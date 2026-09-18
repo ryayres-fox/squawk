@@ -72,6 +72,7 @@ from squawk.retention import (
     plan_prune,
 )
 from squawk.runtime import read_pid_file
+from squawk.sarif import sarif_document
 from squawk.service import cmd_install_service, cmd_status, cmd_stop, serve_web, start_daemon
 from squawk.stages import (
     SERVICES,
@@ -704,6 +705,39 @@ def cmd_prune(args: argparse.Namespace) -> int:
     return 1 if done["failed"] else 0
 
 
+def cmd_sarif(args: argparse.Namespace) -> int:
+    """One run as SARIF 2.1.0 on stdout.
+
+    Read-only, and it writes nothing: a run directory is sealed, and a format
+    conversion has no business inside one. Redirect it where you want it.
+
+    Exit 1 rather than printing an empty document when there is no run to
+    convert -- an empty SARIF is indistinguishable from a scan that found
+    nothing, which is the one thing this tool will not do.
+    """
+    root = args.evidence or env("EVIDENCE") or DEFAULT_EVIDENCE
+    runs = list_runs(root)
+    if not runs:
+        sys.stderr.write("No runs under %s. Run a scan first.\n" % root)
+        return 1
+    wanted = (args.sarif or "").strip()
+    if wanted:
+        picked = [r for r in runs if r.get("run_id") == wanted]
+        if not picked:
+            sys.stderr.write(
+                "No run %r under %s. `squawk verify` lists them.\n"
+                % (wanted, root))
+            return 1
+        man = picked[0]
+    else:
+        man = runs[0]                  # list_runs is newest first
+    run_dir = man.get("_dir") or os.path.join(root, man.get("run_id") or "")
+    doc = sarif_document(man, load_findings(run_dir))
+    json.dump(doc, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+    return 0
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     """Prove the evidence has not been edited since it was written.
 
@@ -817,10 +851,26 @@ def cmd_intel(root: str, force: bool = False) -> bool:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="squawk",
-        description="Local, single-user orchestrator for open-source scanners.",
-        epilog="subcommands, same as the flags: serve | run SERVICE | doctor | feeds | "
-               "update | install | services | status | stop | restart | "
-               "install-service | sync-baselines | verify | config show | version")
+        description=(
+            "Local, single-user orchestrator for open-source scanners.\n"
+            "\n"
+            "Start here:\n"
+            "  squawk doctor                 what is installed, and what is missing\n"
+            "  squawk install                provision the scanner toolbench (Unix)\n"
+            "  squawk services               the thirteen services and what each\n"
+            "                                does NOT cover\n"
+            "  squawk run SERVICE --repo DIR scan a checkout\n"
+            "  squawk serve                  the read-only web UI, on loopback\n"
+            "\n"
+            "Everything else:\n"
+            "  feeds | update | status | stop | restart | install-service |\n"
+            "  sync-baselines | verify | prune | config show | version\n"
+            "\n"
+            "Subcommands are the spelling going forward. Every flag below still\n"
+            "works, and each subcommand is the flag of the same name."),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Docs: README.md, then docs/CHARTER.md for the rules this holds "
+               "itself to.")
     p.add_argument("--repo", help="repo target (default: nearest git checkout)")
     p.add_argument("--target", help="explicit target for dir/image scopes")
     p.add_argument("--evidence", help="evidence root (default ~/scan-evidence)")
@@ -855,6 +905,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "and the chain, and the decisions ledger, then exit")
     p.add_argument("--json", action="store_true",
                    help="with verify: print the whole report as one JSON document")
+    p.add_argument("--sarif", nargs="?", const="", metavar="RUN",
+                   help="print one run as SARIF 2.1.0 on stdout (default: the "
+                        "newest run). A scanner that read nothing is an "
+                        "unsuccessful invocation carrying its denominator, and "
+                        "a correlation that could not be evaluated is a "
+                        "notApplicable result -- both survive into GitHub code "
+                        "scanning")
     p.add_argument("--prune", action="store_true",
                    help="show what retention would remove from the evidence root")
     p.add_argument("--apply", action="store_true",
@@ -900,6 +957,7 @@ SUBCOMMANDS = {
     "install-service": ["--install-service"], "sync-baselines": ["--sync-baselines"],
     "prune": ["--prune"], "verify": ["--verify"], "version": ["--version"],
     "config": ["--config"],
+    "sarif": ["--sarif"],
 }
 
 
@@ -994,6 +1052,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
     if args.run:
         return cmd_run(args)
+    if args.sarif is not None:
+        return cmd_sarif(args)
     if args.verify:
         return cmd_verify(args)
     if args.prune:
@@ -1029,6 +1089,7 @@ __all__ = [
     'cmd_intel',
     'cmd_prune',
     'cmd_run',
+    'cmd_sarif',
     'cmd_verify',
     'doctor',
     'inventory_lines',

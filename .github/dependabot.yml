@@ -1,0 +1,17 @@
+# The workflow pins both of its actions to a 40-character commit SHA, which is
+# the right thing and also means they rot silently: a pinned SHA never picks up
+# the fix to the action it points at. This is what unrots them — a pull request
+# per update, with the release notes, which is a decision rather than a drift.
+#
+# Only `github-actions`. Squawk has no dependencies to check: it is standard
+# library only (invariant I13), and the scanners it runs are installed by the
+# operator from their own publishers, not vendored here.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: ci
