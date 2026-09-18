@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "squawk"
+version = "0.9.0"
+description = "A local, single-user, read-only orchestrator for open-source security scanners: evidence-first, loopback-only."
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+dependencies = []
+
+[project.scripts]
+squawk = "squawk.cli:main"
+
+[tool.setuptools]
+packages = ["squawk"]
+
+[tool.mypy]
+# The floor the code claims. mypy 2.x refuses --python-version 3.9, so CI pins
+# the newest 1.x that accepts it and runs it under a newer interpreter; this
+# section makes a bare `mypy` from the package directory reason the same way.
+python_version = "3.9"
+files = ["squawk"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+# Zero errors at the pinned version is the gate. Strictness beyond the default
+# (check_untyped_defs, disallow_untyped_defs) is a later plan, once this holds.
