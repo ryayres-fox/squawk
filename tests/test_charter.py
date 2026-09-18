@@ -2823,3 +2823,47 @@ class TestTheDesignDocumentDescribesTheCodeThatExists:
         for corr in squawk.CORRELATIONS:
             assert corr.title.lower() not in designed, \
                 "%r ships but is listed as not yet shipped" % corr.title
+
+
+class TestTheReadmeNamesTheCoverageSourcesThatExist:
+    """The README lists, by name, which scanner publishes what denominator.
+    It said gitleaks and grype publish none — and by 2026-09-18 both had one:
+    gitleaks writes `scanned ~N bytes` to stderr, and grype is lent the package
+    count from the SBOM it was handed.
+
+    A field check on Kali failed on it, asserting the tool must keep gitleaks
+    at `unknown`. The check was defending a gap: it demanded the tool withhold
+    a denominator the scanner had published. Prose and code had drifted, and
+    the thing that noticed was a script nobody had run in a fortnight.
+    """
+
+    README = pathlib.Path(__file__).parent.parent / "README.md"
+
+    def _sentence(self):
+        text = self.README.read_text(encoding="utf-8")
+        marker = "Squawk reads the coverage each"
+        assert marker in text, "the README no longer says where coverage comes from"
+        return text.split(marker, 1)[1].split("\n\n", 1)[0]
+
+    def test_every_scanner_it_names_has_a_coverage_extractor(self):
+        """A scanner the README credits with publishing a denominator must have
+        something registered to read it, or the sentence is describing a tool
+        this code never asks."""
+        named = [t for t in ("semgrep", "bandit", "checkov", "trivy", "syft",
+                             "gitleaks") if t in self._sentence()]
+        assert named, "the sentence names no scanner at all"
+        missing = [t for t in named if t not in squawk.scanners.COVERAGE]
+        assert not missing, \
+            "the README credits %s with coverage and nothing reads it" % missing
+
+    def test_it_does_not_claim_a_scanner_publishes_nothing_when_it_does(self):
+        """The drift this comes from, in the direction it drifted."""
+        sentence = self._sentence()
+        for tool in ("gitleaks",):
+            assert tool in squawk.scanners.COVERAGE, tool
+            assert "publishes no coverage (%s" % tool not in sentence, (
+                "%s publishes a denominator and the README says it does not"
+                % tool)
+
+    def test_there_is_a_sentence_to_read(self):
+        assert len(self._sentence().split()) > 20
