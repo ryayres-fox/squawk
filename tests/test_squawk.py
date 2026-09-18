@@ -9,6 +9,7 @@ field must never be rendered as a measurement.
 
 import builtins
 import datetime
+import importlib.util
 import inspect
 import json
 import os
@@ -6492,11 +6493,10 @@ class TestAScanSaysItIsNotStuck:
 
 
 class TestTheClockWall:
-    """The operator asked for *"a panel in the room showing times from all over
-    the world"*, saw the first version show their own zone twice, and said:
-    *"why would you show me two of the same time zone. use the three main
-    american time zones plus utc major european and asian time zones as well
-    and any others that are standard."* So: a wall, UTC first because that is
+    """The operator asked for a panel showing times around the
+    world, saw the first version show one zone twice, and asked for the three
+    main American zones plus UTC, the major European and Asian ones, and any
+    other standard zone — each once. So: a wall, UTC first because that is
     what the evidence is stamped in, then the desks west to east — and the two
     clocks that are also facts about this run (the machine that scanned, the
     browser reading) are **badges on the wall**, not extra clocks."""
@@ -7722,8 +7722,8 @@ class TestAWideWindowIsUsed:
 
 class TestACloudReadIsBoundedAndSaysSo:
     """Unbounded, `get-findings` pages a hundred findings at a time until it
-    has every one an account holds. On a real estate that ran past forty-six
-    minutes and would have produced **nothing**, because a stage killed at its
+    has every one an account holds. On a large estate that ran past its budget and would have
+    produced **nothing**, because a stage killed at its
     budget throws its output away. A bounded read answers in seconds, and the
     CLI's own documentation is explicit that when more exist it returns a
     NextToken — so the count comes back carrying the proof that it is a floor.
@@ -8358,8 +8358,8 @@ class TestCloudInventoryIsReadOnly:
 # --------------------------------------------------------------------------- #
 
 class TestTheAttackAlarmDoesNotFireOnControls:
-    """7500 said "evidence of an active attack" about sixty-five ordinary
-    configuration findings, because `"c2" in "ec2"`."""
+    """7500 said "evidence of an active attack" about ordinary configuration findings, because `"c2"
+    in "ec2"`."""
 
     def _asff(self, title, ftype="", status="FAILED", scanner="awscli"):
         return {"scanner": scanner, "title": title, "path": "",
@@ -8716,7 +8716,7 @@ class TestIdentityRedaction:
 
 class TestRoleBreadthIsReadNotGuessed:
     """The first version judged this from the NAMES of attached managed
-    policies. Against a real account it reported "0 roles carrying more than
+    policies. In field use it reported "0 roles carrying more than
     read" over six roles, having never opened an inline policy."""
 
     ADMIN: ClassVar[dict] = {
@@ -11598,8 +11598,7 @@ class TestQueuesTopicsSecretsAndImages:
 
         A `*` principal narrowed by an account, an organization or a source ARN
         is not open to anybody: the condition IS the grant. Reading only the
-        key's name made AWS's own default topic policy a finding, eleven times
-        on one real account.
+        key's name made AWS's own default topic policy a finding, repeatedly in field use.
         """
         for name, doc in (("the default SNS topic policy", self.DEFAULT_TOPIC),
                           ("an SNS-to-SQS subscription", self.SNS_TO_SQS),
@@ -12309,8 +12308,8 @@ def test_a_lambda_only_denial_is_caught_by_the_page(monkeypatch, tmp_path):
     assert "What the internet can talk to" in html
     # It used to assert the whole panel said "This reading is not available".
     # That threw away the load balancer the stage DID read because of the
-    # Lambda list it did not — on a real account the same rule took thirty-six
-    # findings off the page (review 2, R-21). The panel renders what was read
+    # Lambda list it did not — in field use the same rule took dozens of findings off the page
+    # (review 2, R-21). The panel renders what was read
     # and says, above the numbers, that part of the reading failed.
     assert "Part of this reading failed" in html
     assert "a floor, not a total" in html
@@ -13004,7 +13003,7 @@ class TestWhatAwsSaysIsReachableFromOutside:
 
     def test_only_an_external_access_analyzer_is_asked_for_findings(
             self, monkeypatch):
-        """Reported from a real account. Access Analyzer answers more than one
+        """Reported from a field run. Access Analyzer answers more than one
         question and `ListFindings` answers only the first: calling it on an
         unused-access analyzer is rejected with FIELD_VALIDATION_FAILED, which
         took the stage to `gap` and the whole section off the page.
@@ -13066,8 +13065,8 @@ class TestWhatAwsSaysIsReachableFromOutside:
         """Review 2, R-23. The analyzer's zone of trust is the account, so a
         federated principal is outside it by definition — which made every
         IRSA role, every GitHub Actions role and every SSO role in the account
-        an external-access finding. On a real account that was thirty-six at
-        medium, including the SSO role the operator was running as."""
+        an external-access finding. In field use that was dozens at medium, including the SSO role
+        the operator was running as."""
         row = self._keys(self._data([self._irsa()]))["analyzer-own-federation"]
         assert row["severity"] == "low"
         assert "That is how the federation works" in row["why"]
@@ -13368,8 +13367,8 @@ class TestEveryRoleCardOpensTheSetItCounts:
 
 
 class TestARuleThatFiredThirtySixTimesIsOneLine:
-    """On a real account the analyzer section ran to six pages: thirty-six
-    identical paragraphs, one per role the account's own federation can
+    """In field use the analyzer section ran to pages of identical paragraphs, one per role the
+    account's own federation can
     assume. Every other number on this page keeps its members behind the
     number; this one printed them inline and buried the findings that were
     not a pattern.
@@ -14356,8 +14355,8 @@ class TestPublicMeansSomethingDifferentForACredential:
 
 
 class TestFederatedIsNotOneAnswer:
-    """The IAM panel printed `(federated)` beside every GitHub Actions role on
-    a real account — nine of them, undifferentiated.
+    """The IAM panel printed `(federated)` beside every GitHub Actions role in field use — several
+    of them, undifferentiated.
 
     A trust pinned to ONE REPOSITORY and one pinned to the whole organization
     are the same word and not the same risk: the second lets any repository in
@@ -14508,7 +14507,7 @@ class TestZeroSkillsScannedIsNotACleanAudit:
 
 
 class TestAToolThatRefusedTheCommandSaysWhatItRefused:
-    """From a real compliance run (2026-09-12). checkov would not take a flag
+    """From a field compliance run (2026-09-12). checkov would not take a flag
     and the run said:
 
         [1/2] checkov directory … !! usage: checkov [-h] [-v] [--support]
@@ -14577,7 +14576,7 @@ class TestAToolThatRefusedTheCommandSaysWhatItRefused:
         assert not row.detail.startswith("usage:")
         assert "usage: checkov" not in row.detail
 class TestTwoDenominatorsThatWereWrong:
-    """Both from one compliance run on a real repository, 2026-09-12.
+    """Both from one compliance run on a working repository, 2026-09-12.
 
     trivy produced 288 IaC findings across 128 scan targets, and the run said
     "public-unencrypted-store (cannot evaluate: no iac scanner ran)". And
@@ -14715,7 +14714,7 @@ class TestTwoDenominatorsThatWereWrong:
 
     def test_zero_bytes_is_a_gap_whatever_caused_it(self):
         """The case that matters. "0 commits scanned." with "scanned ~0 bytes"
-        read as a clean sweep of a real repository.
+        read as a clean sweep of a working repository.
 
         The note no longer offers "a directory that is not a repository
         scanned in repo scope" as a cause, because `stage_gitleaks` decides on
@@ -14798,17 +14797,19 @@ class TestTheRolesTileSaysWhichRoles:
 
 
 class TestArgumentsThisRunDidNotPass:
-    """From a real compliance run, 2026-09-12. checkov refused eleven flags:
+    """checkov refused a long list of flags this tool never passed:
 
-        --custom-policy-output-format=json --include-policy-metadata=True
-        --config-management={...} --severity-thresholds={...}
-        --compliance=NIST-800-53 --compliance=FedRAMP ...
+        --custom-policy-output-format=json --include-policy-metadata=True ...
 
-    Squawk builds four tokens: `checkov -d <target> -o json`. Those flags came
-    from a `.checkov.yaml` in the tree being SCANNED, which checkov reads
+    Squawk builds four tokens: `checkov -d <target> -o json`. Flags like those
+    come from a `.checkov.yaml` in the tree being SCANNED, which checkov reads
     itself and turns into argv — reproduced against checkov 3.2.459. The
     message read as though this tool had passed them, and the first thing a
-    reader would do is go hunting through code that does not contain them."""
+    reader would do is go hunting through code that does not contain them.
+
+    The flag list here is illustrative and deliberately short: the original
+    was copied from the configuration of the repository being scanned, which
+    is somebody else's policy-as-code and not this project's to publish."""
 
     OURS: ClassVar[list] = ["checkov", "-d", "/t", "-o", "json"]
     THEIRS = ("checkov: error: unrecognized arguments: "
@@ -15023,7 +15024,7 @@ class TestAJsonBooleanInAConditionDoesNotCrashTheReaders:
             squawk.probes._condition_keys(doc["Statement"][0]["Condition"])
 
     def test_the_iam_stage_survives_a_boolean_condition(self, monkeypatch):
-        """The stage, not the reader: this is the path a real account takes."""
+        """The stage, not the reader: this is the path a live estate takes."""
         trust = {"Statement": [{
             "Effect": "Allow",
             "Principal": {"AWS": "arn:aws:iam::%s:root" % self.ME},
@@ -15665,3 +15666,189 @@ class TestARefusalIsKnownEvenWhenTheStderrFileIsNot:
         row = next(r for r in out["results"] if r.tool == "checkov")
         assert "refused" in row.detail and "--compact" in row.detail
         assert not row.detail.startswith("usage:")
+
+
+class TestTheReviewFindings:
+    """Five defects found by an independent review on 2026-09-18, all of the
+    same family: the tool held itself to a rule everywhere except in one
+    place, and the exception was the place a reader was most likely to look.
+    """
+
+    # --- a finding whose subject is a credential ---------------------------
+
+    def test_bandit_does_not_keep_the_password_it_found(self):
+        """`norm_gitleaks` has never kept a matched secret. bandit B105 finds
+        the same secret and kept it, so the discipline held for the scanner
+        whose name says "secret" and not for the one that reads source."""
+        raw = json.dumps({"results": [{
+            "test_id": "B105", "filename": "app.py", "line_number": 3,
+            "issue_severity": "LOW", "issue_confidence": "MEDIUM",
+            "issue_text": "Possible hardcoded password: 'hunter2'",
+            "code": "3 PASSWORD = 'hunter2'\n"}]})
+        f = squawk.scanners.norm_bandit(raw, "/t")[0]
+        assert "hunter2" not in f.detail["evidence"], f.detail["evidence"]
+        assert f.detail["evidence"] == squawk.scanners.EVIDENCE_WITHHELD
+        assert f.path == "app.py" and f.detail["line"] == 3, \
+            "the finding must still say where to look"
+
+    def test_the_password_is_not_in_the_finding_title_either(self):
+        """Withholding the evidence was not enough. bandit's B105 message is
+        "Possible hardcoded password: '<the password>'", so the title carried
+        the secret after its evidence had stopped. Found by planting a password,
+        scanning it and grepping the run's own findings.json for the string."""
+        raw = json.dumps({"results": [{
+            "test_id": "B105", "filename": "app.py", "line_number": 1,
+            "issue_severity": "LOW",
+            "issue_text": "Possible hardcoded password: 'hunter2'",
+            "code": "1 PASSWORD = 'hunter2'\n"}]})
+        f = squawk.scanners.norm_bandit(raw, "/t")[0]
+        whole = json.dumps([f.title, f.detail])
+        assert "hunter2" not in whole, whole
+        assert "hardcoded password" in f.title, "the finding still says what it is"
+
+    def test_an_ordinary_message_keeps_its_quoted_text(self):
+        """The false-positive half: a quote in a message that is not about a
+        credential is part of the explanation."""
+        assert squawk.scanners.message_for(
+            "subprocess call with shell=True, 'rm -rf' seen", "B602") == \
+            "subprocess call with shell=True, 'rm -rf' seen"
+
+    def test_bandit_keeps_the_code_for_a_rule_that_is_not_about_a_secret(self):
+        """The false-positive half. A rule that withholds everything teaches a
+        reader that the evidence field is never worth opening."""
+        raw = json.dumps({"results": [{
+            "test_id": "B602", "filename": "app.py", "line_number": 9,
+            "issue_severity": "HIGH", "issue_text": "subprocess with shell=True",
+            "code": "9 subprocess.run(cmd, shell=True)\n"}]})
+        f = squawk.scanners.norm_bandit(raw, "/t")[0]
+        assert "shell=True" in f.detail["evidence"]
+
+    def test_semgrep_does_not_undo_its_own_redaction_for_a_credential(self, tmp_path):
+        """`_source_line` exists to recover the line semgrep redacts. For a
+        credential rule that recovery is the leak, so it must not run -- and
+        the file must not be read at all."""
+        src = tmp_path / "app.py"
+        src.write_text("x = 1\nAPI_KEY = 'sk-live-abcdef'\n", encoding="utf-8")
+        raw = json.dumps({"results": [{
+            "check_id": "python.lang.security.audit.hardcoded-password",
+            "path": str(src), "start": {"line": 2},
+            "extra": {"severity": "ERROR", "message": "Hardcoded password",
+                      "lines": "requires login"}}]})
+        f = squawk.scanners.norm_semgrep(raw, str(tmp_path))[0]
+        assert "sk-live-abcdef" not in f.detail["evidence"]
+        assert f.detail["evidence"] == squawk.scanners.EVIDENCE_WITHHELD
+
+    def test_semgrep_still_recovers_the_line_for_an_ordinary_rule(self, tmp_path):
+        src = tmp_path / "app.py"
+        src.write_text("x = 1\neval(user_input)\n", encoding="utf-8")
+        raw = json.dumps({"results": [{
+            "check_id": "python.lang.security.audit.eval-detected",
+            "path": str(src), "start": {"line": 2},
+            "extra": {"severity": "ERROR", "message": "eval is dangerous",
+                      "lines": "requires login"}}]})
+        f = squawk.scanners.norm_semgrep(raw, str(tmp_path))[0]
+        assert "eval(user_input)" in f.detail["evidence"]
+
+    def test_the_withheld_sentence_is_not_an_empty_string(self):
+        """An absent evidence field and a withheld one read identically, which
+        is I1 turned on the tool's own output."""
+        assert squawk.scanners.EVIDENCE_WITHHELD.strip()
+        assert "credential" in squawk.scanners.EVIDENCE_WITHHELD
+
+    @pytest.mark.parametrize("rule,message", [
+        ("B105", "Possible hardcoded password"),
+        ("B106", "hardcoded password as a function argument"),
+        ("CKV_SECRET_6", "Base64 High Entropy String"),
+        ("python.lang.security.audit.hardcoded-password", "x"),
+        ("", "AWS Access Key ID found"),
+        ("", "Authorization header disclosed"),
+    ])
+    def test_every_credential_shape_is_recognised(self, rule, message):
+        assert squawk.scanners.is_credential_rule(rule, message)
+
+    @pytest.mark.parametrize("rule,message", [
+        ("B602", "subprocess call with shell=True"),
+        ("CKV_AWS_20", "S3 bucket allows public read"),
+        ("python.lang.security.audit.eval-detected", "eval is dangerous"),
+    ])
+    def test_an_ordinary_rule_keeps_its_evidence(self, rule, message):
+        assert not squawk.scanners.is_credential_rule(rule, message)
+
+    # --- the target the operator asked for ---------------------------------
+
+    def test_an_explicit_repo_is_scanned_and_not_its_parent(self, tmp_path):
+        """`--repo <subdir>` in a monorepo scanned the whole monorepo -- every
+        sibling project in the checkout -- and said nothing about it. Not a cap
+        that went unannounced; a scope nobody asked for."""
+        (tmp_path / ".git").mkdir()
+        sub = tmp_path / "projects" / "one"
+        sub.mkdir(parents=True)
+        assert squawk.resolve_repo(str(sub)) == str(sub)
+        assert squawk.resolve_repo(str(sub)) != str(tmp_path)
+
+    def test_with_no_target_the_enclosing_repository_is_still_the_default(
+            self, tmp_path, monkeypatch):
+        (tmp_path / ".git").mkdir()
+        sub = tmp_path / "a" / "b"
+        sub.mkdir(parents=True)
+        monkeypatch.chdir(str(sub))
+        assert squawk.resolve_repo(None) == str(tmp_path)
+
+    # --- what a transcript carries -----------------------------------------
+
+    def test_the_cli_short_target_masks_the_account(self):
+        """Its web sibling `_short_target` has always masked; this one did not,
+        so `--verify` and `--prune` printed every run's account in full."""
+        out = squawk.cli._short("111111111111")
+        assert "111111111111" not in out, out
+        assert out == squawk.mask_account("111111111111")[:28]
+
+    # --- the two pages that render a run -----------------------------------
+
+    def test_the_coverage_panel_redacts_a_ledger_detail(self):
+        """The CLI redacts this same string; the page rendered it raw, so a
+        detail built from a role ARN reached the browser with the account in
+        it. Two renderers of one string, one of them masked."""
+        man = {"ledger": [{"tool": "cloudiam", "status": "gap",
+                           "detail": "AccessDenied for "
+                                     "arn:aws:iam::111111111111:role/deploy"}]}
+        page = squawk.web.coverage_panel(man)
+        assert "111111111111" not in page, page[:400]
+
+    def test_the_dashboard_masks_what_it_renders(self, tmp_path):
+        """The one artifact whose own docstring invites you to archive it or
+        attach it somewhere, and the only rendered surface with no masking at
+        all."""
+        dash = self._dashboard()
+        run = tmp_path / "20260101T000000Z"
+        run.mkdir()
+        (run / "manifest.json").write_text(json.dumps({
+            "run_id": "20260101T000000Z", "service": "cloudiam",
+            "service_label": "Cloud (AWS)", "scope": "aws",
+            "target": "111111111111", "not_covered": "",
+            "counts": {"total": 0, "excluded": 0},
+            "ledger": [{"tool": "cloudiam", "mode": "read", "status": "gap",
+                        "detail": "AccessDenied for "
+                                  "arn:aws:iam::111111111111:role/deploy"}],
+        }), encoding="utf-8")
+        (run / "findings.json").write_text("[]", encoding="utf-8")
+        (run / "identities.json").write_text("{}", encoding="utf-8")
+        html = dash.render(squawk, str(run))
+        assert "111111111111" not in html, "the dashboard rendered the account"
+
+    def test_the_dashboard_writes_outside_the_sealed_run(self, tmp_path):
+        """A run is sealed and its digest covers every file in it, so a
+        dashboard written inside made the tool's own `--verify` report
+        `extra - dashboard.html` on every run anybody had rendered."""
+        dash = self._dashboard()
+        src = inspect.getsource(dash.main)
+        assert 'os.path.join(run_dir, "dashboard.html")' not in src
+        assert "dashboard-%s.html" in src
+
+    @staticmethod
+    def _dashboard():
+        path = os.path.join(os.path.dirname(ENTRY), "squawk-dashboard.py")
+        spec = importlib.util.spec_from_file_location("squawk_dashboard", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod

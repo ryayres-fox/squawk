@@ -2491,8 +2491,8 @@ def analyzer_findings(data: dict) -> List[dict]:
                 # The analyzer's zone of trust is the account, so a federated
                 # principal is outside it by definition -- which makes every
                 # IRSA role, every GitHub Actions role and every SSO role in
-                # the account an "external access" finding. On a real account
-                # that was thirty-six at medium, including the SSO role the
+                # the account an "external access" finding. In field use that was dozens at medium,
+                # including the SSO role the
                 # operator was running as (review 2, R-23).
                 out.append({
                     "key": "analyzer-own-federation", "resource": name,
@@ -4355,15 +4355,15 @@ WITNESS_KINDS = ("cloud", "dast")
 
 # The vocabulary of threat-detection finding TYPES, not of prose. Each token is
 # matched at a word boundary (see `_looks_like_an_attack`), because the earlier
-# substring test fired 7500 -- "evidence of an active attack" -- on sixty-five
-# ordinary control findings in a real account, for one reason:
+# substring test fired 7500 -- "evidence of an active attack" -- on ordinary control findings in
+# field use, for one reason:
 #
 #     "c2" is a substring of "ec2".
 #
 # So "EC2 subnets should not automatically assign public IP addresses" read as
 # command-and-control traffic, and so did every finding whose resource ARN
 # contained ":ec2:", which is most of them. That is the loudest wrong answer
-# this tool can give, and it gave it on the first real account it ever saw.
+# this tool can give, and it gave it on the first live estate it ever saw.
 #
 # "c2" is gone. GuardDuty writes C&CActivity, not c2, so the token bought
 # nothing and cost the alarm its credibility. The rest are taken from the
@@ -4515,8 +4515,8 @@ def squawk_check(root: str, man: dict) -> List[dict]:
         # Two gates, and the first one does not read words at all. A control
         # evaluation is a weakness at rest by definition, so it is excluded
         # before any matching happens; then the type vocabulary is matched at
-        # word boundaries. Either gate alone would have stopped the sixty-five
-        # false 7500s measured on a real account; both are here because they
+        # word boundaries. Either gate alone would have stopped the false 7500s measured in field
+        # use; both are here because they
         # fail differently and a false "you are under attack" is the most
         # expensive thing this tool can print.
         if _is_control_evaluation(f):

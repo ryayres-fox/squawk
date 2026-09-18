@@ -2,7 +2,7 @@
 """
 squawk-dashboard.py — a static HTML renderer for one Squawk run.
 
-Writes <run-dir>/dashboard.html: a single self-contained page you can archive
+Writes <evidence-root>/dashboard-<run-id>.html: a self-contained page you can archive
 or attach somewhere, showing the run's ledger, severity picture, and the same
 per-scanner fingerprint the GitHub-issue baselines use — so you can eyeball a
 dashboard against a posted baseline table and see immediately whether the
@@ -73,11 +73,16 @@ def render(tower, run_dir: str) -> str:
     sev_counts = man.get("severities", {})
     fingerprints = {t: tower.fingerprint(ids) for t, ids in identities.items()}
 
+    # Masked, like every other rendered surface. This page had none at all,
+    # and it is the one artifact whose own docstring invites you to archive it
+    # or attach it somewhere -- so it was the likeliest of the four to be
+    # shared and the only one that carried the account id, an SSO address and
+    # absolute paths in full. Found in review, 2026-09-18.
     ledger_rows = "".join(
         "<tr><td class='mono'>%s</td><td class='mono'>%s</td>"
         "<td><span class='st %s'>%s</span></td><td class='muted'>%s</td></tr>"
         % (E(r["tool"]), E(r["mode"]), E(r["status"]), E(r["status"]),
-           E(r["detail"]))
+           E(tower.redact_identifiers(r["detail"])))
         for r in man.get("ledger", []))
 
     fp_rows = "".join(
@@ -88,7 +93,8 @@ def render(tower, run_dir: str) -> str:
     finding_rows = "".join(
         "<tr><td>%s</td><td><b>%s</b><div class='mono muted'>%s</div></td>"
         "<td class='mono muted'>%s</td><td class='mono muted'>%s</td></tr>"
-        % (tower.sev_pill(f["severity"]), E(f["title"]), E(f["path"]),
+        % (tower.sev_pill(f["severity"]),
+           E(tower.redact_identifiers(f["title"])), E(f["path"]),
            E(f["scanner"]), E(f["identity"]))
         for f in sorted(findings, key=lambda x: tower.SEVERITY_ORDER.index(
             x["severity"]) if x["severity"] in tower.SEVERITY_ORDER else 9))
@@ -147,7 +153,8 @@ def render(tower, run_dir: str) -> str:
         "</body></html>"
         % (E(man.get("run_id", "")), tower.PAGE_CSS, E(man.get("run_id", "")),
            E(man.get("service_label", "")), E(man.get("scope", "")),
-           E(man.get("target", "")), E(man.get("not_covered", "")),
+           E(tower.mask_account(man.get("target", ""))),
+           E(man.get("not_covered", "")),
            sev_chips or "<span class='muted'>no findings</span>",
            man.get("counts", {}).get("total", 0),
            man.get("counts", {}).get("excluded", 0),
@@ -168,7 +175,13 @@ def main() -> int:
     run_dir = pick_run(tower, root, args.run_dir)
 
     html_text = render(tower, run_dir)
-    out = os.path.join(run_dir, "dashboard.html")
+    # Beside the run directory, not inside it. A run is sealed and its digest
+    # covers every file in it, so a dashboard written in there made the tool's
+    # own `--verify` report `extra - dashboard.html` on every run anybody had
+    # rendered. Found in review, 2026-09-18.
+    out = os.path.join(os.path.dirname(run_dir.rstrip(os.sep)),
+                       "dashboard-%s.html" % os.path.basename(
+                           run_dir.rstrip(os.sep)))
     with open(out, "w", encoding="utf-8") as fh:
         fh.write(html_text)
     print("wrote %s" % out)

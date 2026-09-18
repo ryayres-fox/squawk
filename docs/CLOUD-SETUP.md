@@ -2,7 +2,7 @@
 
 This is the guide for pointing Squawk at a real AWS account for the first
 time, written for someone who has not used it before. It is deliberately
-cautious, because the machine most people have a real account on is a work
+cautious, because the machine most people have an account on is a work
 machine, and the evidence a cloud run writes is about an employer's estate.
 
 **Read the last section before the first one.** *What is safe to send back*
@@ -135,9 +135,9 @@ The second line has three states and never a plain yes or no:
 | `?    read-only` | it could not be established. Said as "could not tell", not guessed either way. |
 
 **On how long it takes.** The service tile says `~1-3min`, which was a guess
-made before it had ever met a real account. The first one it did meet took
+made before it had ever met a live estate. The first one it did meet took
 longer than ten minutes and was still going, so treat that estimate as
-unmeasured and give a real estate `stage_timeout = 3600` from the start.
+unmeasured and give a large estate `stage_timeout = 3600` from the start.
 
 **A `gap` does not stop the run.** You may have no other identity, and the
 run is still only a read. But it is printed on the run and it is the reason
@@ -195,7 +195,7 @@ a claim.
 | `?? 0 findings, but examined 0 findings — Security Hub returned nothing: it may be off in this region, have no standards enabled, or this identity may not be allowed to see it — all three look identical here — not a clean result` | **A gap, not a clean account.** The line names all three explanations because the read cannot tell them apart, and the third is the one an operator is most likely to miss: a hub that is on with no standards enabled evaluates nothing and returns nothing. Squawk will not report this as clean (invariant I15). |
 | `!! An error occurred (AccessDenied…)` | The identity lacks `securityhub:GetFindings`. Not a coverage statement — nothing was read. |
 | `ok N finding(s) across M findings — a FLOOR, not a total …` | **The account holds more than the read asked for.** The read stops at `cloud_max_findings` (1000) so it answers in seconds rather than paging for an hour; the count is a floor and says so. Raise it with `[services.cloudaws] cloud_max_findings = 5000` if you want more, knowing what it costs in time. |
-| `!! timed out after 600s · that is stage_timeout …` | **A large estate — measured, not hypothetical.** The first real account this met exceeded ten minutes. `get-findings` paginates a hundred findings per call, and the CLI keeps going until it has them all. Raise the budget with `[services.cloudaws] stage_timeout = 3600` in `squawk.toml`; the message names the section and a value. |
+| `!! timed out after 600s · that is stage_timeout …` | **A large estate — measured, not hypothetical.** The first live estate this met exceeded ten minutes. `get-findings` paginates a hundred findings per call, and the CLI keeps going until it has them all. Raise the budget with `[services.cloudaws] stage_timeout = 3600` in `squawk.toml`; the message names the section and a value. |
 | `SQUAWK 7600` | A source did not report. On a one-stage service that means the stage above failed; the alarm exists so a failed read never reads as a clean estate. |
 
 An estate with tens of thousands of findings returns a large JSON document,

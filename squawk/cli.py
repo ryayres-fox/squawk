@@ -494,7 +494,7 @@ def inventory_lines(man: dict) -> List[str]:
               summary["regions_enabled"])]
     for domain in summary["domains"]:
         # Every count, zeros included. "0 EC2 instances" was the single most
-        # important line for the first real account this ran against -- it is
+        # important line for the first live estate this ran against -- it is
         # why nothing fired -- and a filter that hid zeros hid exactly that.
         parts = ["%d %s" % (i["count"], i["label"]) for i in domain["items"]]
         out.append("  %-9s %s" % (domain["label"] + ":", ", ".join(parts)))
@@ -775,9 +775,15 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
 
 def _short(target: str) -> str:
+    """A target short enough for a list, with the account masked.
+
+    Its web sibling `_short_target` has always called `mask_account`; this one
+    did not, so `--verify` and `--prune` printed every run's account id in full
+    -- a transcript somebody pastes. Found in review, 2026-09-18.
+    """
     if "/" in target and not target.startswith(("image:", "http")):
         return os.path.basename(target.rstrip("/")) or target
-    return target[:28]
+    return mask_account(target)[:28]
 
 
 # --------------------------------------------------------------------------- #

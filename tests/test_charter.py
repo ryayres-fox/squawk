@@ -1152,9 +1152,9 @@ def _panel_tiles():
 class TestEveryNumberExpandsToItsMembers:
     """Every figure on the Cloud page opens the set it counts.
 
-    The operator asked for this directly: "if you say 2 accounts need something,
-    you should be able to click on the number and it should show the findings".
-    Three ways it was not true, all found by running it on a real account
+    The operator asked for this directly: a number that says
+    how many things need attention should open the set it counts.
+    Three ways it was not true, all found by running it in field use
     (2026-09-10) and none visible from the source:
 
       * the IAM panel's "roles" tile used the key `roles`, which belongs to the
@@ -1241,8 +1241,8 @@ class TestEveryNumberExpandsToItsMembers:
 
         It already did once: the first version of the IAM fixture carried a
         `roles` list, the probe kept only the roles it had something to say
-        about, and the "roles" tile would have expanded to three of a hundred
-        and forty on a real account while every test here passed. The payload
+        about, and the "roles" tile would have expanded to three of many
+        in field use while every test here passed. The payload
         literal each probe builds is the authority.
         """
         by_file = {}
@@ -1282,7 +1282,7 @@ class TestEveryNumberExpandsToItsMembers:
 
         The inventory reading is the exception: its shape is the whole
         `resources`/`reads` graph rather than a per-region list, and its
-        numbers were reconciled against their expansions on a real account
+        numbers were reconciled against their expansions in field use
         (2026-09-09, every tile, no mismatch). Every other panel is covered
         here.
         """
@@ -2095,7 +2095,7 @@ class TestThePageSurvivesPaper:
     """The Cloud page is handed on as a PDF, and paper does not scroll.
 
     Every `overflow-x:auto` container that fits on screen by scrolling was
-    CLIPPED at the page edge: two consecutive PDFs from a real account lost the
+    CLIPPED at the page edge: two consecutive PDFs from a field run lost the
     right-hand columns of the region table and the last two cities of the clock
     strip. A scroll bar is a promise the reader can see more, and print cannot
     keep it.
@@ -2740,3 +2740,51 @@ class TestEveryDeniedReadLeavesATrace:
         bad = [(r.tool, r.status, r.detail) for r in outcome["results"]
                if r.status != "ok"]
         assert not bad, "nothing was denied and these stages did not say ok: %r" % bad
+
+
+class TestTheDesignDocumentDescribesTheCodeThatExists:
+    """`CORRELATION-DESIGN.md` listed three rules under "Rules proven against
+    the planted target". Two of them are in `CORRELATIONS`; the third,
+    "exploitable and reachable", has never been implemented — it needs a CVE
+    scanner and recon inside one url-scope service, and no service runs both.
+
+    A design document that describes a rule the code does not have is the same
+    defect as a scanner reporting a finding it did not find, one layer out.
+    Nothing held the two together until an independent review noticed
+    (2026-09-18).
+    """
+
+    DOC = pathlib.Path(__file__).parent.parent / "docs" / "CORRELATION-DESIGN.md"
+    SHIPPED = "**Shipped**, and proven against the planted target:"
+    DESIGNED = "**Designed, not yet shipped.**"
+
+    def _section(self, start, end=None):
+        text = self.DOC.read_text(encoding="utf-8")
+        assert start in text, "the document no longer has %r" % start
+        body = text.split(start, 1)[1]
+        if end:
+            assert end in body, "the document no longer has %r" % end
+            body = body.split(end, 1)[0]
+        return [ln for ln in body.split("\n") if ln.startswith("- **")]
+
+    def test_the_document_lists_the_rules_that_ship(self):
+        shipped = self._section(self.SHIPPED, self.DESIGNED)
+        assert len(shipped) == len(squawk.CORRELATIONS), (
+            "the document lists %d shipped rule(s) and the code has %d: %s"
+            % (len(shipped), len(squawk.CORRELATIONS),
+               [ln[:60] for ln in shipped]))
+
+    def test_there_are_bullets_to_count(self):
+        """A section that quietly found nothing would pass whatever the
+        document says, which is the shape of the bug this exists for."""
+        assert self._section(self.SHIPPED, self.DESIGNED)
+        assert self._section(self.DESIGNED)
+
+    def test_nothing_under_designed_is_already_implemented(self):
+        """The other direction. A rule that shipped and stayed in the
+        not-yet-shipped list understates the tool, which is the safer error but
+        still a false statement about the code."""
+        designed = " ".join(self._section(self.DESIGNED)).lower()
+        for corr in squawk.CORRELATIONS:
+            assert corr.title.lower() not in designed, \
+                "%r ships but is listed as not yet shipped" % corr.title
