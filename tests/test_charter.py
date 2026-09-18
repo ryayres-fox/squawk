@@ -21,12 +21,13 @@ import textwrap
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import squawk
 
-ENTRY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "squawk.py")
+ENTRY = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     "squawk.py")
 
-CHARTER = pathlib.Path(__file__).with_name("CHARTER.md")
+CHARTER = pathlib.Path(__file__).parent.parent / "docs" / "CHARTER.md"
 
 
 class _Ctx:
@@ -844,7 +845,7 @@ _SERVICE_WORDS = {
 _DENIES_READING = re.compile(r"\b(?:is|are)\s+(?:not|never)\s+read\b")
 
 _PROSE_MODULES = ("stages.py", "analysis.py", "web.py")
-_HERE = pathlib.Path(__file__).parent
+_HERE = pathlib.Path(__file__).parent.parent
 
 
 def _tree(name):
@@ -1151,7 +1152,7 @@ def _panel_tiles():
 class TestEveryNumberExpandsToItsMembers:
     """Every figure on the Cloud page opens the set it counts.
 
-    The owner asked for this directly: "if you say 2 accounts need something,
+    The operator asked for this directly: "if you say 2 accounts need something,
     you should be able to click on the number and it should show the findings".
     Three ways it was not true, all found by running it on a real account
     (2026-09-10) and none visible from the source:
@@ -1833,7 +1834,7 @@ class TestACloudReaderNeverRaises:
 # The severity scale is written down, and the code sits where it says.
 # --------------------------------------------------------------------------- #
 
-SCALE_DOC = pathlib.Path(__file__).with_name("CORRELATION-DESIGN.md")
+SCALE_DOC = pathlib.Path(__file__).parent.parent / "docs" / "CORRELATION-DESIGN.md"
 
 
 def _severity_section() -> str:
@@ -2220,7 +2221,7 @@ class TestTheProjectSaysWhereItRunsAndWhatItCites:
     export would carry as a dangling pointer at private material. Both were
     true for weeks because nothing checked either one."""
 
-    ROOT = os.path.dirname(os.path.abspath(__file__))
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     # Where a claim about portability has to be re-read. Each is a call or an
     # import that does not exist on Windows. Adding one means the README's
@@ -2240,6 +2241,10 @@ class TestTheProjectSaysWhereItRunsAndWhatItCites:
     #: link resolution over the tree it builds, where those files are at the
     #: root they were written for.
     OVERLAY = "public"
+
+    #: The private reference set, renamed from `docs/` so it cannot be
+    #: confused with the published `docs/` the README points at.
+    PRIVATE = "reference"
 
     def _docs(self):
         for base, dirs, files in os.walk(self.ROOT):
@@ -2278,12 +2283,18 @@ class TestTheProjectSaysWhereItRunsAndWhatItCites:
         it may point at, by name or by link.
 
         The private set is the same one `tools/check_private_boundary.py`
-        holds -- everything under `docs/`, plus the reference documents one
-        directory up. It is spelled out here rather than imported, because
+        holds -- everything under `reference/`, plus the reference documents
+        one directory up. It is spelled out here rather than imported, because
         this tree has to test itself after an export that leaves the checker
-        behind."""
+        behind.
+
+        `reference/`, not `docs/`: the published tree has a `docs/` of its own
+        and the README is meant to point at it. Two directories one path apart,
+        one private and one published, is a mistake waiting for somebody in a
+        hurry, so the private one was renamed."""
         private = {os.path.basename(p) for p in self._docs()
-                   if os.path.relpath(p, self.ROOT).startswith("docs" + os.sep)}
+                   if os.path.relpath(p, self.ROOT).startswith(
+                       self.PRIVATE + os.sep)}
         private |= {"TOWER-HANDOFF.md", "SCAN-TOWER-FIELD-LESSONS.md",
                     "SCAN-TOWER-REBUILD-AND-LESSONS.md"}
         with io.open(os.path.join(self.ROOT, "README.md"),
@@ -2331,7 +2342,7 @@ class TestASecurityToolHasADisclosureRoute:
     rather than decorative: a route that is not a public issue, the bound on
     what is maintained, and the report this tool most wants."""
 
-    ROOT = os.path.dirname(os.path.abspath(__file__))
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     def _read(self, name):
         """Whitespace-flattened: a sentence that wraps in the file is still the
@@ -2468,7 +2479,7 @@ class TestThePageFollowsTheWindow:
     def test_the_clock_strip_slides_with_the_page(self):
         """The topbar above it has been sticky since it was written; this was
         not. So the wall a reader is meant to check a timestamp against left
-        the screen the moment they scrolled down to the timestamp (the owner,
+        the screen the moment they scrolled down to the timestamp (the operator,
         2026-09-11)."""
         strip = _css_rule(self.CSS, ".clocks")
         assert "position:sticky" in strip, "the clock strip scrolls away"
@@ -2494,7 +2505,7 @@ class TestThePageFollowsTheWindow:
     def test_the_wall_wraps_rather_than_running_off_the_page(self):
         """Fifteen cells that refuse to shrink do not fit one row on an
         ordinary window, and a strip that scrolls sideways hides the clocks
-        past the edge (the owner, 2026-09-11 and 2026-09-12)."""
+        past the edge (the operator, 2026-09-11 and 2026-09-12)."""
         strip = _css_rule(self.CSS, ".clocks")
         assert "flex-wrap:wrap" in strip, \
             "the strip scrolls sideways instead of wrapping: %s" % strip
@@ -2505,7 +2516,7 @@ class TestThePageFollowsTheWindow:
         """The fault the third attempt fixed. `auto-fit` picks the column count
         from the window alone, and with fifteen clocks the count decides
         everything: eight gives 8+7, seven gives 7+7+1. A window a little
-        narrower than the owner's put one clock alone on a row.
+        narrower than the operator's put one clock alone on a row.
 
         8, 6 and 4 are the counts that strand nobody at fifteen OR at sixteen —
         the script adds a sixteenth when the reader's zone is not already on the

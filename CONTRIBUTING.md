@@ -1,7 +1,7 @@
 # Contributing
 
 Squawk is a small tool with a strong opinion, and the opinion is the part worth
-protecting. Read [`CHARTER.md`](CHARTER.md) first — seventeen rules, each naming
+protecting. Read [`CHARTER.md`](docs/CHARTER.md) first — seventeen rules, each naming
 the test that fails when it is broken. A change that breaks one of them is not
 rejected for style; it is a different tool.
 
@@ -19,7 +19,7 @@ rejected for style; it is a different tool.
 
 ## What is not
 
-[`CHARTER.md`](CHARTER.md) has a section called *What Squawk will never be*.
+[`CHARTER.md`](docs/CHARTER.md) has a section called *What Squawk will never be*.
 It is not a list of priorities to revisit. In short: not a remediator, not
 multi-user, not a SIEM, not an agent, not CI, and not a scanner — where a good
 free tool exists, Squawk drives it rather than competing with it.

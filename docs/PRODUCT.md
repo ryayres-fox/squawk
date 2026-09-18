@@ -198,7 +198,7 @@ added from here on.
 ## Built to the review standard
 
 Squawk is developed against a peer-review standard, summarised for a
-contributor in [`CONTRIBUTING.md`](CONTRIBUTING.md). Branches, code and PRs are
+contributor in [`CONTRIBUTING.md`](../CONTRIBUTING.md). Branches, code and PRs are
 written to pass it: default-block posture, evidence
 for every claim, real tests rather than stubs, no secrets or wildcards, arg-list
 subprocess calls, explicit error handling, docstrings, and live-vs-source

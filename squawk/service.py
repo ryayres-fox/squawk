@@ -305,7 +305,7 @@ def port_is_free(host: str, port: int) -> Tuple[bool, str]:
     """Can the server bind here? A busy port is the most ordinary startup
     failure there is, and it used to answer with a socketserver traceback
     while the foreground said only "did not come up within 6 s" — naming
-    neither the port nor the reason (the owner, 2026-09-08). Tested before
+    neither the port nor the reason (the operator, 2026-09-08). Tested before
     forking, so the reason arrives in the terminal the operator is looking
     at."""
     probe = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET,

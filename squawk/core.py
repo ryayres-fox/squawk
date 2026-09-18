@@ -375,7 +375,7 @@ class Scanner(NamedTuple):
 # code; `trivy fs` and `trivy image` read dependencies. The registry gives a
 # SCANNER one kind, so a correlation that needed `iac` reported "cannot
 # evaluate: no iac scanner ran" over 288 IaC findings trivy had just produced
-# on a real repository (the owner, 2026-09-12). A correlation states its
+# on a real repository (the operator, 2026-09-12). A correlation states its
 # denominator (I16), and the denominator was wrong.
 # Folder names that mean a cloud-sync client owns this path.
 #
@@ -385,7 +385,7 @@ class Scanner(NamedTuple):
 # thousands of network round-trips and it is paid before a single byte is
 # scanned.
 #
-# Measured on the owner's machine, 2026-09-14: gitleaks reads ~20 MB/s of
+# Measured on the operator's machine, 2026-09-14: gitleaks reads ~20 MB/s of
 # scannable text on local disk and skips binaries itself -- a 1.4 GB tree came
 # back as 15.9 MB scanned in 0.8s. The same tool timed out after 900s on a test
 # repository inside OneDrive, and semgrep after 1200s, while bandit finished in
@@ -630,7 +630,7 @@ _ACCOUNT_ID = re.compile(r"(?<![0-9])(\d{8})(\d{4})(?![0-9])")
 # An SSO session name is the person's work email, and it sits in the middle of
 # every assumed-role ARN this tool prints:
 #
-#   arn:aws:sts::************:assumed-role/AWSReservedSSO_.../First.Last@corp.com
+#   arn:aws:sts::************:assumed-role/AWSReservedSSO_.../First.Last@example.com
 #
 # The account id beside it was masked from the day it was first printed; the
 # address next to it went out in full, on the page people screenshot into
@@ -1081,7 +1081,7 @@ PROFILE_KEYS: Dict[str, Knob] = {
     # and the container is NOT capped: `-m` was measured to break this image's
     # baseline scan outright (rc=3 in 40s at 2048m and at 4096m, with and
     # without a larger /dev/shm, where the same scan with the heap set and no
-    # cap passes). Unset by default because only the owner knows the machine.
+    # cap passes). Unset by default because only the operator knows the machine.
     # How many findings a cloud read pulls before it stops and says so.
     # Unbounded, `get-findings` paginates a hundred at a time until it has
     # every finding an account holds: on a real estate that ran 46 minutes
@@ -1200,7 +1200,7 @@ class ProfileError(ValueError):
 # operator would read the acceptance as "the file is fine". The note exists
 # because the refusal reads as a non-sequitur without it: a `[scanners.zap]`
 # fault stopping a host audit that never runs zap looks like a bug until you
-# know the rule. Seen on the box, 2026-09-07.
+# know the rule. Seen in field use, 2026-09-07.
 PROFILE_REFUSED_NOTE = (
     "The whole file is refused, for every service — a profile that cannot be "
     "applied as written is not applied in part. Fix or delete it and run again."

@@ -402,7 +402,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         if ev["phase"] == "budget":
             # The number that answers "is it slow or is it stuck?". It was left
             # to the run page, and the run page is not where a person sits
-            # while semgrep takes twenty minutes on a large tree (the owner,
+            # while semgrep takes twenty minutes on a large tree (the operator,
             # 2026-09-12). It arrives just after the start line and before the
             # wait, which is exactly when it is wanted.
             sys.stdout.write("\033[90m≤%s\033[0m " % human_seconds(ev["timeout"]))
@@ -740,7 +740,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
             # Verify stamps are second-resolution, so two verifies in one
             # second print the same string and "then" and "now" read as the
             # same moment — which makes the anchor look like it compared
-            # against itself. Seen on the box, 2026-09-07. Say which it is.
+            # against itself. Seen in field use, 2026-09-07. Say which it is.
             same = report["previous_at"] == report["at"]
             print("Previous : %s%s — every digest seen then was compared with now"
                   % (report["previous_at"],

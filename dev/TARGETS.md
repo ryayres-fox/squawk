@@ -34,10 +34,10 @@ target:
 `check` says `PASS`, `FAIL` or `SKIP` per line. A scanner that is not
 installed makes its stage a gap and every assertion that needed it a `SKIP`
 naming it — a skip is not a pass — and the last line counts all three.
-Measured on the author's Mac on 2026-09-07, where grype is not installed:
-`35 passed, 0 failed, 4 skipped`, every skip naming grype. **On the Kali box
-the same day, with grype present: `39 passed, 0 failed, 0 skipped`** (#126,
-comment 12). Expectations are shapes — which rule ids appear, which must not —
+Measured on macOS on 2026-09-07, where grype is not installed:
+`35 passed, 0 failed, 4 skipped`, every skip naming grype. **On Kali the same
+day, with grype present: `39 passed, 0 failed, 0 skipped`.** Expectations are
+shapes — which rule ids appear, which must not —
 for the reason under *What "expected" means*; the counts here are what was
 measured, for comparison, not what is asserted.
 
@@ -45,11 +45,11 @@ measured, for comparison, not what is asserted.
 |---|---|---|---|---|
 | **Dockerfile corpus** `corpora/dockerfiles/{bad,good}` | known-bad and known-clean IaC | `./lab-targets.py build` | checkov + trivy-config (`compliance`) on one Dockerfile each | bad: checkov names `CKV_DOCKER_2`, `_3`, `_7` (no HEALTHCHECK, root, `:latest`) and trivy `DS-0001`, `DS-0002`, `DS-0026`; measured 11. good: **none of those ids**; measured 0. |
 | **k8s manifest corpus** `corpora/k8s/{bad,good}` | known-bad and known-clean IaC | same | checkov + trivy-config on one pod each | bad: `CKV_K8S_16`, `_23`, `_19` (privileged, root, hostNetwork) and trivy `KSV-0017`, `-0012`, `-0009`; measured 43. good: none of those; measured 2 — `CKV2_K8S_6` (no NetworkPolicy) and `CKV_K8S_43` (image by tag, not digest), hygiene rather than the bad one's faults. |
-| **lockfile corpus** `corpora/lockfiles` | known-CVE | same | trivy-fs, syft → grype and the differential (`baggage`) | trivy: `CVE-2018-1000656` and `CVE-2019-1010083` (flask 0.12.2), `CVE-2020-8203` and `CVE-2021-23337` (lodash 4.17.15); measured 11. grype: the same advisories under their GHSA ids — `GHSA-562c-5r94-xh97` and `GHSA-5wv5-4vpf-pj6m` (flask), `GHSA-35jh-r3h4-6jhm` and `GHSA-29mw-wpgm-hmr9` (lodash); measured 10 on the box, 21 in all. The differential stays silent. One harmless `app.py` is in it so bandit and semgrep examine a file and the run is complete, not a gap. |
-| **Juice Shop image** `bkimminich/juice-shop:latest` | known-CVE image | pulled by `fresh` | trivy-image, syft → grype (`cargo`) | trivy: CVEs across the image's npm packages, measured 128 across 8 scan targets. grype: 117 on the box, CVEs on the OS packages first; 245 in all. The differential stays silent. |
+| **lockfile corpus** `corpora/lockfiles` | known-CVE | same | trivy-fs, syft → grype and the differential (`baggage`) | trivy: `CVE-2018-1000656` and `CVE-2019-1010083` (flask 0.12.2), `CVE-2020-8203` and `CVE-2021-23337` (lodash 4.17.15); measured 11. grype: the same advisories under their GHSA ids — `GHSA-562c-5r94-xh97` and `GHSA-5wv5-4vpf-pj6m` (flask), `GHSA-35jh-r3h4-6jhm` and `GHSA-29mw-wpgm-hmr9` (lodash); measured 10 on Kali, 21 in all. The differential stays silent. One harmless `app.py` is in it so bandit and semgrep examine a file and the run is complete, not a gap. |
+| **Juice Shop image** `bkimminich/juice-shop:latest` | known-CVE image | pulled by `fresh` | trivy-image, syft → grype (`cargo`) | trivy: CVEs across the image's npm packages, measured 128 across 8 scan targets. grype: 117 on Kali, CVEs on the OS packages first; 245 in all. The differential stays silent. |
 | **OWASP Juice Shop** :3000 | known-vulnerable single-page app | `./lab-targets.py fresh` | recon, liveprobe, activeprobe | recon reports `3000:/`, `/api/`, `/rest/` and **`3000:catch-all`** — it answers every path with the same page, so DVWA, phpMyAdmin and TWiki are *not* reported at paths it does not serve (fifteen endpoints, one real, before 2026-09-07). ZAP: dozens; 44 on a prior run. The active probe's crawl budget is a profile setting (`zap_active_spider_minutes`), and the run prints the one it used. |
 | **DVWA** :8080 | known-vulnerable, behind a login | same | recon | `8080:/` (its login redirect) and `/dvwa/` (403 — a real directory). No probe expectation until a profile can log it in. |
-| **VAmPI** :5000 | known-vulnerable REST API with an OpenAPI in its repo | same | recon, liveprobe; `zap-api-scan` later | recon: `5000:/` only — it answers unknown paths with 404, so no catch-all. liveprobe: header findings `10036` (server version) and `10021` (X-Content-Type-Options), and the URL count on the ZAP line; measured 13 findings across 5 URLs on the Mac, 11 across 5 on the box. |
+| **VAmPI** :5000 | known-vulnerable REST API with an OpenAPI in its repo | same | recon, liveprobe; `zap-api-scan` later | recon: `5000:/` only — it answers unknown paths with 404, so no catch-all. liveprobe: header findings `10036` (server version) and `10021` (X-Content-Type-Options), and the URL count on the ZAP line; measured 13 findings across 5 URLs on macOS, 11 across 5 on Kali. |
 
 ## The other targets
 

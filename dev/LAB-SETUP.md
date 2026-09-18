@@ -31,7 +31,7 @@ have been poking at is not the target you scanned last week. Every expected
 answer, measured, is in [`TARGETS.md`](TARGETS.md). A longer probe is a
 profile, not an edit: `squawk.toml` in the evidence root with
 `[targets."http://127.0.0.1:3000"] zap_active_spider_minutes = 30` gives the
-active probe a real crawl, and the run prints it ([`SETUP.md`](SETUP.md),
+active probe a real crawl, and the run prints it ([`SETUP.md`](../docs/SETUP.md),
 *A profile*). crAPI, and a probe of DVWA
 that gets past its login, come when scan profiles exist to give a run a login
 and a budget. Everything downstream — recon, the
@@ -152,7 +152,7 @@ Expect ZAP to surface SQLi, XSS, CSRF, and missing headers on Mutillidae/DVWA �
 the known-vulnerable outcomes that prove DAST fired and parsed correctly.
 
 **SAST** — scan the same apps' source (DVWA and Mutillidae are on GitHub; or copy
-Metasploitable's `/var/www` off the box) as a repo:
+Metasploitable's `/var/www` off the target) as a repo:
 
 ```
 git clone https://github.com/digininja/DVWA /tmp/dvwa
@@ -173,5 +173,5 @@ target you just probed dynamically.
 - **Every DAST scan is time-boxed** (`-m 2` spider minutes), because an unbounded
   active scan against a stateful app is a denial of service in itself.
 
-See [`ROADMAP.md`](ROADMAP.md) for where this goes next (Docker-hosted targets,
+See [`ROADMAP.md`](../docs/ROADMAP.md) for where this goes next (Docker-hosted targets,
 authenticated DAST, canaries).

@@ -35,7 +35,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-HERE="$(cd "$(dirname "$0")" && pwd)"
+# The checks live in `dev/`; the app is one directory up, at the root of
+# the checkout.
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
 PASS=0; FAIL=0; SKIP=0
 RESULTS=""
 

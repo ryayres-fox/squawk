@@ -1,8 +1,7 @@
 # Squawk — roadmap
 
 The single ordered plan. [`CHARTER.md`](CHARTER.md) says what must stay true;
-this says what gets built and in what order; [`POSITIONING.md`](POSITIONING.md) says who it
-is for and what releasing it would cost. When any of them disagree, the charter
+this says what gets built and in what order. When the two disagree, the charter
 wins.
 
 Ordering principle, taken from the charter's one idea: **a claim nobody can
@@ -58,25 +57,25 @@ run that produced evidence.
 | DAST via the ZAP image, private-target rail, host-free identities | it 4 |
 | Target recon feeding the kiosk | it 4 |
 | AST10 skill audit | it 4 |
-| Findings grouped by advisory with drill-down and per-instance history | #61 |
-| Alarm codes 7500 / 7600 / 7700 | #62 |
-| Logging on by default, every refusal recorded | #68 |
-| The squawk verdict rendered on the web *Scan complete* page | #72 |
-| A never-built vulnerability database no longer reads as 739855 days old | #73 |
-| Normalizers survive a report shape they did not expect | #75 |
-| Host self-audit across seven areas, three states | #76 |
-| Install and update evidence: inventory, transcript, sha256, dependencies | #77 |
-| Portable installer, and 18/18 across six distributions | #78 |
-| Charter, and conformance tests that fail when it is broken | #79 |
-| Positioning, novelty assessment, licence and release gates | #80 |
-| Phase 1 finished: error channels carried, cross-scanner differential | #90 |
-| Correlation across scanners, stating the denominator | #91 |
-| Phase 1 field-check script for the full-toolbench paths | #94 |
+| Findings grouped by advisory with drill-down and per-instance history | merged |
+| Alarm codes 7500 / 7600 / 7700 | merged |
+| Logging on by default, every refusal recorded | merged |
+| The squawk verdict rendered on the web *Scan complete* page | merged |
+| A never-built vulnerability database no longer reads as 739855 days old | merged |
+| Normalizers survive a report shape they did not expect | merged |
+| Host self-audit across seven areas, three states | merged |
+| Install and update evidence: inventory, transcript, sha256, dependencies | merged |
+| Portable installer, and 18/18 across six distributions | merged |
+| Charter, and conformance tests that fail when it is broken | merged |
+| Positioning, novelty assessment, licence and release gates | merged |
+| Phase 1 finished: error channels carried, cross-scanner differential | merged |
+| Correlation across scanners, stating the denominator | merged |
+| Phase 1 field-check script for the full-toolbench paths | merged |
 
 ## In review, not merged
 
-Nothing currently in review. The last open stack (#75–#80) merged, and the
-Phase 1 / 1.5 work (#90, #91) with it. When a pull request is open with green
+Nothing currently in review. The last open stack merged, and the
+Phase 1 / 1.5 work with it. When a pull request is open with green
 checks but not yet accepted it belongs here, so the distinction — *tests passed*
 is not *done* — survives someone skimming.
 
@@ -90,25 +89,25 @@ implies the phases are the whole story.
 
 | | |
 |---|---|
-| A crashing web view showed a blank page; now surfaces the traceback | #96 |
-| An out-of-scope correlation reads "not applicable", not "cannot evaluate" | #97 |
-| The field check's differential test was vacuous — it never staged agreement | #95 |
-| **UI overhaul**: teal instrument panel, light and dark, colour-impaired-safe, one design system shared by the app and the exported report | #98 |
-| Overview tiles no longer stretch empty; the tagline says what the tool is for | #99 |
-| **Rescan** a prior target without retyping it | #100 |
-| **Compare** a rescan to the previous run — the *what changed* view | #101 |
-| Drill-down on compared findings; a findings-rating trend (−5 to +5, median at 0) | #103 |
-| Real evidence, targets named on every run, drillable triage, overview drill-down | #104 |
-| Findings and Triage count the same (both group by rule) | #105 |
-| Title and column polish; a clean result shows its work; a gap run is never drawn clean | #106, #107, #108 |
-| Topbar fixed; the design charter, `DESIGN.md` | #109, #110 |
-| Every scanner's evidence captured (code, description, reference); the passive-DAST claim made honest | #111, #112 |
-| A rescan of a vanished directory is refused; no ledger is not clean | #113 |
-| **Active app probe**: active DAST (zap-full-scan) behind the private-target rail | #114 |
-| **Cloud inventory**: ten API-driven AWS stages — org, inventory, enablement, IAM, edge, front door, storage, containers, data services, Access Analyzer — with toxic combinations joined across them | #197 and before |
-| **The cloud review, closed out**: seventeen findings from the 2026-09-10 review; every number on the page opens the set it counts, a reading that cannot be parsed is a gap rather than an exception, one severity scale with the code held to it, and AWS's own analyzer read where the account runs one | #199-#209 |
+| A crashing web view showed a blank page; now surfaces the traceback | merged |
+| An out-of-scope correlation reads "not applicable", not "cannot evaluate" | merged |
+| The field check's differential test was vacuous — it never staged agreement | merged |
+| **UI overhaul**: teal instrument panel, light and dark, colour-impaired-safe, one design system shared by the app and the exported report | merged |
+| Overview tiles no longer stretch empty; the tagline says what the tool is for | merged |
+| **Rescan** a prior target without retyping it | merged |
+| **Compare** a rescan to the previous run — the *what changed* view | merged |
+| Drill-down on compared findings; a findings-rating trend (−5 to +5, median at 0) | merged |
+| Real evidence, targets named on every run, drillable triage, overview drill-down | merged |
+| Findings and Triage count the same (both group by rule) | merged |
+| Title and column polish; a clean result shows its work; a gap run is never drawn clean | merged |
+| Topbar fixed; the design charter, `DESIGN.md` | merged |
+| Every scanner's evidence captured (code, description, reference); the passive-DAST claim made honest | merged |
+| A rescan of a vanished directory is refused; no ledger is not clean | merged |
+| **Active app probe**: active DAST (zap-full-scan) behind the private-target rail | merged |
+| **Cloud inventory**: ten API-driven AWS stages — org, inventory, enablement, IAM, edge, front door, storage, containers, data services, Access Analyzer — with toxic combinations joined across them | merged |
+| **The cloud review, closed out**: seventeen findings from the 2026-09-10 review; every number on the page opens the set it counts, a reading that cannot be parsed is a gap rather than an exception, one severity scale with the code held to it, and AWS's own analyzer read where the account runs one | merged |
 
-The compare view (#101) is the first working piece of Phase 2's remediation
+The compare view is the first working piece of Phase 2's remediation
 tracking; see that phase for what it does and does not yet do.
 
 ---
@@ -142,7 +141,7 @@ files scanned.** Semgrep with real rules on the same tree: **0 findings, 6 files
 scanned.** Identical finding counts, and the denominator separates them
 completely. Trivy on a directory it could not resolve returned a valid,
 clean-looking report with **zero `Results` blocks** — defect 1 and defect 4 in
-issue #58, both visible for free.
+the original defect list, both visible for free.
 
 - [x] **Extract coverage per stage** into the run evidence: units examined, units
       skipped, and what the unit means for that tool, because files, resources
@@ -184,7 +183,7 @@ what makes it survivable:
 
 ## Phase 1.5 — correlate, and let the scanners check each other ✅ core done
 
-The three deliverables below are merged (#91) and the exit criterion was
+The three deliverables below are merged and the exit criterion was
 demonstrated both ways. Open follow-ons, scoped in the PR rather than implied:
 the exploitable-and-reachable rule (needs recon and a CVE scanner in one
 url-scope service), Dockerfile COPY-target confirmation for the secret rule, and
@@ -206,7 +205,7 @@ join is a local operation nobody performs on open-source output.
       the combination reports `unknown`, never silent. **Done** — charter I16, verified live: secret+build went `unknown` when gitleaks was absent.
 - [x] **Disagreement as a free detection test.** Two scanners over the same input
       disagreeing sharply is a health signal that needs no fixture and cannot go
-      stale. **Done** — shipped in Phase 1 as `scanner_differential` (#90),
+      stale. **Done** — shipped in Phase 1 as `scanner_differential`,
       zero-vs-many only. Measured: bandit found a hardcoded password gitleaks
       missed.
 
@@ -217,7 +216,7 @@ else does.
 
 ### Review 2026-08-30 — gaps found, and where each stands
 
-An adversarial pass over everything to date found six defects (all fixed in #91,
+An adversarial pass over everything to date found six defects (all fixed,
 each with a regression test that failed on the pre-fix code) and four gaps that
 are documented here rather than fixed, with the reason.
 
@@ -251,7 +250,7 @@ problem that got fixed.
       separate mutable ledger. Open becomes resolved with a date; a resolved
       finding that returns is flagged as a regression; **a scanner that was
       silent never reads as a fix** (charter I1 across time).
-      *Started in #101:* the *what changed* view diffs a run against the prior
+      *Started:* the *what changed* view diffs a run against the prior
       run of the same target and already enforces the load-bearing rule — a
       scanner that did not run OK in both runs is silent, never remediated, with
       five regression tests. `finding_history` reconstructs `first`/`last`/`runs`
@@ -362,7 +361,7 @@ first day at a new organisation.
 
 - [x] **Cloud native findings ingest: AWS.** Security Hub (ASFF) is read as the
       read-only identity in the credential chain, behind SQUAWK_CLOUD_ACK, with
-      the identity named first and an empty read counted as a gap (#116).
+      the identity named first and an empty read counted as a gap.
       Defender for Cloud is still to do.
 - [ ] **Cloud native findings ingest, Azure.** Security Hub (ASFF) and
       Defender for Cloud assessments into normalizers; account and

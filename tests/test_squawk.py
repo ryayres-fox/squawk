@@ -29,7 +29,8 @@ from typing import ClassVar
 
 import squawk
 
-ENTRY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "squawk.py")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ENTRY = os.path.join(ROOT, "squawk.py")
 
 
 class _serve:
@@ -794,7 +795,7 @@ class TestAFirstRunHasNoLastTime:
         No squawk. Nothing critical, nothing under attack, and every source
         that reported last time reported again.
 
-    On the owner's first ever `cargo` run there was no last time. The 7600
+    On the operator's first ever `cargo` run there was no last time. The 7600
     check that compares scanners against the previous comparable run needs
     `pos > 0` and is skipped entirely when a run is the first of its target, so
     the third clause was the outcome of a comparison that never happened — a
@@ -988,7 +989,7 @@ class TestAChainedStageInheritsItsDenominator:
             self._ctx(tmp_path, "not json at all"), "sbom") is None
 
     def test_a_full_sbom_gives_grype_the_denominator_it_lacks(self, tmp_path):
-        """From the owner's first `customs` run, 2026-09-15:
+        """From the operator's first `customs` run, 2026-09-15:
 
             syft   ok 0 finding(s) across 759 packages
             grype  ok 18 finding(s) — tool publishes no coverage
@@ -1198,7 +1199,7 @@ class TestSevenSevenHundredSaysWhetherItIsLive:
     """7700 is the loudest line this tool prints, and on a repository scan it
     said "a critical exposure is live" over 38 trivy findings about
     security-group rules in `.tf` files and 3 about plain HTTP in an ALB
-    definition (the owner's run, 2026-09-14). Every finding was real. Nothing
+    definition (the operator's run, 2026-09-14). Every finding was real. Nothing
     had been checked for reachability, and a preflight cannot check it — it
     reads a tree, not an account.
 
@@ -1596,7 +1597,7 @@ class TestCorrelation:
         assert "read nothing" not in c[0]["why"]
 
     def test_a_scanner_that_died_does_not_delete_a_real_combination(self):
-        """From the owner's run, 2026-09-14. gitleaks timed out at its budget,
+        """From the operator's run, 2026-09-14. gitleaks timed out at its budget,
         so `secrets` left `ran_kinds`, and secret-in-container-build reported
         "cannot evaluate" over a bandit B105 and a Dockerfile that were both
         still sitting in the findings list. The same evidence with gitleaks at
@@ -1639,7 +1640,7 @@ class TestCorrelation:
 
 class TestACorrelationSaysWhatBecameOfTheScanner:
     """"no secrets scanner ran" was printed over a gitleaks that had run for
-    fifteen minutes and been killed at its budget (the owner's run,
+    fifteen minutes and been killed at its budget (the operator's run,
     2026-09-14). A tool that ran and died is not a tool that was never there,
     and this project's whole thesis is that those are different sentences."""
 
@@ -5514,7 +5515,7 @@ class TestDecisionsUnderLoad:
 
 
 class TestWhatTheScreenshotsShowed:
-    """Four things visible in the owner's screenshots and in headless renders of
+    """Four things visible in the operator's screenshots and in headless renders of
     main, each held here so it cannot come back."""
 
     def test_every_scan_tile_has_the_same_control_row(self, tmp_path):
@@ -5563,7 +5564,7 @@ class TestWhatTheScreenshotsShowed:
 
 
 class TestTheTileNumberIsTheProofNumber:
-    """The rule in the owner's words: if you present a number that references
+    """The rule in the operator's words: if you present a number that references
     data, it must be linked to show the proof. The critical & high tile showed
     102 and linked to critical alone, which showed 15. This holds the tile's
     number against the instance count on the page it lands on."""
@@ -5625,7 +5626,7 @@ class TestTheTileNumberIsTheProofNumber:
 
 
 class TestNoPageScrollsSideways:
-    """The owner at 170% zoom scrolled left and right to read the Overview:
+    """The operator at 170% zoom scrolled left and right to read the Overview:
     the page needed 1412px however narrow the window. Grid children default
     to the width of their content, so nothing shrank. These are the rules that
     let it; `live-check.py` measures the result with a real layout engine."""
@@ -5794,7 +5795,7 @@ class TestLabTargets:
     def _mod():
         import importlib.util
         spec = importlib.util.spec_from_file_location(
-            "lab_targets", os.path.join(os.path.dirname(ENTRY), "lab-targets.py"))
+            "lab_targets", os.path.join(os.path.dirname(ENTRY), "dev", "lab-targets.py"))
         assert spec is not None and spec.loader is not None
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
@@ -5906,8 +5907,13 @@ class TestLabTargets:
             head = path.read_text(encoding="utf-8").split("\n", 1)[0].lower()
             if head.startswith("#") and head.rstrip().endswith(("log", "changelog")):
                 continue
-            for m in re.finditer(r"`\./([\w-]+\.(?:py|sh))\b", path.read_text(encoding="utf-8")):
-                assert (here / m.group(1)).exists(), (path.name, m.group(1))
+            for m in re.finditer(r"`\./((?:[\w-]+/)*[\w-]+\.(?:py|sh))\b",
+                                 path.read_text(encoding="utf-8")):
+                # `./x` is relative to the document that says it, which is not
+                # always the root now that the checks live in `dev/`.
+                named = m.group(1)
+                assert (path.parent / named).exists() or (here / named).exists(), \
+                    (path.name, named)
 
 
 class TestProfiles:
@@ -6310,7 +6316,7 @@ class TestProfiles:
         assert [n for n in os.listdir(str(ev)) if n[:2] == "20"] == []
 
     def test_a_refused_profile_says_the_whole_file_is_refused(self, tmp_path, capsys):
-        """Seen on the box: a `[scanners.zap]` fault stopped a host audit that
+        """Seen in field use: a `[scanners.zap]` fault stopped a host audit that
         never runs zap, and the refusal read as a non-sequitur. A profile is
         one document — if part of it cannot be applied, none of it is, for
         every service — and the refusal now says so wherever it appears."""
@@ -6330,7 +6336,7 @@ class TestProfiles:
     def test_two_verifies_in_one_second_do_not_read_as_one(self, tmp_path, monkeypatch, capsys):
         """Verify stamps are second-resolution. Two verifies in the same
         second printed `Previous : <t>` under `Checked : <t>`, which reads as
-        an anchor compared against itself. Seen on the box, 2026-09-07: the
+        an anchor compared against itself. Seen in field use, 2026-09-07: the
         second verify had really used the first as its anchor and caught an
         edit, but the line could not say so."""
         ev = tmp_path / "ev"
@@ -6353,7 +6359,7 @@ class TestProfiles:
 
 class TestAScanSaysItIsNotStuck:
     """A forty-minute active probe showed a spinner and nothing else, so an
-    operator could not tell a working scan from a hung one (the owner, #126,
+    operator could not tell a working scan from a hung one (field report,
     2026-09-07). What is honestly knowable while a scanner runs is elapsed
     time and the bound it is running under — never a percentage, because no
     scanner here publishes progress and a bar that advanced on a guess would
@@ -6486,8 +6492,8 @@ class TestAScanSaysItIsNotStuck:
 
 
 class TestTheClockWall:
-    """The owner asked for *"a panel in the room showing times from all over
-    the world"*, saw the first version show his own zone twice, and said:
+    """The operator asked for *"a panel in the room showing times from all over
+    the world"*, saw the first version show their own zone twice, and said:
     *"why would you show me two of the same time zone. use the three main
     american time zones plus utc major european and asian time zones as well
     and any others that are standard."* So: a wall, UTC first because that is
@@ -6502,7 +6508,7 @@ class TestTheClockWall:
         assert all(o is not None for o in offsets), ids
         # All four US offsets. Honolulu and Denver were missing, so a wall
         # meant to answer "what time is it where that ran" skipped two of the
-        # zones a US estate actually runs in (the owner, 2026-09-11).
+        # zones a US estate actually runs in (the operator, 2026-09-11).
         assert ids[1:6] == ["Pacific/Honolulu", "America/Los_Angeles",
                             "America/Denver", "America/Chicago",
                             "America/New_York"], "the American zones, west to east"
@@ -6576,7 +6582,7 @@ class TestTheClockWall:
         """The server cannot know the reader's zone, so the script asks the
         browser and badges the clock that already shows it — adding one only
         when that zone is not on the wall. Showing the same time twice is
-        exactly what the owner objected to."""
+        exactly what the operator objected to."""
         html = squawk.page("X", "", "", "").decode()
         assert "resolvedOptions().timeZone" in html
         assert "cells.filter(function(c){return c.dataset.zone===you})[0]" in html
@@ -6626,7 +6632,7 @@ class TestTheClockWall:
     def test_the_walls_own_classes_are_not_someone_elses(self):
         """The mark rendered as a 15px circle because `.mark` was already the
         severity legend's class, defined later in the same stylesheet with a
-        fixed width — so the badge the owner photographed was a severity dot
+        fixed width — so the badge the operator photographed was a severity dot
         wearing the wrong text. Every class this component emits must be
         styled only under `.clocks`, never by a rule of its own elsewhere."""
         css = squawk.PAGE_CSS
@@ -6678,7 +6684,7 @@ class TestTheClockWall:
 
 
 class TestTheFinishedScanSaysWhatItWas:
-    """The owner, #126, 2026-09-07: *"when scan completed on this page I have
+    """Field report, 2026-09-07: *"when scan completed on this page I have
     no idea what kind of scan this was. I only know it was baggage because I
     waited to see what the scan page went to when done."* The running view
     named the service and target; the finished one showed a run id and
@@ -6702,7 +6708,7 @@ class TestTheFinishedScanSaysWhatItWas:
 
 
 class TestWatchingAScanIsCheap:
-    """The owner, #126, 2026-09-07: the box got sluggish while the job page
+    """Field report, 2026-09-07: the host got sluggish while the job page
     tracked a probe. The page reloads itself, and every reload counted the
     runs by parsing every manifest in the store — eighty-five JSON documents
     for one number in the top bar, several times a minute."""
@@ -6758,11 +6764,11 @@ class TestWatchingAScanIsCheap:
 
 
 class TestAMemoryBudgetForTheProbe:
-    """The owner, #126: *"live app probe steals all of my memory to copy text
+    """Field report: *"live app probe steals all of my memory to copy text
     from cli."* ZAP's launcher takes a quarter of the memory it believes it
     has as its heap — and in a container under cgroup v2 it reads the HOST's,
     so a container limit changes nothing about how much ZAP asks for. The
-    first version of this shipped that wrong premise and the owner's probe
+    first version of this shipped that wrong premise and the operator's probe
     failed on it the same day. The lever that works is ZAP's own JVM
     properties file, measured 2026-09-08."""
 
@@ -6800,7 +6806,7 @@ class TestAMemoryBudgetForTheProbe:
 
     def test_no_heap_is_the_default_and_changes_nothing(self, tmp_path, monkeypatch):
         """Unset, ZAP takes a quarter of the machine. Setting it too small
-        turns a working probe into a failed one, and only the owner knows the
+        turns a working probe into a failed one, and only the operator knows the
         machine — so the built-in is nothing, and it reads `no cap` rather
         than the word None."""
         monkeypatch.setattr(squawk.stages, "tool_path", lambda name: None)
@@ -6817,7 +6823,7 @@ class TestAMemoryBudgetForTheProbe:
 
     def test_the_estate_summary_follows_the_table_it_summarises(self):
         """The summary card is short and the targets table is long, so the
-        right column was mostly empty on a wide screen (the owner, with a
+        right column was mostly empty on a wide screen (the operator, with a
         screenshot). It sticks below the top bar instead, and goes back to
         normal flow at the width where the columns stack.
 
@@ -6859,7 +6865,7 @@ class TestAMemoryBudgetForTheProbe:
     def test_a_failed_stage_keeps_all_of_its_stderr(self, tmp_path, monkeypatch):
         """One line is enough to know a stage failed and nowhere near enough
         to say why — and the machine that can answer is not always the machine
-        that can reproduce it (the owner's box, 2026-09-08). The whole of
+        that can reproduce it (the operator's box, 2026-09-08). The whole of
         stderr is evidence, hashed and sealed with the run."""
         ev = tmp_path / "ev"
         ev.mkdir()
@@ -6898,7 +6904,7 @@ class TestAMemoryBudgetForTheProbe:
 
 
 class TestAProbeRefusesAPortWithNothingOnIt:
-    """The owner's probe failed three times in under half a minute each, and
+    """The operator's probe failed three times in under half a minute each, and
     the reason was one line at the bottom of a log nobody had reason to open:
     `Job spider failed to access URL … Connection refused`. Juice Shop was
     down. The run said a scanner had gone quiet, which is true and useless —
@@ -7008,7 +7014,7 @@ class TestTheCloudGuideDescribesTheRealThing:
     def _guide():
         """The guide as one line, because prose wraps and the tool's messages
         do not — a quote broken over two lines is still the same quote."""
-        with open(os.path.join(os.path.dirname(ENTRY), "CLOUD-SETUP.md"),
+        with open(os.path.join(os.path.dirname(ENTRY), "docs", "CLOUD-SETUP.md"),
                   encoding="utf-8") as fh:
             return " ".join(fh.read().split())
 
@@ -7060,7 +7066,7 @@ class TestTheCloudGuideDescribesTheRealThing:
         assert claimed, "the README no longer states its own counts"
         assert words[claimed.group(1).lower()] == len(rows), \
             "the README lists %d documents and claims %s" % (len(rows), claimed.group(1))
-        charter = (here / "CHARTER.md").read_text(encoding="utf-8")
+        charter = (here / "docs" / "CHARTER.md").read_text(encoding="utf-8")
         invariants = len(re.findall(r"^\| \*\*I\d+\*\*", charter, re.M))
         assert words[claimed.group(2).lower()] == invariants, \
             "the charter has %d invariants and the README claims %s" % (
@@ -7346,7 +7352,7 @@ class TestStartupFailuresSayWhatFailed:
     """`serve --daemon` on a busy port printed "Squawk did not come up within
     6 s; see <log>" and left a socketserver traceback in that log — naming
     neither the port nor the reason, for the most ordinary startup failure
-    there is (the owner, 2026-09-08, port 8787 taken on a work machine)."""
+    there is (the operator, 2026-09-08, port 8787 taken on a work machine)."""
 
     @staticmethod
     def _busy():
@@ -7417,7 +7423,7 @@ class TestStartupFailuresSayWhatFailed:
 
 
 class TestASyncFolderIsNamedBeforeTheRun:
-    """From the owner's machine, 2026-09-14. A test repository inside OneDrive
+    """From the operator's machine, 2026-09-14. A test repository inside OneDrive
     timed out gitleaks after 900s and semgrep after 1200s, while bandit
     finished in 7s and `trivy config` in 5s — those two filter to `.py` and to
     IaC files before reading, so they open a fraction of the tree. The split is
@@ -7523,7 +7529,7 @@ class TestATimeoutNamesItsBudget:
         assert "[scanners.awscli] stage_timeout = 3600" in detail, detail
 
     def test_the_advice_raises_the_stage_that_asked(self, tmp_path, monkeypatch):
-        """From the owner's run of 2026-09-14. gitleaks and semgrep both timed
+        """From the operator's run of 2026-09-14. gitleaks and semgrep both timed
         out in one preflight, and each printed `[services.preflight]
         stage_timeout` with a DIFFERENT value — 5400 and 7200, for the same
         key. Following either gives bandit ninety minutes to do seven seconds
@@ -7563,7 +7569,7 @@ class TestATimeoutNamesItsBudget:
 
 class TestNoPageRendersARunTargetRaw:
     """The Findings heading read `Run of 111111111111` while the run picker two
-    lines under it read `********8115` — photographed by the owner, 2026-09-17,
+    lines under it read `********8115` — photographed by the operator, 2026-09-17,
     which is the fourth time this id has left the machine in a screenshot.
 
     `mask_account`'s own docstring names "the Findings heading" as a place it
@@ -7695,7 +7701,7 @@ class TestTheAccountIsMaskedOnScreen:
 class TestAWideWindowIsUsed:
     """The content was capped at 1200px while the clock strip spanned the whole
     window, so a 2000px screen showed 568px of empty space beside the findings
-    and a strip that ran past them (the owner, 2026-09-08). The cap was raised
+    and a strip that ran past them (the operator, 2026-09-08). The cap was raised
     to 1680px; measured after, 88px.
 
     Raising a cap is not removing one, and on 2026-09-11 the same complaint
@@ -8893,7 +8899,7 @@ class TestDefaultOnlyRegionsCollapse:
 
 
 class TestAReadingDatesItself:
-    """From the reference design the owner pointed at: "Every figure below is
+    """From the reference design the operator pointed at: "Every figure below is
     from that one saved reading — a page load costs nothing and dates itself."
     A number is worth what the reader knows about where it came from."""
 
@@ -12619,7 +12625,7 @@ class TestNoAddressLeavesTheMachine:
 #
 # `get-resources` without `--embed methods` returns each method as `{}`. The
 # reader treated the missing `authorizationType` as open, so every method on
-# every REST API was a HIGH finding — the seven APIs from the owner's real run
+# every REST API was a HIGH finding — the seven APIs from the operator's real run
 # would have been seven whatever their authorizers were.
 #
 # The fixtures below are the CLI's shape, not the projected shape the reader
@@ -13134,7 +13140,7 @@ class TestWhatAwsSaysIsReachableFromOutside:
 
 
 class TestEveryCountThePageShowsIsDiffed:
-    """From the owner's run of 2026-09-15. A reading went from 106 network
+    """From the operator's run of 2026-09-15. A reading went from 106 network
     interfaces to 107 and the comparison said:
 
         What changed since the last reading — 0 change(s), 24.1h apart
@@ -13192,7 +13198,7 @@ class TestEveryCountThePageShowsIsDiffed:
 
 
 class TestAStageIsTimedOnTheClockItsBudgetUses:
-    """From the owner's run of 2026-09-14, on a laptop that slept overnight:
+    """From the operator's run of 2026-09-14, on a laptop that slept overnight:
 
         semgrep  !! timed out after 7200s  ·  and it took a further 9h 29m to
         stop, so the stage ran 11h 29m in all
@@ -13666,7 +13672,8 @@ class TestTheRoleAwsOrganizationsCreatesIsNotACriticalFinding:
 
 class TestTheEdgeStageCoversBothShapes:
     """Review 2, R-22. `_cov_cloudedge` did `int(per.get("functions") or 0)`.
-    #207 changed `functions` from a count to the list of functions so the tile
+    A later change made `functions` the list of functions rather than a count,
+    so the tile
     could expand, and updated the reader but not the extractor: `int` of a
     non-empty list raises, `stage_coverage` swallows it, and the stage reported
     no coverage at all on every populated account.
@@ -13692,7 +13699,7 @@ class TestTheEdgeStageCoversBothShapes:
         assert "3 function(s) and load balancer(s) found" in cov.note
 
     def test_an_old_reading_that_carried_a_count_still_reads(self):
-        """Evidence written before #207 holds an integer. A run kept last month
+        """Evidence written before that change holds an integer. A run kept last month
         has to stay readable."""
         cov = squawk.scanners.stage_coverage("cloudedge",
                                              json.dumps(self._edge(2)))
@@ -14277,8 +14284,8 @@ class TestWhatAnArgvRecorderCannotSee:
         # Relative to THIS file, not to the working directory. CI runs pytest
         # from the repository root and a relative "CHARTER.md" is only found
         # when the suite happens to be run from inside the package.
-        charter = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               "CHARTER.md")
+        charter = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "docs", "CHARTER.md")
         row = [ln for ln in open(charter, encoding="utf-8")
                if ln.startswith("| **I3**")]
         assert row, "the I3 row moved"
@@ -14624,7 +14631,7 @@ class TestTwoDenominatorsThatWereWrong:
         return argv
 
     def test_a_directory_that_is_not_a_repository_gets_no_git(self, tmp_path):
-        """The owner's `GitHub Repos/acme-platform` — a directory that HOLDS
+        """The operator's `GitHub Repos/acme-platform` — a directory that HOLDS
         repositories rather than being one. `--no-git` was decided by scope
         alone, so gitleaks was told to walk a history that does not exist and
         reported "0 commits scanned · scanned ~0 bytes". Reproduced against
@@ -14869,7 +14876,7 @@ class TestArgumentsThisRunDidNotPass:
 
 
 class TestALongStageSaysHowLongItMay:
-    """"semgrep is still running and has been for some time" (the owner,
+    """"semgrep is still running and has been for some time" (the operator,
     2026-09-12). The start line said which stage; the number that answers "is
     it slow or is it stuck?" was left to the run page, and the run page is not
     where a person sits while semgrep takes twenty minutes on a large tree."""

@@ -2341,13 +2341,13 @@ def _github_sub_scope(sub: str) -> str:
 
     A GitHub OIDC subject reads `repo:<owner>/<name>:<context>`, and the three
     parts narrow by very different amounts. Everything before the first slash
-    is the owner, and a wildcard there is not a narrowing at all: `repo:*/*`,
+    is the operator, and a wildcard there is not a narrowing at all: `repo:*/*`,
     `repo:*:*` and `repo:*` each admit every repository on GitHub, which is the
     exact configuration this whole function exists to name. The previous test
     was `sub.startswith("*")`, so all three came back "pinned" and no finding
     fired (review R-5, reproduction 4).
 
-    Returns "loose" (pins nobody), "organization" (pins the owner but not the
+    Returns "loose" (pins nobody), "organization" (pins the operator but not the
     repository) or "repository" (pins both).
     """
     value = sub.strip()

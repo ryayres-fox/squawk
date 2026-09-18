@@ -194,7 +194,7 @@ CORRELATIONS: Tuple[Correlation, ...] = (
 # What became of a stage that did not produce a usable read. The distinction is
 # the tool's own thesis pointed inward: "no secrets scanner ran" was printed
 # over a gitleaks that had run for fifteen minutes and been killed at its
-# budget (the owner's run, 2026-09-14). A tool that ran and died is not a tool
+# budget (the operator's run, 2026-09-14). A tool that ran and died is not a tool
 # that was never there, and saying so is the same substitution this refuses
 # everywhere else.
 _TROUBLE = {
@@ -287,7 +287,7 @@ def correlate(findings: List[dict], results: "List[StageResult]") -> List[dict]:
             continue                       # not applicable to this kind of scan
         # The rule is evaluated whatever happened upstream, and the OUTCOME
         # decides the state. Gating evaluation on the required kinds threw away
-        # real findings: on the owner's run gitleaks timed out, so `secrets`
+        # real findings: on the operator's run gitleaks timed out, so `secrets`
         # left `ran_kinds`, and secret-in-container-build reported "cannot
         # evaluate" over a bandit B105 and a Dockerfile that were both still
         # sitting in the findings list. The same evidence with gitleaks at
@@ -1262,7 +1262,7 @@ def _guardduty_features(regional: dict, read: List[str]) -> dict:
 
     GuardDuty being "on" says nothing about whether it is looking at your
     runtime, your EKS audit logs or your S3 data events. The reference design
-    the owner pointed at showed these as a strip of pills for exactly that
+    the operator pointed at showed these as a strip of pills for exactly that
     reason: the headline hides the detail that decides what it can actually
     see."""
     on: set = set()
@@ -1363,7 +1363,7 @@ TRACKED_COUNTS = (
     # These four are on the page and were not diffed. A real reading went from
     # 106 network interfaces to 107 and the comparison said "Nothing changed,
     # over readings that covered the same ground both times" — a positive claim
-    # of no change, not an absence of news (the owner's run, 2026-09-15).
+    # of no change, not an absence of news (the operator's run, 2026-09-15).
     #
     # `enis` and `roles` were blind on both paths: neither is in `ID_FIELDS`
     # either, so a new one appeared under no heading at all. `igws` and
@@ -1662,7 +1662,7 @@ def iam_findings(data: dict) -> List[dict]:
 OUTSIDE_REACH = ("anyone", "external")
 
 # `federated` was one word for nine different doors. The page printed it beside
-# every GitHub Actions role on the owner's account, and the difference between
+# every GitHub Actions role on the operator's account, and the difference between
 # a trust pinned to ONE REPOSITORY and one pinned to the whole organization is
 # the entire risk: the second lets any repository in the org assume the role.
 # `_federated_reach` has computed which it is since the GitHub reader was
@@ -4324,7 +4324,7 @@ LIVE_SCOPES = ("aws", "url", "host")
 # loudest line this tool prints, did not. On a preflight of a Terraform
 # repository it announced "a critical exposure is live" over 38 trivy findings
 # about security-group rules in `.tf` files and 3 about plain HTTP in an ALB
-# definition (the owner's run, 2026-09-14). Every finding was real and nothing
+# definition (the operator's run, 2026-09-14). Every finding was real and nothing
 # had been checked for reachability. An alarm that overstates is the same
 # failure as one that understates, and it costs more: a reader who learns to
 # discount 7700 has lost the loudest channel there is.
@@ -4476,7 +4476,7 @@ def comparable_runs(root: str, man: dict) -> "Tuple[List[dict], Optional[int]]":
     cannot run at all -- and the CLI said "every source that reported last time
     reported again" anyway. That is a claim about a comparison that never
     happened, on the first run of a target, which is exactly when a reader has
-    least reason to doubt it (the owner's first `cargo` run, 2026-09-15)."""
+    least reason to doubt it (the operator's first `cargo` run, 2026-09-15)."""
     same = sorted((m for m in list_runs(root) if target_key(m) == target_key(man)),
                   key=lambda m: m["run_id"])
     ids = [m["run_id"] for m in same]
@@ -4552,7 +4552,7 @@ def squawk_check(root: str, man: dict) -> List[dict]:
             # beats a theoretical critical — and then it inherited the code's
             # own words, which say critical. A live probe of Juice Shop printed
             # "4 high finding(s) against a RUNNING app" and "(a critical
-            # exposure is live)" four lines apart (the owner, 2026-09-16). The
+            # exposure is live)" four lines apart (the operator, 2026-09-16). The
             # scope half was right and the severity half was not: the earlier
             # pass set a strapline on the critical branch and left this one on
             # the fallback.

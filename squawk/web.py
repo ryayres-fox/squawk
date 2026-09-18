@@ -295,8 +295,8 @@ a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,
 /* A GRID, not a wrapping flex row. Fifteen cells never fit one row on a
    laptop, and wrapped flex cells size themselves independently: eight on the
    first row and seven on the second, none of them lining up, every cell a
-   different width. On a 14" screen that reads as noise rather than as a wall
-   of clocks (the owner, 2026-09-15).
+   different width. On a small laptop screen that reads as noise rather than as a wall
+   of clocks (the operator, 2026-09-15).
    `auto-fit` puts as many columns as fit and shares the rest, so the rows are
    columns and the cell count follows the window without a breakpoint. */
 /* A FIXED number per row, chosen at breakpoints, with the remainder centred.
@@ -308,7 +308,7 @@ a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,
        8 columns -> 8 + 7        7 columns -> 7 + 7 + 1
        5 columns -> 5 + 5 + 5    4 columns -> 4 + 4 + 4 + 3
 
-   A window a little narrower than the owner's lands on seven and puts one
+   A window a little narrower than the operator's lands on seven and puts one
    clock alone on a row. So the count is chosen here, from the values that
    divide well, and never by the width on its own.
 
@@ -349,9 +349,9 @@ a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,
  font-size:.95rem;font-weight:600;color:var(--ink);line-height:1.2;
  font-variant-numeric:tabular-nums}
 .clocks .day{font-size:.62rem;color:var(--faint);line-height:1.25}
-/* A clock that is one of *these* machines — the box that scanned, the browser
+/* A clock that is one of *these* machines — the host that scanned, the browser
    reading — is marked by the whole cell. On a wall of ten a chip in the corner
-   is easy to miss, which is what the owner found. */
+   is easy to miss, which is what the operator found. */
 .clocks .clk.here{background:var(--accent-soft);border-radius:5px;
  box-shadow:inset 0 2px 0 var(--accent)}
 .clocks .clk.here .now{color:var(--accent-2)}
@@ -794,8 +794,8 @@ def _zone_now(zone: str, when: float) -> Optional[Tuple[str, str, str, str]]:
 
 
 def clock_wall() -> str:
-    """The wall, the way an operations room hangs it — the owner's own
-    request, and his correction to the first version: *"why would you show me
+    """The wall, the way an operations room hangs it — the operator's own
+    request, and their correction to the first version: *"why would you show me
     two of the same time zone. use the three main american time zones plus utc
     major european and asian time zones."*
 
@@ -836,7 +836,7 @@ def clock_wall() -> str:
         #
         # A clock that is one of *these* machines is marked by the whole cell,
         # not by a chip in the corner: on a wall of ten identical clocks a
-        # small badge is easy to miss, which is what the owner found.
+        # small badge is easy to miss, which is what the operator found.
         cells.append(
             "<div class='clk%s' data-zone='%s' title='%s · %s'>"
             "<span class='zone'>%s%s</span>"
@@ -1667,7 +1667,7 @@ def coverage_panel(man: dict) -> str:
             # knowing about before the next run.
             # The same wording as the job page while it was running — that
             # said "6m 35s of the 40m 00s budget" and this said "6m 42s of
-            # 2400 s", one number in two hands (the owner's screenshots,
+            # 2400 s", one number in two hands (the operator's screenshots,
             # 2026-09-08). The raw seconds are what a profile types; a page
             # that reports elapsed against it should read the same both times.
             took = ran.get("elapsed")
@@ -1839,7 +1839,7 @@ def view_job(job: Job, root: str) -> str:
                    % E(job.run_id or "")) if priors >= 2 else ""
     # Which scan, and against what. The page said only "Scan complete" and a
     # run id, so an operator who had walked away could not tell what had just
-    # run without watching where the job page came from (the owner, #126,
+    # run without watching where the job page came from (the operator,
     # 2026-09-07). The running view says it; the finished one must too.
     took = human_seconds(job.elapsed())
     return (

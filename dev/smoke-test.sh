@@ -24,7 +24,9 @@
 
 set -uo pipefail
 
-HERE="$(cd "$(dirname "$0")" && pwd)"
+# The checks live in `dev/`; the app is one directory up, at the root of
+# the checkout.
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
 EV="$(mktemp -d)"
 WITH_TARGETS=0
 PASS=0; FAIL=0

@@ -2,13 +2,13 @@
 
 A runbook from a fresh Kali VM to a DAST scan firing against a containerized
 target. Each step carries a **Verify** line so the instructions are testable.
-The VM, host-only network, and snapshots are in [`LAB-SETUP.md`](LAB-SETUP.md);
+The VM, host-only network, and snapshots are in [`LAB-SETUP.md`](../dev/LAB-SETUP.md);
 this is the software install and the run. 16 GB RAM is comfortable for Kali +
 Docker + a target + ZAP.
 
 ## Prerequisites
 
-- Kali up per [`LAB-SETUP.md`](LAB-SETUP.md), Python 3.9+.
+- Kali up per [`LAB-SETUP.md`](../dev/LAB-SETUP.md), Python 3.9+.
 - A way to fetch Squawk — **`git`** (to clone the repo) or **`wget`/`curl`** (to
   pull the two raw files). Install whichever you prefer first; Kali ships curl.
 - `squawk.py` and `squawk-dashboard.py` must end up in the **same directory** —
@@ -20,7 +20,7 @@ Docker + a target + ZAP.
 > On Apple Silicon, VirtualBox is ARM-only and can't boot the x86 Metasploitable
 > 2 disk — the target is a multi-arch container instead. Same recon, same DAST.
 
-## Fetching Squawk onto the box
+## Fetching Squawk onto the host
 
 ```bash
 git clone https://github.com/ryayres-fox/squawk.git
@@ -35,7 +35,7 @@ its root.
 This box runs offensive tooling near deliberately-vulnerable targets — treat it
 as compromisable and give it the **least access that still works**. Do **not** put
 your GitHub account's SSH key or a broad token on it. Use a **read-only deploy
-key** scoped to that one repo: if the box is popped, the blast radius is read
+key** scoped to that one repo: if the host is popped, the blast radius is read
 access to a single repo, revoked by deleting one key.
 
 Generate a repo-scoped key on Kali (set a passphrase), and add the **public** half
@@ -65,7 +65,7 @@ git clone git@github-squawk:ryayres-fox/squawk.git
 **Verify:** `ssh -T git@github-squawk` reports authentication succeeded
 (read-only).
 
-Alternatives, in rough order of how much they trust the box:
+Alternatives, in rough order of how much they trust the host:
 
 - **Fine-grained PAT (HTTPS), read-only, scoped to this repo, with an expiry** —
   clone with a credential helper so the token never lands in a URL or
@@ -131,7 +131,7 @@ docker ps -a --filter name=juice --filter name=dvwa --filter name=vampi --format
 
 The targets are Juice Shop on :3000, DVWA on :8080 and VAmPI on :5000, each
 published on 127.0.0.1 only. `check` runs each service against the target
-whose answer is written beside it in [`TARGETS.md`](TARGETS.md) and prints
+whose answer is written beside it in [`TARGETS.md`](../dev/TARGETS.md) and prints
 one line per assertion with the value it saw; a scanner that is not installed
 makes its lines `SKIP`, never `PASS`.
 
@@ -254,7 +254,7 @@ fresh.
 ## Reaching the UI
 
 From the Kali desktop: `python3 squawk.py --open` (→ `http://127.0.0.1:8787/`).
-From the Mac, tunnel to it (preserves loopback-only):
+From your workstation, tunnel to it (preserves loopback-only):
 
 ```bash
 ssh -L 8787:127.0.0.1:8787 <user>@<kali-host-only-ip>
@@ -268,8 +268,8 @@ findings.
 | Symptom | Cause | Fix |
 |---|---|---|
 | `docker: permission denied` | not in the docker group yet | `newgrp docker`, or re-login |
-| `Conflict. The container name "/juice" is already in use` | the container survived a reboot in Exited state and still holds the name; restarting the docker service does not clear it | `./lab-targets.py fresh` (or `docker start juice`) — see *Coming back to the lab after a reboot* |
-| target exists but `curl` returns nothing | container is `Exited`, not running | `./lab-targets.py status` then `fresh` |
+| `Conflict. The container name "/juice" is already in use` | the container survived a reboot in Exited state and still holds the name; restarting the docker service does not clear it | `./../dev/lab-targets.py fresh` (or `docker start juice`) — see *Coming back to the lab after a reboot* |
+| target exists but `curl` returns nothing | container is `Exited`, not running | `./../dev/lab-targets.py status` then `fresh` |
 | `curl` to target refuses | container down, or port not on loopback | `docker ps`; republish with `-p 127.0.0.1:PORT:PORT` |
 | recon finds nothing | wrong port/scheme, or not serving | confirm the port; try `http://127.0.0.1:3000/#/` for Juice Shop |
 | `Refusing DAST target` | target host is not private | use `127.0.0.1` / `192.168.x` / `10.x`; a public target needs `SQUAWK_DAST_ACK=1` |

@@ -83,7 +83,7 @@ _OWN_CONFIG = {
 }
 
 # And what to do about it. Naming the cause left the reader with a diagnosis
-# and no move: the owner's own repository lost checkov on every run of
+# and no move: the operator's own repository lost checkov on every run of
 # `preflight` and `compliance`, which is two services down to a coverage gap
 # until somebody works out the remedy. Measured against checkov 3.2.459 on
 # 2026-09-12: `--config-file` does NOT override the tree's own file, and the
@@ -420,14 +420,14 @@ def _run_one_stage(spec: StageSpec, ctx: RunContext, raw_file: str,
     # asleep. This was `time.time()`, which does. A laptop that slept overnight
     # mid-run reported "timed out after 7200s · and it took a further 9h 29m to
     # stop, so the stage ran 11h 29m in all" — the stage had not overrun by a
-    # second, and the line said the timeout control had failed (the owner's run
+    # second, and the line said the timeout control had failed (the operator's run
     # of 2026-09-14). Comparing an elapsed on one clock against a budget on
     # another is a claim about a control that was never measured.
     started = time.monotonic()
     code, out, err = run_cmd(cmd, cwd=None, timeout=timeout)
     ran["elapsed"] = round(time.monotonic() - started, 1)
     # Everything the scanner said on stderr, kept as evidence rather than the
-    # first line of it. A ZAP probe failed on the owner's box in 25 seconds
+    # first line of it. A ZAP probe failed on the operator's box in 25 seconds
     # (2026-09-08) and the run held one line — enough to know it failed,
     # nowhere near enough to say why, and the machine that could answer was
     # not the machine that could reproduce it. The file is hashed into the
@@ -497,7 +497,7 @@ def _run_one_stage(spec: StageSpec, ctx: RunContext, raw_file: str,
     # operator chose that number. Measured 2026-09-08 — a heap too small fails
     # in well under a minute, which is how it reads on the run.
     if status in ("error", "gap"):
-        # A stage killed at its budget should name the budget. The owner's
+        # A stage killed at its budget should name the budget. The operator's
         # first real Security Hub read hit the built-in ten minutes and said
         # only "timed out after 600s" — true, and it left the reader to work
         # out that the number is a setting (2026-09-08).
@@ -506,7 +506,7 @@ def _run_one_stage(spec: StageSpec, ctx: RunContext, raw_file: str,
             # applies to every stage in it, so a run where two stages time out
             # printed two different values for one key — gitleaks asking for
             # 5400 and semgrep for 7200, in the same block, both writing
-            # `[services.preflight] stage_timeout` (the owner's run,
+            # `[services.preflight] stage_timeout` (the operator's run,
             # 2026-09-14). Following either gave bandit ninety minutes to do
             # seven seconds of work, and following both is impossible.
             # `[scanners.<tool>]` is the most specific table a profile has and
@@ -535,7 +535,7 @@ def _run_one_stage(spec: StageSpec, ctx: RunContext, raw_file: str,
         # checkov that would not take a flag reported its usage banner --
         # "usage: checkov [-h] [-v] [--support] ..." -- and the sentence that
         # says which flag was in the 38th line of a file the reader had to go
-        # open (the owner, 2026-09-12). argparse is what most of these are
+        # open (the operator, 2026-09-12). argparse is what most of these are
         # built on, and `prog: error: ...` is its convention.
         refusal = str(ran.get("refusal") or "")
         if refusal:
@@ -543,7 +543,7 @@ def _run_one_stage(spec: StageSpec, ctx: RunContext, raw_file: str,
         # The detail is otherwise the FIRST line of stderr, which is a poor
         # summary when a scanner is verbose: with ZAP's `-d` on, the first line
         # is a debug message and the run read "zap did not report (Trigger
-        # hook: cli_opts, args: 1)" (the owner, 2026-09-08). Point at the rest,
+        # hook: cli_opts, args: 1)" (the operator, 2026-09-08). Point at the rest,
         # which is kept, rather than let one line stand for all of it.
         lines = ran.get("stderr_lines")
         more = (lines - 1) if isinstance(lines, int) else 0
