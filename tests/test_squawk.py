@@ -16108,3 +16108,76 @@ class TestStopHonoursThePortItWasGiven:
         out = capsys.readouterr().out
         assert killed == [], "the CLI dropped the port and stopped the server"
         assert rc == 2 and "Refusing to stop" in out, out
+
+
+class TestSelfPermsSaysHowManyAreLoose:
+    """The instrument check named one writable file at a time.
+
+    A clone made with a permissive umask has every file group-writable. The
+    check reported the loosest one, an operator ran the `chmod go-w <file>` it
+    printed, and the next run named the next file — a queue presented as a
+    single defect. Seen on a field box: `squawk.py`, fixed, then
+    `squawk/__init__.py` (2026-09-18).
+
+    `path-writable`, immediately above it in the same function, has always
+    named every offending directory. This is that, applied to the other half.
+    """
+
+    @staticmethod
+    def _check(monkeypatch, modes):
+        """Drive the integrity checks with a chosen set of files and modes."""
+        monkeypatch.setattr(squawk.probes, "app_sources", lambda: list(modes))
+        # `_mode_of` is shared with the PATH check in the same function, so it
+        # has to answer for paths this test never named. None means "could not
+        # read", which that check already handles.
+        monkeypatch.setattr(squawk.probes, "_mode_of", lambda p: modes.get(p))
+        out = []
+        squawk.probes._audit_integrity(out)
+        return next(c for c in out if c["check"] == "self-perms")
+
+    def test_many_loose_files_say_how_many(self, monkeypatch):
+        got = self._check(monkeypatch, {
+            "/app/squawk.py": 0o664,
+            "/app/squawk/__init__.py": 0o664,
+            "/app/squawk/core.py": 0o664,
+        })
+        assert got["status"] == "gap"
+        assert "3 of the app's files" in got["detail"], got["detail"]
+        assert "surfaces the next" in got["detail"]
+
+    def test_the_fix_covers_all_of_them(self, monkeypatch):
+        """A fix that clears one of three teaches the operator the check is
+        noise."""
+        got = self._check(monkeypatch, {
+            "/app/squawk.py": 0o664,
+            "/app/squawk/__init__.py": 0o664,
+        })
+        assert got["fix"].startswith("chmod -R go-w "), got["fix"]
+        assert "/app" in got["fix"]
+
+    def test_one_loose_file_is_still_named_on_its_own(self, monkeypatch):
+        """The false-positive half: a single offender must not be dressed up as
+        a sweep."""
+        got = self._check(monkeypatch, {
+            "/app/squawk.py": 0o664,
+            "/app/squawk/core.py": 0o644,
+        })
+        assert got["status"] == "gap"
+        assert "of the app's files" not in got["detail"], got["detail"]
+        assert got["fix"] == "chmod go-w /app/squawk.py"
+
+    def test_nothing_loose_is_ok(self, monkeypatch):
+        got = self._check(monkeypatch, {
+            "/app/squawk.py": 0o644,
+            "/app/squawk/core.py": 0o644,
+        })
+        assert got["status"] == "ok", got
+
+    def test_the_loosest_is_still_the_one_named(self, monkeypatch):
+        """World-writable outranks group-writable: the worst file is the one a
+        reader needs to see first."""
+        got = self._check(monkeypatch, {
+            "/app/squawk.py": 0o664,
+            "/app/squawk/core.py": 0o666,
+        })
+        assert "/app/squawk/core.py" in got["detail"], got["detail"]
