@@ -664,22 +664,50 @@ def _audit_integrity(out: List[dict]) -> None:
                         % (len((os.environ.get("PATH") or "").split(os.pathsep)),
                            unknown_dirs)))
 
-    # The app is a package: check every source file, report the loosest.
+    # The app is a package: check every source file, report the loosest AND how
+    # many are loose. Reporting only the loosest named one file at a time, so an
+    # operator who ran the fix it printed saw the next file appear on the next
+    # run -- a clone made with a permissive umask has every file group-writable,
+    # and the check turned that into a queue. `path-writable` directly above
+    # names every offending directory; this named one of many and said nothing
+    # about the rest (field run, 2026-09-18).
     me, mode = "", None
+    loose = []
     for cand in app_sources() or [os.path.abspath(__file__)]:
         cm = _mode_of(cand)
-        if cm is not None and (mode is None or (cm & 0o022) > (mode & 0o022)):
+        if cm is None:
+            continue
+        if cm & 0o022:
+            loose.append(cand)
+        if mode is None or (cm & 0o022) > (mode & 0o022):
             me, mode = cand, cm
     if mode is None:
         out.append(_chk("self-perms", "integrity", "unknown", "low",
                         "Own file permissions not readable", me))
     elif mode & 0o022:
+        detail = ("Mode %04o on %s. Anything that can rewrite the auditor "
+                  "decides what the audit says." % (mode, me))
+        fix = "chmod go-w %s" % me
+        if len(loose) > 1:
+            detail += (" %d of the app's files are writable by others, not one; "
+                       "fixing only the file named here surfaces the next."
+                       % len(loose))
+            try:
+                root = os.path.commonpath(loose)
+            except ValueError:                      # different drives: rare
+                root = ""
+            if root:
+                # `commonpath` over two or more distinct files is already their
+                # shared directory. It is only a file when every input was the
+                # same path, which cannot happen here, and an existence check
+                # is wrong: the directory may be unreadable and still be the
+                # right thing to name.
+                if os.path.isfile(root):
+                    root = os.path.dirname(root)
+                fix = "chmod -R go-w %s" % root
         out.append(_chk(
             "self-perms", "integrity", "gap", "high",
-            "Squawk's own file is writable by others",
-            "Mode %04o on %s. Anything that can rewrite the auditor decides "
-            "what the audit says." % (mode, me),
-            "chmod go-w %s" % me))
+            "Squawk's own file is writable by others", detail, fix))
     else:
         out.append(_chk("self-perms", "integrity", "ok", "info",
                         "Squawk's own file is not group- or world-writable",
