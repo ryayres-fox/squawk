@@ -56,10 +56,13 @@ The denominator is published next to every count. A scanner reports what it
 found; almost none reports what it *looked at*, and a zero over nothing examined
 prints the same as a zero over a real tree. Squawk reads the coverage each
 scanner already emits: semgrep's `paths.scanned`, bandit's per-file `metrics`,
-checkov's `resource_count`, trivy's `Results` targets, syft's `artifacts`. It
+checkov's `resource_count`, trivy's `Results` targets, syft's `artifacts`, and
+gitleaks' `scanned ~N bytes` — which it writes to stderr rather than into its
+report. grype publishes none, and is lent the package count from the SBOM it
+was handed, which the run says out loud: `from the SBOM this stage read`. It
 shows the number inline. `0 findings across 214 files` is a clean scan; `0
 findings, but examined 0 files` is a **gap**, not a pass, and it raises squawk
-code 7600. A tool that publishes no coverage (gitleaks, grype) is reported
+code 7600. A tool that publishes no coverage and has none to borrow is reported
 `unknown`, never a fabricated zero.
 
 Correlation joins findings across scanners into toxic combinations: a public

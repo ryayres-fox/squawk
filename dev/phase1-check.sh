@@ -61,10 +61,16 @@ printf '%s\n' "$out" | grep -E 'gitleaks|semgrep|bandit' | sed 's/^/     /'
 if printf '%s' "$out" | grep -Eq '(semgrep|bandit).*across [0-9]+ files'; then
   ok "a SAST scanner reports 'across N files' (a real denominator)"
 else bad "no scanner showed 'across N files' — coverage not surfaced"; fi
+# gitleaks writes "scanned ~N bytes" to stderr rather than into its report, so
+# it HAS a denominator and the run must show it. This check used to assert the
+# opposite -- that gitleaks stay `unknown` -- which was true before the
+# extractor read that line, and by 2026-09-18 had become a check defending a
+# gap: it demanded the tool withhold a denominator the scanner had published.
+# Caught by running this on Kali, which is what it is for.
 if have gitleaks; then
-  if printf '%s' "$out" | grep gitleaks | grep -qv 'across'; then
-    ok "gitleaks shows neither 'across' nor a gap (coverage unknown, not faked)"
-  else bad "gitleaks fabricated a denominator or gapped — unknown must stay unknown"; fi
+  if printf '%s' "$out" | grep gitleaks | grep -qE 'across [0-9]+ bytes'; then
+    ok "gitleaks reports the byte count it published, rather than withholding it"
+  else bad "gitleaks published 'scanned ~N bytes' and the run did not show it"; fi
 else skip "gitleaks not installed — cannot prove the unknown state"; fi
 
 # --- 2. syft/grype live, differential silent on agreement -------------------
