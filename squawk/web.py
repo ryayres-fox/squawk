@@ -795,9 +795,9 @@ def _zone_now(zone: str, when: float) -> Optional[Tuple[str, str, str, str]]:
 
 def clock_wall() -> str:
     """The wall, the way an operations room hangs it — the operator's own
-    request, and their correction to the first version: *"why would you show me
-    two of the same time zone. use the three main american time zones plus utc
-    major european and asian time zones."*
+    request, and their correction to the first version: not two clocks on the
+    same zone, but the three main American zones plus UTC, the major European
+    and Asian ones, and any other standard zone, each once.
 
     Two of the clocks are also facts about this run: one is badged **server**,
     the machine the scans run on, and one **you**, the browser reading. In
@@ -1691,7 +1691,12 @@ def coverage_panel(man: dict) -> str:
             "<td>%s</td><td class='mono' style='font-size:.8rem' title='%s'>%s</td>"
             "<td class='muted' style='font-size:.8rem'>%s</td></tr>"
             % (E(row.get("tool", "")), _STATUS_DOT.get(st, "var(--faint)"),
-               E(st), looked, budget_title, budget, E(row.get("detail", ""))))
+               E(st), looked, budget_title, budget,
+               # The CLI redacts this same string (`cli.py`, `_line`); this
+               # rendered it raw, so a ledger detail built from a role name or
+               # an ARN reached the page with the account in it. Found in
+               # review, 2026-09-18.
+               E(redact_identifiers(row.get("detail", "")))))
     panel = ("<div class='card'><h3>What ran</h3>"
              "<p class='muted' style='font-size:.82rem'>Every stage, its status, "
              "what it examined and the budget it ran under &mdash; a clean result "
@@ -3561,9 +3566,9 @@ def _cloud_reading(root: str, tool: str) -> "Tuple[Optional[dict], Optional[dict
         # `gap` covers two different things and the difference is already in
         # the ledger. A stage that read SOME things and had one read fail has a
         # real payload and a non-zero `examined`; refusing to render that hid
-        # everything the stage did read because of one thing it did not -- on a
-        # real account one unused-access analyzer failing took thirty-six
-        # findings from the working analyzer off the page, while the ledger
+        # everything the stage did read because of one thing it did not -- in field use one
+        # unused-access analyzer failing took dozens of findings from the working analyzer off the
+        # page, while the ledger
         # went on counting them (review 2, R-21). A stage that read NOTHING has
         # `examined` zero, and rendering that would be R-2 again: a denied read
         # printed as an empty account.
@@ -3944,7 +3949,7 @@ def _finding_rows(rows: "List[dict]", empty: str,
     A rule that fires on dozens of resources is one pattern, not dozens of
     things to read, and printing a paragraph for each of them buries the
     findings that are not a pattern -- the analyzer section ran to six pages
-    of identical text on a real account. `collapse` names those rules, as
+    of identical text in field use. `collapse` names those rules, as
     (the finding's key, the number on this page holding the same set, the
     sentence to print). The count is exact and the number links to every
     member, so nothing is hidden: it moves behind the number, which is where

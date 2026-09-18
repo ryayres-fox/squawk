@@ -832,7 +832,7 @@ def norm_clouddata(raw: str, base: str) -> List[Finding]:
 # `--no-git` prints only the second. A directory that is not a repository,
 # scanned in repo scope, prints "0 commits scanned." and "scanned ~0 bytes" --
 # which is the case that matters, because until now it read as 0 finding(s) and
-# "No squawk. Nothing critical." on a real repository (the operator, 2026-09-12).
+# "No squawk. Nothing critical." on a working repository (the operator, 2026-09-12).
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _GITLEAKS_BYTES = re.compile(r"scanned ~(\d+) bytes")
 _GITLEAKS_COMMITS = re.compile(r"(\d+) commits scanned")
@@ -1014,6 +1014,79 @@ def norm_gitleaks(raw: str, base: str) -> List[Finding]:
 _REDACTED_EVIDENCE = ("requires login", "requires semgrep login")
 
 
+# A finding whose subject IS a credential carries the credential in its matched
+# text. `norm_gitleaks` and the trivy secret reader have never kept that text --
+# they record "secret: <rule>" and let the path and line locate it. The SAST and
+# IaC readers did keep it, so the discipline held only for the scanners whose
+# names say "secret", and a screenshot of the findings page could carry the
+# password bandit had just found. Worse, `_source_line` below exists to recover
+# the line semgrep redacts, which un-redacted exactly this. Found in review,
+# 2026-09-18.
+CREDENTIAL_MARKERS = (
+    "secret", "password", "passwd", "credential", "hardcoded", "token",
+    "authorization", "bearer",
+    # Each of the three spellings a scanner actually uses: a rule id
+    # (`api-key`), a python identifier (`api_key`) and a message written for a
+    # human ("API Key ID found"). Missing the spaced form is how the first
+    # version of this let "AWS Access Key ID found" through.
+    "api-key", "api_key", "api key", "apikey",
+    "access-key", "access_key", "access key",
+    "private-key", "private_key", "private key",
+    "session-id", "session_id", "session id", "sessionid",
+)
+
+#: bandit's credential tests, by id, because the id is the reliable half.
+CREDENTIAL_RULES = ("b105", "b106", "b107")
+
+#: What stands in its place. Not an empty string: an absent evidence field and a
+#: withheld one read identically, which is I1 turned on the tool's own output.
+EVIDENCE_WITHHELD = ("withheld \u2014 this rule's subject is a credential, so the "
+                     "matched text is the credential")
+
+
+def is_credential_rule(rule: Optional[str], message: str = "") -> bool:
+    """Does this finding's own subject make its matched text a secret?
+
+    Matched on the rule id and the message rather than on the scanner, because
+    bandit B105, a semgrep `hardcoded-password` rule and a checkov `CKV_SECRET`
+    all find the same thing under different names. Wrong in the safe direction:
+    a rule about tokenizing loses its snippet, which costs a reader context and
+    leaks nothing.
+    """
+    if (rule or "").strip().lower() in CREDENTIAL_RULES:
+        return True
+    hay = ("%s %s" % (rule or "", message or "")).lower()
+    return any(m in hay for m in CREDENTIAL_MARKERS)
+
+
+def evidence_for(text: Optional[str], rule: Optional[str],
+                 message: str = "") -> str:
+    """The matched text, or a sentence saying it was withheld and why."""
+    if is_credential_rule(rule, message):
+        return EVIDENCE_WITHHELD
+    return (text or "").strip()[:400]
+
+
+#: A quoted literal inside a scanner's own message.
+_QUOTED = re.compile(r"""(['"])(?:\\.|(?!\1).)*\1""")
+
+
+def message_for(text: Optional[str], rule: Optional[str]) -> str:
+    """A scanner's own words about a finding, with any quoted literal removed
+    when the rule's subject is a credential.
+
+    Withholding the evidence field was not enough: bandit's B105 message is
+    "Possible hardcoded password: '<the password>'", so the finding's TITLE
+    carried the secret after its evidence had stopped. Found by running the
+    first version of this fix against a planted password and grepping the
+    run's own findings.json for it (2026-09-18).
+    """
+    text = (text or "").strip()
+    if not text or not is_credential_rule(rule, text):
+        return text
+    return _QUOTED.sub("'\u2026'", text).strip()
+
+
 def _real_evidence(s: Optional[str]) -> str:
     """The evidence string, or empty if it is a scanner's redaction placeholder.
     The finding's path and line still locate it; a redaction stand-in must not
@@ -1070,14 +1143,20 @@ def norm_semgrep(raw: str, base: str) -> List[Finding]:
         extra = r.get("extra") or {}
         # Semgrep redacts the matched line when unauthenticated. Rather than send
         # the operator to a semgrep account (nothing here needs one), read the
-        # offending line from the file we just scanned.
-        ev = _real_evidence(extra.get("lines")) or _source_line(base, rel, line)
+        # offending line from the file we just scanned -- unless the rule's own
+        # subject is a credential, in which case the redaction was right and
+        # recovering it would undo it.
+        if is_credential_rule(check, msg):
+            ev = EVIDENCE_WITHHELD
+        else:
+            ev = _real_evidence(extra.get("lines")) or _source_line(base, rel, line)
+            ev = ev[:400]
         out.append(Finding("semgrep", ident, sev, msg, rel,
                            {"description": msg,
                             "remediation": extra.get("fix") or "",
                             "reference": (extra.get("metadata") or {}).get("source", ""),
                             "rule": check, "line": line,
-                            "evidence": ev[:400]}))
+                            "evidence": ev}))
     return out
 
 
@@ -1091,10 +1170,12 @@ def norm_bandit(raw: str, base: str) -> List[Finding]:
         sev = norm_severity(r.get("issue_severity"))
         ident = "%s:%s:%s" % (test, rel, line)
         cwe = r.get("issue_cwe") or {}
+        msg = message_for(r.get("issue_text"), test)
         out.append(Finding("bandit", ident, sev,
-                           _title(r.get("issue_text") or test), rel,
-                           {"description": r.get("issue_text") or "",
-                            "evidence": (r.get("code") or "").strip()[:400],
+                           _title(msg or test), rel,
+                           {"description": msg,
+                            "evidence": evidence_for(r.get("code"), test,
+                                                     r.get("issue_text") or ""),
                             "reference": r.get("more_info") or "",
                             "cwe": str(cwe.get("id") or ""),
                             "confidence": r.get("issue_confidence") or "",
@@ -1134,7 +1215,9 @@ def norm_checkov(raw: str, base: str) -> List[Finding]:
             out.append(Finding("checkov", ident, "medium",
                                _title(r.get("check_name") or cid), rel,
                                {"description": desc,
-                                "evidence": code.strip()[:400],
+                                "evidence": evidence_for(
+                                    code, cid,
+                                    "%s %s" % (r.get("check_name") or "", desc)),
                                 "reference": r.get("guideline") or "",
                                 "rule": cid}))
     return out
@@ -1304,7 +1387,9 @@ def norm_zap(raw: str, base: str) -> List[Finding]:
                            str(alert.get("confidence", "")), ""),
                        "risk": alert.get("riskdesc", ""),
                        "method": inst.get("method", ""), "param": param,
-                       "evidence": (inst.get("evidence") or "")[:400],
+                       "evidence": evidence_for(inst.get("evidence"),
+                                                str(alert.get("alertRef") or ""),
+                                                name),
                        "attack": (inst.get("attack") or "")[:200],
                        "other": _text(inst.get("otherinfo"))[:400]}
                 out.append(Finding("zap", ident, sev, name, path, det))
@@ -1402,12 +1487,16 @@ NORMALIZERS: Dict[str, Callable[[str, str], List[Finding]]] = {
 
 __all__ = [
     'COVERAGE',
+    'CREDENTIAL_MARKERS',
+    'CREDENTIAL_RULES',
+    'EVIDENCE_WITHHELD',
     'NORMALIZERS',
     'REPORT_SHAPES',
     '_ANSI',
     '_ASFF_SEV',
     '_GITLEAKS_BYTES',
     '_GITLEAKS_COMMITS',
+    '_QUOTED',
     '_REDACTED_EVIDENCE',
     '_ZAP_CONF',
     '_ZAP_RISK',
@@ -1443,7 +1532,10 @@ __all__ = [
     '_text',
     '_title',
     '_trivy_findings',
+    'evidence_for',
     'function_count',
+    'is_credential_rule',
+    'message_for',
     'norm_asff',
     'norm_bandit',
     'norm_checkov',

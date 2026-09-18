@@ -69,12 +69,22 @@ Not because they do not matter, but because they are not ours to fix.
 ## Before you attach evidence
 
 Evidence directories hold what was scanned. Squawk masks account identifiers on
-every page and in the terminal, and strips account ids, key ids and addresses
-from the errors the AWS CLI returns before they reach evidence. It does not
-rewrite what the other scanners produce: their raw output is written as it
-arrives, and a scanner that quotes the string it matched leaves that string in
-the evidence (bandit quotes a hardcoded password). Before attaching anything
-from a real estate, read it. If you cannot share it, describe it: a
+every page, in the terminal and in the exported dashboard, and strips account
+ids, key ids and addresses from the errors the AWS CLI returns before they
+reach evidence.
+
+**A finding whose subject is a credential does not carry the credential.** A
+secret scanner records `secret: <rule>` and lets the path and line locate it,
+and since 2026-09-18 a SAST or IaC rule that finds the same thing is held to
+the same standard: its matched text reads "withheld", and a quoted literal is
+removed from the message too, because bandit's own wording for a hardcoded
+password is to quote the password. `findings.json` and every page built from it
+are safe to share on that count.
+
+**`raw/` is not.** Each scanner's output is written exactly as it arrived,
+because an evidence chain over something rewritten proves nothing — and a
+scanner that quotes the string it matched leaves that string there. `raw/` is
+the one part of a run to read before you attach it. If you cannot share it, describe it: a
 reproduction against a synthetic target is worth more to us than a real one we
 cannot look at.
 

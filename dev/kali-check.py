@@ -895,7 +895,7 @@ Still yours, because a script cannot judge them:
      both grounds, severity distinguishable by shape as well as colour.
   b) `python3 squawk.py install-service`, then the four commands it prints.
      `systemctl --user status squawk` is active; reboot; it is back.
-  c) `python3 squawk-dashboard.py <newest run>` and open dashboard.html: the
+  c) `python3 squawk-dashboard.py <newest run>` and open the page it names: the
      same palette and the same light and dark as the app.
   d) Does the Scan page read as one thing? Does the Overview answer "what is
      the state of my estate" in five seconds?""")

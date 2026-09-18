@@ -104,7 +104,7 @@ def _refusal(err: str, cmd: "Optional[List[str]]" = None) -> str:
 
     Read from the END, because a usage banner comes first and the reason last.
 
-    And it says WHOSE arguments were refused. A checkov on a real repository
+    And it says WHOSE arguments were refused. A checkov on a working repository
     refused eleven flags Squawk has never built -- they came from a
     `.checkov.yaml` in the tree being scanned, which checkov reads itself and
     turns into argv (reproduced against checkov 3.2.459, 2026-09-12). The

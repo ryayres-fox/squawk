@@ -375,7 +375,7 @@ class Scanner(NamedTuple):
 # code; `trivy fs` and `trivy image` read dependencies. The registry gives a
 # SCANNER one kind, so a correlation that needed `iac` reported "cannot
 # evaluate: no iac scanner ran" over 288 IaC findings trivy had just produced
-# on a real repository (the operator, 2026-09-12). A correlation states its
+# on a working repository (the operator, 2026-09-12). A correlation states its
 # denominator (I16), and the denominator was wrong.
 # Folder names that mean a cloud-sync client owns this path.
 #
@@ -1084,7 +1084,7 @@ PROFILE_KEYS: Dict[str, Knob] = {
     # cap passes). Unset by default because only the operator knows the machine.
     # How many findings a cloud read pulls before it stops and says so.
     # Unbounded, `get-findings` paginates a hundred at a time until it has
-    # every finding an account holds: on a real estate that ran 46 minutes
+    # every finding an account holds: on a large estate that ran 46 minutes
     # and then produced NOTHING, because a stage killed at its budget throws
     # its output away (2026-09-08). A bounded read answers in seconds, and the
     # CLI hands back a NextToken when there is more — so the count comes with
@@ -1093,7 +1093,7 @@ PROFILE_KEYS: Dict[str, Knob] = {
     # How long the whole inventory read may take, across every region.
     # Region count is the denominator for every cloud claim, and an account
     # with seventeen enabled regions is seventeen times the calls of one. The
-    # budget is what keeps that from becoming the forty-six-minute run again;
+    # budget is what keeps that from becoming the run that went past its budget again;
     # the regions it did not reach are NAMED, so a bounded read stays a
     # bounded read and never quietly becomes a clean one (I12).
     # How many IAM principals one read pulls before it stops and says so.
@@ -1672,15 +1672,30 @@ def load_profile(evidence_root: str, explicit: Optional[str] = None) -> Profile:
 
 
 def resolve_repo(explicit: Optional[str]) -> Optional[str]:
-    start = explicit or os.getcwd()
-    start = os.path.abspath(start)
-    cur = start
+    """The repository to scan.
+
+    An explicit path is honoured exactly as given. It used to walk up from
+    there to the enclosing git root, so `--repo <subdirectory>` in a monorepo
+    scanned the whole monorepo -- every sibling project, and whatever else the
+    checkout holds -- and said nothing about the substitution. That is I12
+    pointed the wrong way: not a cap that went unannounced, but a scope nobody
+    asked for. Found in review, 2026-09-18.
+
+    Without one, the working directory's enclosing repository is the sensible
+    default, and the run prints the path it settled on.
+
+    The `.git` walk that `stage_gitleaks` does is a different thing and stays:
+    it decides whether history is available to read, not what gets scanned.
+    """
+    if explicit:
+        return os.path.abspath(explicit)
+    cur = os.path.abspath(os.getcwd())
     while True:
         if os.path.isdir(os.path.join(cur, ".git")):
             return cur
         parent = os.path.dirname(cur)
         if parent == cur:
-            return explicit if explicit else None
+            return None
         cur = parent
 
 

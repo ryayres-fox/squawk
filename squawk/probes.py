@@ -1114,7 +1114,7 @@ def _role_breadth(role_name: str, timeout: int) -> dict:
     """What one role can actually do, with the evidence for saying so.
 
     The first version judged this from the NAMES of attached managed policies
-    and nothing else. Against a real account it reported "0 roles carrying more
+    and nothing else. In field use it reported "0 roles carrying more
     than read" over six roles -- a number that had never looked at an inline
     policy or opened a customer-managed one, presented as a fact. A role with
     an inline `"Action": "*"` would have counted as fine.
@@ -2016,7 +2016,7 @@ def _principal_reasons(principal: dict, docs: Dict[str, object],
 # AdministratorAccess does not need to escalate, it is already there, and
 # listing it under "can grant themselves more" is a category error that put the
 # account's own SSO admin role in a list of privilege-escalation paths
-# (measured on a real account, 2026-09-09).
+# (measured in field use, 2026-09-09).
 ADMIN_MARKERS = ("allows every action", "allows every IAM action",
                  "grants administrative IAM permissions")
 
@@ -2036,8 +2036,8 @@ def escalation_only(reasons: List[str]) -> List[str]:
 #
 # "A role is only a path for whoever can assume it" was a caveat on the page,
 # which is another way of saying the tool raised the question and left it to
-# the reader. Against a real account that produced eleven roles that can grant
-# themselves more and no way to tell which of them mattered.
+# the reader. In field use that produced a handful of roles that can grant themselves more and no
+# way to tell which of them mattered.
 #
 # The trust policy is the answer, and it was already in the graph response --
 # fetched, and then dropped. A role that can escalate is ordinary; a role that
@@ -2730,7 +2730,7 @@ ENI_KINDS = (
     # InterfaceType and means "an ordinary elastic network interface", which is
     # true of most of the entries above as well -- so rendering it as a
     # category produced a tile reading "interface · 7", which looks like an
-    # answer and is not one (measured on a real account, 2026-09-09). An
+    # answer and is not one (measured in field use, 2026-09-09). An
     # interface whose owner we could not name is reported as unattributed,
     # because "we did not work it out" and "it is an interface" are different
     # statements.
@@ -3485,7 +3485,7 @@ ANALYZER_KINDS = {
 # ACCOUNT_UNUSED_ACCESS and ORGANIZATION_UNUSED_ACCESS find unused permissions,
 # and the INTERNAL_ACCESS pair find something else again. Calling ListFindings
 # on any of the other four is rejected with FIELD_VALIDATION_FAILED -- which is
-# exactly what happened on a real account that runs an unused-access analyzer,
+# exactly what happened in field use that runs an unused-access analyzer,
 # taking the whole stage to `gap` and the whole section off the page.
 EXTERNAL_ACCESS_ANALYZERS = ("ACCOUNT", "ORGANIZATION")
 
@@ -3495,7 +3495,7 @@ EXTERNAL_ACCESS_ANALYZERS = ("ACCOUNT", "ORGANIZATION")
 # The analyzer's zone of trust is the account, and a federated principal comes
 # from outside it by definition -- so every IRSA role in an EKS cluster, every
 # GitHub Actions OIDC role and every SSO role in the account is reported as
-# external access. On a real account that was thirty-six findings at medium,
+# external access. In field use that was dozens of findings at medium,
 # all of them the account's own identity federation, including the SSO role the
 # operator was running Squawk as (review 2, R-23 and R-24).
 #
@@ -3805,8 +3805,8 @@ def organization_read(ctx: "RunContext") -> "Optional[dict]":
 #
 # The account this was written against reads: no public instances, no function
 # URLs, no internet-facing load balancers, no public buckets. And it has a
-# deploy role named for API Gateway ingest and forty-six VPC endpoint
-# interfaces. Traffic is arriving somewhere.
+# deploy role named for API Gateway ingest and many VPC endpoint interfaces. Traffic is arriving
+# somewhere.
 #
 # "0 reachable from the internet" under a caveat saying API Gateway is not read
 # is not the same weight as the number above it. A tile that says zero, over a
@@ -4095,7 +4095,7 @@ def aws_frontdoor(ctx: "RunContext") -> "Union[str, Tuple[str, str, str]]":
 # Reading only the key's NAME, which is what this did, meant the policy AWS
 # itself attaches to every new SNS topic -- Principal `*` narrowed by
 # `AWS:SourceOwner` equal to the account -- was reported as "usable by any AWS
-# principal". Eleven of those on one real account, all of them the service's
+# principal". Several of those in field use, all of them the service's
 # own default (review R-7, measured 2026-09-10).
 # --------------------------------------------------------------------------- #
 

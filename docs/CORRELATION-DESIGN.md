@@ -50,7 +50,13 @@ driven, exactly like `SCANNERS`, so a new rule is an entry and not a code change
         rule: Callable[[Dict[str, List[Finding]]], List[CorrFinding]]
         lift: str              # resulting severity, and why
 
-Rules proven against the planted target:
+Two rules ship today. `CORRELATIONS` in `squawk/analysis.py` is the list
+that runs, and `test_the_design_document_lists_the_rules_that_ship` holds this
+section to it, because a design document that describes a rule the code does
+not have is the same defect as a scanner that reports a finding it did not
+find.
+
+**Shipped**, and proven against the planted target:
 
 - **Secret baked into every image.** A secret-class finding in file X (`bandit`
   B105 or `gitleaks`) + a Dockerfile that `COPY . .` (`trivy-config`
@@ -58,14 +64,19 @@ Rules proven against the planted target:
   target: `bandit B105:app.py:3` + Dockerfile `COPY . .`. Lift: two LOWs to HIGH,
   because a credential in source is bad, a credential in every published image
   is worse, and the reason is the join itself.
-- **Exploitable and reachable.** A CVE in package P (`grype`) + the app that
-  ships P is listening (`recon`). Join on **package** appearing in a reachable
-  service. Lift depends on the CVE, but reachability is the multiplier no single
-  scanner applies.
 - **Exposed misconfiguration.** A public-ingress rule (`checkov` `CKV_AWS_24`,
   open SSH to `0.0.0.0/0`) + a public bucket in the same estate (`CKV_AWS_20`).
   Join on **resource** proximity. Neither is news alone; together they describe a
   reachable path.
+
+**Designed, not yet shipped.** Kept here because the design is the argument
+for building it, and because the `unknown` machinery below already carries it:
+
+- **Exploitable and reachable.** A CVE in package P (`grype`) + the app that
+  ships P is listening (`recon`). Join on **package** appearing in a reachable
+  service. Lift depends on the CVE, but reachability is the multiplier no single
+  scanner applies. It needs a CVE scanner and recon inside one url-scope
+  service, which no service currently runs together.
 
 Every correlation **cites its members**. The output is not a new opaque
 "critical"; it is "critical *because* these three findings, and here they are." The
@@ -85,11 +96,13 @@ So a rule reports three states, like everything else:
 - a member scanner did not run             ->  **`unknown`**: "cannot evaluate
   'exploitable and reachable' — recon did not run"
 
-**No platform shows you this.** A graph tool renders the correlations it found
-and stays silent about the ones it could not evaluate. Correlation *with a stated
-denominator*, "these 4 toxic combinations, and 2 more I could not check because
-recon was skipped", is the Phase 1 denominator argument one layer up, and the
-part that would be genuinely new.
+**I have not found a tool that does this per rule.** Platforms do surface
+coverage, as a separate thing: an unscanned image, a missing connector, a
+documented note that an absent data source suppresses attack paths. What I have
+not seen is the suppression stated *inside the correlation layer itself* — "4
+combinations fired, and 2 more I could not check because recon was skipped",
+in the same list, at the same moment. If a tool does this, this paragraph is
+the thing to correct, and I would rather be corrected than keep the claim.
 
 ### The fourth state: it fired, and one leg was never scanned
 

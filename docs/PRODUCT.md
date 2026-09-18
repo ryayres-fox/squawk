@@ -144,8 +144,8 @@ prerequisite, not a delay.
 | Skill audit (AST10) | none | available |
 | Container image scan | none for a locally built or public image | available |
 | Recon + unauthenticated DAST against a local target | none | available |
-| Cloud native findings ingest: AWS Security Hub | read-only cloud identity + `SQUAWK_CLOUD_ACK=1` | available, **not yet exercised against a real account**; [`CLOUD-SETUP.md`](CLOUD-SETUP.md) is the guide for doing so on a machine you do not own |
-| Cloud inventory + toxic combinations: AWS networking, compute, attached roles | read-only cloud identity + `SQUAWK_CLOUD_ACK=1` | available, **not yet exercised against a real account**; works whether or not Security Hub is on |
+| Cloud native findings ingest: AWS Security Hub | read-only cloud identity + `SQUAWK_CLOUD_ACK=1` | available and **exercised against a live account**; [`CLOUD-SETUP.md`](CLOUD-SETUP.md) is the guide for doing so on a machine you do not own |
+| Cloud inventory + toxic combinations: AWS networking, compute, attached roles | read-only cloud identity + `SQUAWK_CLOUD_ACK=1` | available and **exercised against a live account**; works whether or not Security Hub is on |
 | Cloud native findings ingest: Defender for Cloud | read-only cloud identity | waits |
 | Prowler fallback posture | read-only cloud identity | waits |
 | Authenticated DAST | app credential / session | waits |

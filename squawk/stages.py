@@ -280,7 +280,7 @@ def stage_securityhub(ctx: RunContext) -> Tuple[List[str], int]:
     #
     # BOUNDED, and that is the whole point. Unbounded, the CLI paginates a
     # hundred findings at a time until it has every one the account holds:
-    # measured on a real estate, that ran past forty-six minutes and would
+    # measured on a large estate that ran past its budget and would
     # have produced nothing, because a stage killed at its budget throws its
     # output away. `--max-items` stops it, and the CLI's own documentation is
     # explicit that when there is more it returns a NextToken — so the answer
@@ -426,7 +426,9 @@ SERVICES: Dict[str, Service] = {
         "check the URL count on the run, because an injectable parameter the "
         "crawl never reached cannot be attacked, and finding none of them is "
         "then a coverage limit rather than a clean result. It attacks, so it "
-        "runs only against a target you own on a private network."),
+        "runs only against a private address, or a public one you have "
+        "acknowledged with SQUAWK_DAST_ACK. It cannot tell whether you own "
+        "the target; nothing can. That part is on you."),
     "cloudinventory": Service(
         "cloudinventory", "Cloud inventory (AWS)", "aws",
         ("cloud-org", "cloud-inventory", "cloud-enablement",
@@ -438,7 +440,7 @@ SERVICES: Dict[str, Service] = {
         # It has drifted twice. The first repair (2026-09-09) wrote this
         # comment and did not change the sentence below it, which went on
         # naming ECS, EKS, SNS/SQS and Secrets Manager as unread through two
-        # releases that read all four -- caught on a real account 2026-09-10.
+        # releases that read all four -- caught in field use 2026-09-10.
         # It is now held by TestCoverageProseMatchesWhatIsRead, which reads
         # the services the probes actually call and fails any sentence here
         # that denies reading one of them. Add a probe, and this text has to
@@ -581,11 +583,29 @@ def aws_identity_readonly(arn: str, timeout: int = 20) -> Tuple[str, str]:
 
 
 def dast_target_ok(url: str) -> Tuple[bool, str]:
-    """DAST sends real attack traffic, so the target must be one you own on a
-    private network. This refuses a public address unless SQUAWK_DAST_ACK is set
-    — the same 'small, local, deliberate' stance as the loopback bind guard.
-    Aiming an active scan at something you do not own is the one-line mistake
-    this rail exists to stop."""
+    """DAST sends real attack traffic, so this refuses a public address unless
+    SQUAWK_DAST_ACK is set — the same 'small, local, deliberate' stance as the
+    loopback bind guard. Aiming an active scan at something you do not own is
+    the one-line mistake this rail exists to stop.
+
+    What it checks is the **resolved address**, not the name: a hostname that
+    answers with a public A record is refused, and one that answers with
+    `127.0.0.1` is allowed. Decimal and hexadecimal spellings of an address
+    normalise, a URL with a port is handled, and a name that does not resolve
+    fails closed.
+
+    What it does **not** check is ownership, because nothing can. A private
+    address is not an owned address: every RFC1918 host inside a corporate
+    network passes this with no acknowledgement at all, and aiming
+    `zap-full-scan` at one of those is the likelier real mistake. This rail
+    narrows the blast radius; it does not confer permission. Said plainly
+    because the docstring used to claim "a target you own", which is not
+    something the code can know (review, 2026-09-18).
+
+    `169.254.169.254` passes as link-local. That is the cloud metadata
+    endpoint, and it is deliberate: the self-audit reads it, and a scan of a
+    host inside a VPC may legitimately reach it.
+    """
     parsed = urlparse(url if "://" in url else "http://" + url)
     host = parsed.hostname
     if not host:

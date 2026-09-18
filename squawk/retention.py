@@ -1,6 +1,6 @@
 """Retention: what evidence is kept, what is let go, and what is said about it.
 
-Evidence grows without bound. A run of a real repository is a megabyte or so and
+Evidence grows without bound. A run of a working repository is a megabyte or so and
 the biggest parts of it are the scanner's original output and, on a target with
 history, a copy of that target's whole timeline; sixty runs of one target is a
 directory nobody planned. The self-audit already warns when the volume is
