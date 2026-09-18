@@ -1,0 +1,12 @@
+# GitHub reads .github/ only at a repository root. In the development tree
+# these files are inert; the port carries them to the root of the public
+# repository, where they take effect. The advisory URL below is that
+# repository's.
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/ryayres-fox/squawk/security/advisories/new
+    about: >-
+      Never open a public issue for one. That includes a case where Squawk
+      printed a clean result over something it did not read -- see SECURITY.md,
+      a false clean is a security report here.
