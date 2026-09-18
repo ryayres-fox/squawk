@@ -18,6 +18,7 @@ import pathlib
 import re
 import sys
 import textwrap
+import typing
 
 import pytest
 
@@ -2740,6 +2741,40 @@ class TestEveryDeniedReadLeavesATrace:
         bad = [(r.tool, r.status, r.detail) for r in outcome["results"]
                if r.status != "ok"]
         assert not bad, "nothing was denied and these stages did not say ok: %r" % bad
+
+
+class TestTheReadmeCountsTheServices:
+    """The README said "twelve services" in two places while the registry held
+    thirteen, and it said so on the first screen a stranger reads.
+
+    This project already counts its documents and its invariants, on the stated
+    rule that a number nobody recounts is the same defect as a scanner nobody
+    checks. Nothing counted the services, which is how the number drifted --
+    the rule was written down and not applied to the thing most often read.
+    """
+
+    WORDS: typing.ClassVar[dict] = {
+        8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve",
+        13: "thirteen", 14: "fourteen", 15: "fifteen", 16: "sixteen",
+        17: "seventeen", 18: "eighteen", 19: "nineteen", 20: "twenty"}
+
+    README = pathlib.Path(__file__).parent.parent / "README.md"
+
+    def test_the_readme_says_how_many_services_there_are(self):
+        want = self.WORDS[len(squawk.SERVICES)]
+        readme = self.README.read_text(encoding="utf-8")
+        claims = re.findall(r"the (\w+) services", readme)
+        assert claims, "the README no longer states how many services there are"
+        wrong = [c for c in claims if c != want]
+        assert not wrong, (
+            "the registry has %d services (%r) and the README says %s"
+            % (len(squawk.SERVICES), want, sorted(set(wrong))))
+
+    def test_there_is_a_claim_to_check(self):
+        """A regex that quietly matched nothing would pass whatever the README
+        says, which is the shape of the bug this exists for."""
+        readme = self.README.read_text(encoding="utf-8")
+        assert len(re.findall(r"the (\w+) services", readme)) >= 2
 
 
 class TestTheDesignDocumentDescribesTheCodeThatExists:

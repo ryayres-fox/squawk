@@ -20,8 +20,9 @@ python3 squawk.py --install               # provision the scanner toolbench (Uni
 python3 squawk.py --update                 # OS, scanners, vuln DBs, ZAP image, and record what moved
 python3 squawk.py --doctor                 # what's installed, what's missing, and the instrument check
 python3 squawk.py --run selfaudit          # audit this machine, not a target
-python3 squawk.py --list-services          # the twelve services
+python3 squawk.py --list-services          # the thirteen services
 python3 squawk.py --run compliance --repo /path/to/checkout
+python3 squawk.py sarif > squawk.sarif        # the last run, as SARIF 2.1.0
 ```
 
 `--doctor` exits non-zero on exactly two conditions: no scanner at all, or an
@@ -126,7 +127,7 @@ scanner that reported last time and not this time raises 7600 rather than
 letting the smaller number read as progress.
 
 The rest of the vocabulary is the same airport. **Scan** is where a run starts,
-and the twelve services are **pre-flight check**, **customs manifest**,
+and the thirteen services are **pre-flight check**, **customs manifest**,
 **baggage check**, **contraband sweep**, **cargo scan**, **recon**, **live
 probe**, **active probe**, **compliance**, **cloud (AWS)**, **self-audit** and
 **skill audit**. Every one of them declares what it does *not* cover before you
@@ -400,6 +401,7 @@ each imports only from the ones above it:
 | `baselines` | GitHub-issue baselines |
 | `retention` | what evidence is kept, what is let go, and what is said about it |
 | `runtime` | jobs in flight; the server's pid file |
+| `sarif` | one run as SARIF 2.1.0: a stage that read nothing is an unsuccessful invocation carrying its denominator, and a correlation that could not be evaluated is a `notApplicable` result |
 | `web` | every page, and the request handler |
 | `service` | serve, daemonize, status, stop, the systemd unit |
 | `cli` | the parser, the subcommands, `--doctor`, `--run`, `main()` |

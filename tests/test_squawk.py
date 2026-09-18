@@ -3174,8 +3174,8 @@ class TestPackageShape:
     the version is stated once."""
 
     ORDER = ("core", "probes", "scanners", "stages", "evidence", "decisions", "analysis",
-             "engine", "feeds", "installer", "baselines", "retention", "runtime", "web",
-             "service", "cli")
+             "engine", "feeds", "installer", "baselines", "retention", "runtime", "sarif",
+             "web", "service", "cli")
 
     def _pkg(self):
         return os.path.dirname(os.path.abspath(squawk.__file__))
@@ -15852,3 +15852,156 @@ class TestTheReviewFindings:
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         return mod
+
+
+class TestSarif:
+    """SARIF 2.1.0, because it is the format this category speaks and because
+    it already has the vocabulary for the one thing this tool insists on.
+
+    A scanner that ran and read nothing is an unsuccessful invocation carrying
+    its denominator. A correlation that could not be evaluated is a result with
+    `kind = notApplicable`. Both survive into GitHub code scanning, which is
+    where a reader of this output actually lives. An exporter that flattened
+    either into "no findings" would be this project's own defect, committed on
+    the way out of the door.
+    """
+
+    @staticmethod
+    def _man(**over):
+        man = {
+            "run_id": "20260101T000000Z", "service": "preflight", "scope": "repo",
+            "target": "/w/app", "not_covered": "No SBOM/CVE scan.",
+            "ledger": [
+                {"tool": "gitleaks", "mode": "detect", "status": "ok",
+                 "detail": "0 finding(s) across 100 bytes",
+                 "coverage": {"examined": 100, "unit": "bytes", "skipped": 0,
+                              "errors": 0}},
+                {"tool": "checkov", "mode": "directory", "status": "gap",
+                 "detail": "0 findings, but examined 0 resources — not a clean result",
+                 "coverage": {"examined": 0, "unit": "resources", "skipped": 0,
+                              "errors": 0}},
+            ],
+            "correlations": [],
+        }
+        man.update(over)
+        return man
+
+    @staticmethod
+    def _finding(**over):
+        f = {"scanner": "gitleaks", "identity": "aws-key:app.py:3",
+             "severity": "high", "title": "secret: aws-access-key",
+             "path": "app.py", "detail": {"rule": "aws-access-key", "line": 3}}
+        f.update(over)
+        return f
+
+    def test_the_document_is_sarif_2_1_0(self):
+        doc = squawk.sarif.sarif_document(self._man(), [])
+        assert doc["version"] == "2.1.0"
+        assert doc["$schema"].endswith("sarif-2.1.0.json")
+        assert isinstance(doc["runs"], list) and doc["runs"]
+
+    def test_one_run_per_scanner_so_which_tool_read_what_survives(self):
+        doc = squawk.sarif.sarif_document(self._man(), [self._finding()])
+        names = [r["tool"]["driver"]["name"] for r in doc["runs"]]
+        assert names == ["gitleaks", "checkov"], names
+
+    def test_a_stage_that_read_nothing_is_not_a_successful_scan(self):
+        """The whole reason to emit this format. `0 findings` from a stage that
+        examined 0 resources must not arrive as a clean run."""
+        doc = squawk.sarif.sarif_document(self._man(), [])
+        checkov = next(r for r in doc["runs"]
+                       if r["tool"]["driver"]["name"] == "checkov")
+        assert checkov["invocations"][0]["executionSuccessful"] is False
+        note = checkov["invocations"][0]["toolExecutionNotifications"][0]
+        assert "examined 0 resources" in note["message"]["text"]
+        assert note["properties"]["examined"] == 0
+        assert note["properties"]["unit"] == "resources"
+
+    def test_a_stage_that_read_something_is_a_successful_scan(self):
+        doc = squawk.sarif.sarif_document(self._man(), [])
+        gl = next(r for r in doc["runs"]
+                  if r["tool"]["driver"]["name"] == "gitleaks")
+        assert gl["invocations"][0]["executionSuccessful"] is True
+
+    def test_a_correlation_that_could_not_be_evaluated_is_not_applicable(self):
+        man = self._man(correlations=[{
+            "key": "public-unencrypted-store", "state": "unknown",
+            "title": "Publicly reachable AND unencrypted storage",
+            "why": "cannot evaluate: checkov read nothing this run",
+            "severity": "unknown", "members": [], "fix": "Make it private"}])
+        doc = squawk.sarif.sarif_document(man, [])
+        corr = next(r for r in doc["runs"]
+                    if r["tool"]["driver"]["name"] == "squawk-correlation")
+        res = corr["results"][0]
+        assert res["kind"] == "notApplicable"
+        assert res["level"] == "none", "SARIF requires level none once kind is not fail"
+        assert "cannot evaluate" in res["message"]["text"]
+        assert res["properties"]["squawkState"] == "unknown"
+
+    def test_a_correlation_that_fired_is_a_finding(self):
+        man = self._man(correlations=[{
+            "key": "secret-in-container-build", "state": "fired",
+            "title": "Secret in a container build context", "why": "joined on file",
+            "severity": "high", "members": ["a", "b"], "fix": "Rotate it"}])
+        doc = squawk.sarif.sarif_document(man, [])
+        res = next(r for r in doc["runs"]
+                   if r["tool"]["driver"]["name"] == "squawk-correlation")["results"][0]
+        assert res["kind"] == "fail" and res["level"] == "error"
+
+    @pytest.mark.parametrize("sev,level", [
+        ("critical", "error"), ("high", "error"), ("medium", "warning"),
+        ("low", "note"), ("info", "none"), ("unknown", "none"),
+    ])
+    def test_every_severity_maps_to_a_level(self, sev, level):
+        doc = squawk.sarif.sarif_document(
+            self._man(), [self._finding(severity=sev)])
+        res = doc["runs"][0]["results"][0]
+        assert res["level"] == level
+        assert res["properties"]["severity"] == sev, \
+            "the original severity must survive the lossy mapping"
+
+    def test_a_finding_carries_its_stable_identity_as_a_fingerprint(self):
+        """Two runs of the same tree produce the same document. Without this a
+        consumer re-raises every finding on every run."""
+        doc = squawk.sarif.sarif_document(self._man(), [self._finding()])
+        res = doc["runs"][0]["results"][0]
+        assert res["partialFingerprints"]["squawkIdentity/v1"] == "aws-key:app.py:3"
+
+    def test_a_finding_whose_stage_is_not_in_the_ledger_still_appears(self):
+        """Silence is the failure mode this tool is about. Dropping a finding
+        because its stage row was missing would reintroduce it in the exporter."""
+        doc = squawk.sarif.sarif_document(
+            self._man(), [self._finding(scanner="mystery")])
+        names = [r["tool"]["driver"]["name"] for r in doc["runs"]]
+        assert "mystery" in names
+        run = next(r for r in doc["runs"] if r["tool"]["driver"]["name"] == "mystery")
+        assert len(run["results"]) == 1
+
+    def test_the_target_is_masked(self):
+        doc = squawk.sarif.sarif_document(self._man(target="111111111111"), [])
+        assert "111111111111" not in json.dumps(doc)
+
+    def test_every_run_carries_the_squawk_run_id_so_they_regroup(self):
+        doc = squawk.sarif.sarif_document(self._man(), [self._finding()])
+        for r in doc["runs"]:
+            assert r["automationDetails"]["id"].startswith("20260101T000000Z/")
+
+    def test_the_document_is_json(self):
+        doc = squawk.sarif.sarif_document(self._man(), [self._finding()])
+        assert json.loads(json.dumps(doc)) == doc
+
+    def test_the_cli_refuses_rather_than_printing_an_empty_document(
+            self, tmp_path, capsys):
+        """An empty SARIF is indistinguishable from a scan that found nothing."""
+        rc = squawk.main(["sarif", "--evidence", str(tmp_path)])
+        assert rc == 1
+        assert "No runs" in capsys.readouterr().err
+
+    def test_the_cli_refuses_a_run_id_that_is_not_there(self, tmp_path, capsys):
+        run = tmp_path / "20260101T000000Z"
+        run.mkdir()
+        (run / "manifest.json").write_text(json.dumps(self._man()), encoding="utf-8")
+        (run / "findings.json").write_text("[]", encoding="utf-8")
+        assert squawk.main(["sarif", "20991231T000000Z",
+                            "--evidence", str(tmp_path)]) == 1
+        assert "No run" in capsys.readouterr().err
