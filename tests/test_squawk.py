@@ -16005,3 +16005,106 @@ class TestSarif:
         assert squawk.main(["sarif", "20991231T000000Z",
                             "--evidence", str(tmp_path)]) == 1
         assert "No run" in capsys.readouterr().err
+
+
+class TestStopHonoursThePortItWasGiven:
+    """`squawk.py --stop --port 8799` stopped the server on 8787.
+
+    A server is found by its evidence root, because that is where the pid file
+    lives and one root has one server. `--port` was accepted here and did
+    nothing — so on a box with two servers the operator asked for one and got
+    the other: a systemd unit they had just repaired went down, and the server
+    they meant stayed up. Found on a field run, 2026-09-18.
+
+    A flag that is accepted and silently ignored is I12 in the command line
+    rather than in a scan. The port is a check now, not a selector.
+
+    These assert that **nothing was signalled**, not that the exit code was 2.
+    The first version asserted the code, and passed with the fix reverted: the
+    stand-in process it used was killed but never reaped, so the pid check
+    still saw it and `cmd_stop` returned 2 from the "still running" branch
+    instead of from the refusal. Two different failures wearing one number.
+    """
+
+    @staticmethod
+    def _running(root, port, pid=424242):
+        rec = {"pid": pid, "host": "127.0.0.1", "port": port,
+               "url": "http://127.0.0.1:%d/" % port, "evidence": str(root),
+               "started_at": "20260101T000000Z", "version": squawk.__version__}
+        squawk.runtime.write_pid_file(str(root), rec)
+        return rec
+
+    @staticmethod
+    def _watch_kills(monkeypatch, dies=False):
+        """Record every signal sent, and let the caller decide whether the
+        process goes away afterwards."""
+        killed = []
+        state = {"alive": True}
+
+        def fake_kill(pid, sig):
+            killed.append(pid)
+            if dies:
+                state["alive"] = False
+
+        monkeypatch.setattr(squawk.service.os, "kill", fake_kill)
+        monkeypatch.setattr(squawk.service, "_alive", lambda pid: state["alive"])
+        return killed
+
+    def test_a_port_that_does_not_match_signals_nothing(self, tmp_path, capsys,
+                                                        monkeypatch):
+        killed = self._watch_kills(monkeypatch)
+        self._running(tmp_path, 8787)
+        rc = squawk.service.cmd_stop(str(tmp_path), wait=0.1, port=8799)
+        out = capsys.readouterr().out
+        assert killed == [], "it signalled a process it was told not to stop"
+        assert rc == 2, out
+        assert "Refusing to stop" in out, out
+        assert "8787" in out and "8799" in out, "both ports must be named"
+        assert squawk.runtime.read_pid_file(str(tmp_path)) is not None, \
+            "the server must still be recorded as running"
+
+    def test_the_refusal_names_the_evidence_root_as_the_way_to_select(
+            self, tmp_path, capsys, monkeypatch):
+        self._watch_kills(monkeypatch)
+        self._running(tmp_path, 8787)
+        squawk.service.cmd_stop(str(tmp_path), wait=0.1, port=8799)
+        assert "--evidence" in capsys.readouterr().out, \
+            "a refusal that does not say how to succeed is half a message"
+
+    def test_a_matching_port_is_allowed_through(self, tmp_path, capsys,
+                                                monkeypatch):
+        """The false-positive half: the check must not block the ordinary
+        case."""
+        killed = self._watch_kills(monkeypatch, dies=True)
+        self._running(tmp_path, 8787)
+        rc = squawk.service.cmd_stop(str(tmp_path), wait=0.1, port=8787)
+        assert rc == 0, capsys.readouterr().out
+        assert killed == [424242], killed
+
+    def test_no_port_still_stops_the_server_in_this_root(
+            self, tmp_path, capsys, monkeypatch):
+        killed = self._watch_kills(monkeypatch, dies=True)
+        self._running(tmp_path, 8787)
+        assert squawk.service.cmd_stop(str(tmp_path), wait=0.1) == 0
+        assert killed == [424242]
+
+    def test_the_stopped_line_names_what_was_stopped(self, tmp_path, capsys,
+                                                     monkeypatch):
+        """`Stopped Squawk (pid 481275).` gave a reader no way to notice it was
+        the wrong server."""
+        self._watch_kills(monkeypatch, dies=True)
+        self._running(tmp_path, 8787)
+        squawk.service.cmd_stop(str(tmp_path), wait=0.1)
+        out = capsys.readouterr().out
+        assert "8787" in out, out
+        assert str(tmp_path) in out, "the evidence root is half the identity"
+
+    def test_the_cli_passes_the_port_through(self, tmp_path, capsys, monkeypatch):
+        """End to end: the flag reaches the check rather than being dropped in
+        the parser, which is exactly where it was being dropped."""
+        killed = self._watch_kills(monkeypatch)
+        self._running(tmp_path, 8787)
+        rc = squawk.main(["--stop", "--port", "8799", "--evidence", str(tmp_path)])
+        out = capsys.readouterr().out
+        assert killed == [], "the CLI dropped the port and stopped the server"
+        assert rc == 2 and "Refusing to stop" in out, out

@@ -1003,7 +1003,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.status:
         return cmd_status(root0)
     if args.stop:
-        return cmd_stop(root0)
+        # The port is a check, not a selector -- see cmd_stop. Passed through
+        # only when the operator typed one.
+        return cmd_stop(root0, port=args.port if args.port else None)
     if args.install_service:
         return cmd_install_service(args, root0)
     if args.restart:

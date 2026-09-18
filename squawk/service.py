@@ -135,15 +135,37 @@ def cmd_status(root: str) -> int:
 STOP_WAIT_SECONDS = 30.0
 
 
-def cmd_stop(root: str, wait: float = STOP_WAIT_SECONDS) -> int:
+def cmd_stop(root: str, wait: float = STOP_WAIT_SECONDS,
+             port: "Optional[int]" = None) -> int:
     """Stop the server recorded in the pid file with SIGTERM and wait for it
     to go. It records any scan in progress as aborted on the way out, and
-    stops the scanner — process and container — before it goes."""
+    stops the scanner — process and container — before it goes.
+
+    A server is found by its EVIDENCE ROOT, because that is what the pid file
+    sits in and one root has one server. `--port` used to be accepted here and
+    silently ignored: `--stop --port 8799` stopped the server on 8787, because
+    that was the one in the default root. It killed a systemd unit somebody
+    had just repaired and left the server they meant running (field run,
+    2026-09-18). A flag that is accepted and does nothing is I12 in the
+    command line rather than in a scan.
+
+    So the port is now a check, not a selector: given one, it must match the
+    server about to be stopped, and a mismatch refuses and names both.
+    """
     import signal
     rec = read_pid_file(root)
     if rec is None:
         print("Squawk is not running (no pid file at %s)." % _pid_path(root))
         return 1
+    running_port = rec.get("port")
+    if port is not None and running_port is not None and int(running_port) != int(port):
+        print("Refusing to stop: the server in %s is on port %s, not %d.\n"
+              "A server is found by its evidence root, not by its port. To stop "
+              "the one on %d, pass the --evidence it was started with."
+              % (root, running_port, port, port))
+        LOG.warning("REFUSED stop: asked for port=%s, server in %s is on %s",
+                    port, root, running_port)
+        return 2
     pid = int(rec.get("pid", 0))
     if not _alive(pid):
         print("Stale pid file: process %d is already gone. Removing it." % pid)
@@ -166,8 +188,12 @@ def cmd_stop(root: str, wait: float = STOP_WAIT_SECONDS) -> int:
               "Run --stop again, or kill -9 %d to force." % (pid, wait, pid))
         return 2
     remove_pid_file(root)
-    print("Stopped Squawk (pid %d)." % pid)
-    LOG.info("server stopped by --stop: pid=%d", pid)
+    # Name what was stopped, not only its pid. "Stopped Squawk (pid 481275)"
+    # gave a reader no way to notice it was the wrong server.
+    where = str(rec.get("url") or "port %s" % rec.get("port", "?"))
+    print("Stopped Squawk (pid %d) — %s, evidence %s." % (pid, where, root))
+    LOG.info("server stopped by --stop: pid=%d port=%s evidence=%s",
+             pid, rec.get("port"), root)
     return 0
 
 
