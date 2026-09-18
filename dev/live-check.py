@@ -30,7 +30,9 @@ import time
 import urllib.error
 import urllib.request
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# The checks live in `dev/`; the app is one directory up, at the root of
+# the checkout.
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENTRY = os.path.join(HERE, "squawk.py")
 WEB = os.path.join(HERE, "squawk", "web.py")
 
@@ -204,7 +206,7 @@ def main(argv=None):
                 failures.append("%s -> %s%s" % (path, status,
                                                 " with a traceback" if tb else ""))
         # No page may scroll sideways: the Overview needed 1412px at any width
-        # and the owner, at 170% zoom, scrolled left and right to read it. A
+        # and the operator, at 170% zoom, scrolled left and right to read it. A
         # headless browser measures scrollWidth against clientWidth at four
         # widths; without one this prints that it was not measured, which is
         # not a pass.
@@ -215,7 +217,7 @@ def main(argv=None):
             bad = [w for w in wide if w[2] > w[3]]
             # A card may scroll its own table at phone widths; at 1000px and
             # up that is a layout that did not shrink, which the Overview did
-            # at the owner's zoom with two columns cut off at the edge.
+            # at the operator's zoom with two columns cut off at the edge.
             clipped = [w for w in wide if w[4] > 0 and w[1] >= 1000]
             narrow = [w for w in wide if w[4] > 0 and w[1] < 1000]
             print("widths: %d route(s) x 4 width(s); %s; %s"

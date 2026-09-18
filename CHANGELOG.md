@@ -12,10 +12,10 @@ them against synthetic targets is an exercise in which one missed identifier
 undoes the whole thing, so they stay where they were written.
 
 What crossed instead is the reasoning that can be stated from public standards
-and checked against this tree: [`CHARTER.md`](CHARTER.md) for the invariants,
-[`PRODUCT.md`](PRODUCT.md) for the boundaries and the credential rules,
-[`DESIGN.md`](DESIGN.md) for what must stay true on screen, and
-[`CORRELATION-DESIGN.md`](CORRELATION-DESIGN.md) for how findings are joined
+and checked against this tree: [`CHARTER.md`](docs/CHARTER.md) for the invariants,
+[`PRODUCT.md`](docs/PRODUCT.md) for the boundaries and the credential rules,
+[`DESIGN.md`](docs/DESIGN.md) for what must stay true on screen, and
+[`CORRELATION-DESIGN.md`](docs/CORRELATION-DESIGN.md) for how findings are joined
 across layers. Where a decision looks arbitrary, one of those four says why.
 
 ## Unreleased

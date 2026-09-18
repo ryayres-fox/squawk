@@ -10,127 +10,8 @@ no server to run, loopback-only.
 
 **What this is for:** the instrument a security engineer carries into a new org —
 code, running app, and cloud in one ranked, read-only assessment they can rerun to
-prove things are getting fixed. See [`PRODUCT.md`](PRODUCT.md) for the product
+prove things are getting fixed. See [`PRODUCT.md`](docs/PRODUCT.md) for the product
 definition and the hard boundaries.
-
-## Why "Squawk"
-
-Aircraft squawk a transponder code when something is wrong, and the three
-emergency codes map onto this tool almost exactly:
-
-| Code | Aviation | Here |
-|---|---|---|
-| **7700** | general emergency | a critical exposure is live |
-| **7600** | lost communications | a scanner or target went silent |
-| **7500** | unlawful interference | evidence of an active attack |
-
-**7600 is the one this tool is built around.** "Radio failure" is precisely the
-governing rule: *a scanner that did not run must never look like a scanner that
-found nothing.* A quiet run is not a clean run, and the alarm says so — a
-scanner that reported last time and not this time raises 7600 rather than
-letting the smaller number read as progress.
-
-The rest of the vocabulary is the same airport. **Scan** is where a run starts,
-and the twelve services are **pre-flight check**, **customs manifest**,
-**baggage check**, **contraband sweep**, **cargo scan**, **recon**, **live
-probe**, **active probe**, **compliance**, **cloud (AWS)**, **self-audit** and
-**skill audit**. Every one of them declares what it does *not* cover before you
-read its result. (The Scan page was called the Kiosk until each service tile
-became its own target picker; `squawk services` lists them.)
-
-**Porting plan:** [`PORT-PLAN.md`](PORT-PLAN.md) — what Squawk takes from the
-reference tool it grew out of, in order, and what it deliberately leaves.
-
-## The documents, and which one answers what
-
-Twelve, which is enough to need an order. They answer different questions, and
-where two of them disagree the one higher in this list wins.
-
-| Read this | To answer |
-|---|---|
-| [`CHARTER.md`](CHARTER.md) | What must stay true no matter what gets built. Seventeen invariants, each naming the test that fails when it is broken, and the six questions every new capability answers in its own commit. **Start here.** |
-| [`PRODUCT.md`](PRODUCT.md) | What this is, what it will never be, and the eight credential rules |
-| [`DESIGN.md`](DESIGN.md) | The seven experience pillars and the user journey: what must stay consistent on screen, with a checklist to hold each page against |
-| [`POSITIONING.md`](POSITIONING.md) | Who it is for, what is actually novel and what is not, and what releasing it would cost |
-| [`ROADMAP.md`](ROADMAP.md) | What gets built next, in what order, and how you know a phase is finished |
-| [`CHANGELOG.md`](CHANGELOG.md) | What shipped, newest first |
-| [`SETUP.md`](SETUP.md) | Standing it up on Kali, with verify lines |
-| [`TARGETS.md`](TARGETS.md) | Sample targets with known properties, and how to verify a scan's output is what it should be |
-| [`LAB-SETUP.md`](LAB-SETUP.md) | The container lab on the Kali box, and the VM topology it replaced |
-| [`CLOUD-SETUP.md`](CLOUD-SETUP.md) | Reading AWS Security Hub for the first time, written for a machine you do not own — including what is safe to send back |
-| [`CORRELATION-DESIGN.md`](CORRELATION-DESIGN.md) | Phase 1.5 design: joining findings across layers, verified against real scanner output |
-| [`PORT-PLAN.md`](PORT-PLAN.md) | Absorbed into the roadmap; kept for its reasoning |
-
-Both counts in this section were wrong here for weeks — it said nine documents
-and thirteen invariants while listing eleven and enforcing sixteen. A number in
-a document nobody recounts is the same defect as a scanner nobody checks, so if
-you add a document or an invariant, fix the count in the same commit. Twelve
-documents and seventeen invariants as of 2026-09-17.
-
-## Status
-
-Rebuilt in iterations from a private handoff document, each verified before the next. The design record that came out of it is
-[`DESIGN.md`](DESIGN.md) and [`CHARTER.md`](CHARTER.md); nothing here depends on the source material.
-
-- **Iteration 1 — the engine (done).** `--doctor` preflight, the scanner registry
-  and normalizers, the run pipeline, the evidence model (`manifest.json`,
-  `.ledger.tsv`, `raw/` — a scanner's own report and, where it prints its
-  coverage only to stdout, that too — `identities.json`, `digest.json` — which
-  is written last and hashes all the rest, plus the run before it), stable identity keys,
-  the contamination filter, and a headless `--run <service>`.
-- **Iteration 2 — the loopback web UI (done).** Kiosk (pick a service + target,
-  runs execute in a background thread and stream to a self-refreshing status
-  page), Findings (the evidence table with the identity key on every row),
-  History (per-scanner identity diff against the previous comparable run, where
-  a scanner absent from either run reads *silent*, never *resolved*), and Posture
-  (newest run per target, a 12-week strip where a week with no scan is a gap).
-- **Iteration 3 — baselines, triage, and `squawk-dashboard.py` (done).**
-  - *GitHub-issue baselines*: `--sync-baselines` (or the Baselines page) pulls
-    issues titled "Local scan report" read-only via `gh`, parses the
-    `## Diff baseline` table + `<details>` identity blocks, and caches under
-    `<evidence>/.baselines/`. The **truncation guard** recomputes
-    `sha256(sorted ids)[:16]` from what was actually parsed and only uses
-    scanners whose hash reconciles — a deleted slice of a 4,000-identity set is
-    rejected, never read as 1,150 fixes (tested). Counts-only issues are
-    unusable, with the reason shown. The generator splits sets across comments
-    (and within a scanner, labeled `part N of M`) to stay under GitHub's 65,536
-    cap — and Squawk generates but **never posts**.
-  - *Triage*: one row per **decision** (an advisory affecting four packages is
-    one decision showing 4 items), `j/k/x/a/r/f/s/o/n` keyboard flow, every
-    mark recorded in an append-only ledger in the evidence store (who, when,
-    why, which identities) and shown on every later run of the target,
-    baseline-matched findings hidden as already filed (with a show-anyway
-    toggle), and Finish produces paste-ready markdown of that record.
-  - *`squawk-dashboard.py`*: a static single-page render of one run. It imports
-    its counting logic **from** `squawk.py` (same directory, refuses to run
-    without it) so the identity keys, the contamination filter, and the
-    fingerprint are defined once — its per-scanner fingerprint is byte-identical
-    to the baseline table's, so you can eyeball one against the other.
-
-- **Iteration 4 — the estate, and evidence you can prove (done).** Ten pages
-  now, not four: **Overview** (newest run per target, every number a link),
-  **Scan** (each service tile is its own picker), **Findings**, **Estate** (one
-  row per `(scanner, rule)` across every live target, filtered, searched and
-  paged, with every count stating what it is out of), **Priority** (ranked by
-  exploitability, not severity), **Intel** (CISA KEV and EPSS with provenance,
-  per-CVE detail from OSV and NVD, and general intel that does not depend on
-  having scanned anything), **Triage**, **History**, **Cloud** (AWS Security Hub
-  ingest, read-only), **Baselines**. Underneath: a real lifecycle (`status`,
-  `stop`, `restart`, `--daemon`, `/healthz`, a generated systemd unit, aborted
-  runs recorded), evidence retention with a dry run and a record of what went,
-  and — as of plan 02 — a digest chain across runs, a hash chain in the
-  decisions ledger and `squawk verify` to walk both. A run can be given a
-  **profile** (`squawk.toml`): timing, budgets and scanner options per
-  service, per target or per scanner, printed before the run, carried in the
-  manifest, shown on the run page, and refused by name when a value is unsafe
-  or unknown. The type checker is a gate: `mypy` 1.20.2 against the 3.9
-  floor, zero errors, on every push.
-
-Start the UI with no flag (or `--open` to launch a browser):
-
-```bash
-python3 squawk.py --repo /path/to/checkout        # serves http://127.0.0.1:8787/
-```
 
 ## Quick start
 
@@ -148,7 +29,7 @@ unwritable evidence root. Every other absence prints as a gap with a reason and
 still exits 0, because it narrows what you can run rather than stopping you.
 
 To stand it up on Kali against a containerized target end to end, meaning Docker,
-the target, recon, DAST and the full scanner set, follow [`SETUP.md`](SETUP.md).
+the target, recon, DAST and the full scanner set, follow [`SETUP.md`](docs/SETUP.md).
 
 ### The instrument check
 
@@ -225,7 +106,98 @@ unwritable evidence root. Every other absence prints as a gap with a reason and
 still exits 0, because it narrows what you can run rather than stopping you.
 
 To stand it up on Kali against a containerized target end to end — Docker, the
-target, recon, DAST, and the full scanner set — follow [`SETUP.md`](SETUP.md).
+target, recon, DAST, and the full scanner set — follow [`SETUP.md`](docs/SETUP.md).
+
+## Why "Squawk"
+
+Aircraft squawk a transponder code when something is wrong, and the three
+emergency codes map onto this tool almost exactly:
+
+| Code | Aviation | Here |
+|---|---|---|
+| **7700** | general emergency | a critical exposure is live |
+| **7600** | lost communications | a scanner or target went silent |
+| **7500** | unlawful interference | evidence of an active attack |
+
+**7600 is the one this tool is built around.** "Radio failure" is precisely the
+governing rule: *a scanner that did not run must never look like a scanner that
+found nothing.* A quiet run is not a clean run, and the alarm says so — a
+scanner that reported last time and not this time raises 7600 rather than
+letting the smaller number read as progress.
+
+The rest of the vocabulary is the same airport. **Scan** is where a run starts,
+and the twelve services are **pre-flight check**, **customs manifest**,
+**baggage check**, **contraband sweep**, **cargo scan**, **recon**, **live
+probe**, **active probe**, **compliance**, **cloud (AWS)**, **self-audit** and
+**skill audit**. Every one of them declares what it does *not* cover before you
+read its result. (The Scan page was called the Kiosk until each service tile
+became its own target picker; `squawk services` lists them.)
+
+
+## Status
+
+Rebuilt in iterations from a private handoff document, each verified before the next. The design record that came out of it is
+[`DESIGN.md`](docs/DESIGN.md) and [`CHARTER.md`](docs/CHARTER.md); nothing here depends on the source material.
+
+- **Iteration 1 — the engine (done).** `--doctor` preflight, the scanner registry
+  and normalizers, the run pipeline, the evidence model (`manifest.json`,
+  `.ledger.tsv`, `raw/` — a scanner's own report and, where it prints its
+  coverage only to stdout, that too — `identities.json`, `digest.json` — which
+  is written last and hashes all the rest, plus the run before it), stable identity keys,
+  the contamination filter, and a headless `--run <service>`.
+- **Iteration 2 — the loopback web UI (done).** Kiosk (pick a service + target,
+  runs execute in a background thread and stream to a self-refreshing status
+  page), Findings (the evidence table with the identity key on every row),
+  History (per-scanner identity diff against the previous comparable run, where
+  a scanner absent from either run reads *silent*, never *resolved*), and Posture
+  (newest run per target, a 12-week strip where a week with no scan is a gap).
+- **Iteration 3 — baselines, triage, and `squawk-dashboard.py` (done).**
+  - *GitHub-issue baselines*: `--sync-baselines` (or the Baselines page) pulls
+    issues titled "Local scan report" read-only via `gh`, parses the
+    `## Diff baseline` table + `<details>` identity blocks, and caches under
+    `<evidence>/.baselines/`. The **truncation guard** recomputes
+    `sha256(sorted ids)[:16]` from what was actually parsed and only uses
+    scanners whose hash reconciles — a deleted slice of a 4,000-identity set is
+    rejected, never read as 1,150 fixes (tested). Counts-only issues are
+    unusable, with the reason shown. The generator splits sets across comments
+    (and within a scanner, labeled `part N of M`) to stay under GitHub's 65,536
+    cap — and Squawk generates but **never posts**.
+  - *Triage*: one row per **decision** (an advisory affecting four packages is
+    one decision showing 4 items), `j/k/x/a/r/f/s/o/n` keyboard flow, every
+    mark recorded in an append-only ledger in the evidence store (who, when,
+    why, which identities) and shown on every later run of the target,
+    baseline-matched findings hidden as already filed (with a show-anyway
+    toggle), and Finish produces paste-ready markdown of that record.
+  - *`squawk-dashboard.py`*: a static single-page render of one run. It imports
+    its counting logic **from** `squawk.py` (same directory, refuses to run
+    without it) so the identity keys, the contamination filter, and the
+    fingerprint are defined once — its per-scanner fingerprint is byte-identical
+    to the baseline table's, so you can eyeball one against the other.
+
+- **Iteration 4 — the estate, and evidence you can prove (done).** Ten pages
+  now, not four: **Overview** (newest run per target, every number a link),
+  **Scan** (each service tile is its own picker), **Findings**, **Estate** (one
+  row per `(scanner, rule)` across every live target, filtered, searched and
+  paged, with every count stating what it is out of), **Priority** (ranked by
+  exploitability, not severity), **Intel** (CISA KEV and EPSS with provenance,
+  per-CVE detail from OSV and NVD, and general intel that does not depend on
+  having scanned anything), **Triage**, **History**, **Cloud** (AWS Security Hub
+  ingest, read-only), **Baselines**. Underneath: a real lifecycle (`status`,
+  `stop`, `restart`, `--daemon`, `/healthz`, a generated systemd unit, aborted
+  runs recorded), evidence retention with a dry run and a record of what went,
+  and — as of plan 02 — a digest chain across runs, a hash chain in the
+  decisions ledger and `squawk verify` to walk both. A run can be given a
+  **profile** (`squawk.toml`): timing, budgets and scanner options per
+  service, per target or per scanner, printed before the run, carried in the
+  manifest, shown on the run page, and refused by name when a value is unsafe
+  or unknown. The type checker is a gate: `mypy` 1.20.2 against the 3.9
+  floor, zero errors, on every push.
+
+Start the UI with no flag (or `--open` to launch a browser):
+
+```bash
+python3 squawk.py --repo /path/to/checkout        # serves http://127.0.0.1:8787/
+```
 
 ## What makes it worth building next to DefectDojo
 
@@ -258,7 +230,7 @@ The correctness guarantees are the reason it exists:
 
 The guarantees are the product; the scanners are commodity. So the rules are
 written down as things a test can check rather than intentions to agree with:
-[`CHARTER.md`](CHARTER.md) holds seventeen invariants, and `test_charter.py`
+[`CHARTER.md`](docs/CHARTER.md) holds seventeen invariants, and `test_charter.py`
 fails when one is broken.
 
 They are enforced across the registry rather than per feature, so a scanner
@@ -283,61 +255,15 @@ entry in `SCANNERS` plus a normalizer, and a new service is an entry in
 Next up is **runtime testing**: DAST (OWASP ZAP) against an app running in a
 VirtualBox VM, and standing containerized apps up under Docker locally to probe
 them live. The full plan — scopes, safety rails, and setup notes — is in
-[`ROADMAP.md`](ROADMAP.md).
-
-## Development standard
-
-Branches, code and PRs here are written to pass a peer-review standard,
-summarised for a contributor in [`CONTRIBUTING.md`](CONTRIBUTING.md):
-default-block posture, evidence for every claim, real tests, no secrets or wildcards, arg-list
-subprocess calls, explicit error handling, and live-vs-source verification. See
-[`PRODUCT.md`](PRODUCT.md) for the credential-handling rules that gate every
-future cloud and authenticated capability.
-
-Live-vs-source verification has a script. `./live-check.py` reads the route
-table out of the handler, serves a daemon on a free port against a throwaway
-evidence root, fetches every route it found, and fails on a non-200, a
-traceback in a body or in the server log, or a server still listening after
-stop. A route added to the handler is a route it fetches, so a page cannot be
-added and never seen fail.
-
-`./kali-check.py` is the field check: 84 assertions over the lifecycle, the
-subcommands, an aborted run, the decisions ledger, resolved and regressed
-dates, a scanner going silent, the refusals and the empty-feed states, the
-evidence chain and every way of editing it, `stop` killing a live ZAP
-container, and a profile printed, applied and refused, each printing the
-value it saw. It found two defects the first time it ran, which is
-the argument for it. `./smoke-test.sh` and `./phase1-check.sh` are the other
-half: the whole app against real code, because a fixture is the author's idea
-of the format.
-
-`./lab-targets.py` is the lab: the container targets on loopback, the file corpora with a known answer each, and `check`, which holds every service to the answer written beside its target in [`TARGETS.md`](TARGETS.md) — `PASS`, `FAIL` or `SKIP` per line with the value it saw, and a skip is never a pass.
-
-## Reporting something, and what is maintained
-
-[`SECURITY.md`](SECURITY.md) is how to report a vulnerability — through GitHub's
-private reporting, never a public issue. It also says what counts as one here,
-including the case people do not expect: **a clean result Squawk did not earn.**
-If you can make this tool print an empty finding list, a green stage or a zero
-over something it did not read, that is a security report and it is the one most
-wanted.
-
-[`CONTRIBUTING.md`](CONTRIBUTING.md) is the gate a change passes and the six
-questions a new capability answers. [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)
-is one paragraph.
-
-**Maintenance is one person, best-effort**: security issues first, bugs triaged
-as time allows, no commitment on feature requests. Pre-1.0, the newest release
-is the only supported one and there are no backports. Written down so nobody has
-to guess it.
+[`ROADMAP.md`](docs/ROADMAP.md).
 
 ## Requirements and portability
 
 Python 3.9+ (and 3.9-safe, no `X | Y` annotations). Scanners are optional and
 discovered at runtime: `gitleaks`, `semgrep`, `bandit`, `checkov`, `trivy`,
-`syft`, `grype`. Supporting: `git`, `docker`, `gh`. [`SETUP.md`](SETUP.md) is
-the install and first run, [`CLOUD-SETUP.md`](CLOUD-SETUP.md) the AWS side, and
-[`DESIGN.md`](DESIGN.md) the reasoning behind each design choice.
+`syft`, `grype`. Supporting: `git`, `docker`, `gh`. [`SETUP.md`](docs/SETUP.md) is
+the install and first run, [`CLOUD-SETUP.md`](docs/CLOUD-SETUP.md) the AWS side, and
+[`DESIGN.md`](docs/DESIGN.md) the reasoning behind each design choice.
 
 **POSIX only.** Squawk is stdlib Python, but it is not portable to Windows and
 is not tested there: it locks with `fcntl`, ends a runaway scanner by process
@@ -369,7 +295,7 @@ fix rather than failing as an unexplained `No such file or directory`.
 
 ### Verifying that claim
 
-`./test-matrix.sh` runs the detection and the host self-audit across container
+`./dev/test-matrix.sh` runs the detection and the host self-audit across container
 images and reports a table. Portability asserted is not portability tested.
 
 Currently passing 18 of 18 checks on `debian:stable-slim`, `ubuntu:24.04`,
@@ -382,6 +308,76 @@ have no systemd, which makes them a hostile environment for an installer — thr
 conditions that each broke the original script. What they cannot test is the
 systemd side: `clock-sync` and `journal-persistent` answer *not determined*
 there, and only a real VM makes them answer properly.
+
+## Reporting something, and what is maintained
+
+[`SECURITY.md`](SECURITY.md) is how to report a vulnerability — through GitHub's
+private reporting, never a public issue. It also says what counts as one here,
+including the case people do not expect: **a clean result Squawk did not earn.**
+If you can make this tool print an empty finding list, a green stage or a zero
+over something it did not read, that is a security report and it is the one most
+wanted.
+
+[`CONTRIBUTING.md`](CONTRIBUTING.md) is the gate a change passes and the six
+questions a new capability answers. [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)
+is one paragraph.
+
+**Maintenance is one person, best-effort**: security issues first, bugs triaged
+as time allows, no commitment on feature requests. Pre-1.0, the newest release
+is the only supported one and there are no backports. Written down so nobody has
+to guess it.
+
+## Development standard
+
+Branches, code and PRs here are written to pass a peer-review standard,
+summarised for a contributor in [`CONTRIBUTING.md`](CONTRIBUTING.md):
+default-block posture, evidence for every claim, real tests, no secrets or wildcards, arg-list
+subprocess calls, explicit error handling, and live-vs-source verification. See
+[`PRODUCT.md`](docs/PRODUCT.md) for the credential-handling rules that gate every
+future cloud and authenticated capability.
+
+Live-vs-source verification has a script. `./dev/live-check.py` reads the route
+table out of the handler, serves a daemon on a free port against a throwaway
+evidence root, fetches every route it found, and fails on a non-200, a
+traceback in a body or in the server log, or a server still listening after
+stop. A route added to the handler is a route it fetches, so a page cannot be
+added and never seen fail.
+
+`./dev/kali-check.py` is the field check: 84 assertions over the lifecycle, the
+subcommands, an aborted run, the decisions ledger, resolved and regressed
+dates, a scanner going silent, the refusals and the empty-feed states, the
+evidence chain and every way of editing it, `stop` killing a live ZAP
+container, and a profile printed, applied and refused, each printing the
+value it saw. It found two defects the first time it ran, which is
+the argument for it. `./dev/smoke-test.sh` and `./dev/phase1-check.sh` are the other
+half: the whole app against real code, because a fixture is the author's idea
+of the format.
+
+`./dev/lab-targets.py` is the lab: the container targets on loopback, the file corpora with a known answer each, and `check`, which holds every service to the answer written beside its target in [`TARGETS.md`](dev/TARGETS.md) — `PASS`, `FAIL` or `SKIP` per line with the value it saw, and a skip is never a pass.
+
+## The documents, and which one answers what
+
+Ten, which is enough to need an order. They answer different questions, and
+where two of them disagree the one higher in this list wins.
+
+| Read this | To answer |
+|---|---|
+| [`CHARTER.md`](docs/CHARTER.md) | What must stay true no matter what gets built. Seventeen invariants, each naming the test that fails when it is broken, and the six questions every new capability answers in its own commit. **Start here.** |
+| [`PRODUCT.md`](docs/PRODUCT.md) | What this is, what it will never be, and the eight credential rules |
+| [`DESIGN.md`](docs/DESIGN.md) | The seven experience pillars and the user journey: what must stay consistent on screen, with a checklist to hold each page against |
+| [`ROADMAP.md`](docs/ROADMAP.md) | What gets built next, in what order, and how you know a phase is finished |
+| [`CHANGELOG.md`](CHANGELOG.md) | What shipped, newest first |
+| [`SETUP.md`](docs/SETUP.md) | Standing it up on Kali, with verify lines |
+| [`TARGETS.md`](dev/TARGETS.md) | Sample targets with known properties, and how to verify a scan's output is what it should be |
+| [`LAB-SETUP.md`](dev/LAB-SETUP.md) | The container lab on the Kali box, and the VM topology it replaced |
+| [`CLOUD-SETUP.md`](docs/CLOUD-SETUP.md) | Reading AWS Security Hub for the first time, written for a machine you do not own — including what is safe to send back |
+| [`CORRELATION-DESIGN.md`](docs/CORRELATION-DESIGN.md) | Phase 1.5 design: joining findings across layers, verified against real scanner output |
+
+Both counts in this section were wrong here for weeks — it said nine documents
+and thirteen invariants while listing eleven and enforcing sixteen. A number in
+a document nobody recounts is the same defect as a scanner nobody checks, so if
+you add a document or an invariant, fix the count in the same commit. Ten
+documents and seventeen invariants as of 2026-09-18.
 
 ## Layout
 

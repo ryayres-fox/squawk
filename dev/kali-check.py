@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Squawk — the field check for everything that does not need your eyes.
 
-The worklog used to ask a person to do by hand what a script can do: start the
+This used to be a checklist a person worked through by hand: start the
 server, mark a triage row, rescan, look for a date, disable a scanner, check
 nothing reads as fixed. Each of those has an exact expected answer, so each of
 them belongs here, and what is left for a person is only what a person can
@@ -46,7 +46,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# The checks live in `dev/`; the app is one directory up, at the root of
+# the checkout.
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENTRY = os.path.join(HERE, "squawk.py")
 sys.path.insert(0, HERE)
 
@@ -91,8 +93,8 @@ def cli(*args, **kw):
 
 
 # The servers THIS check started, by pid. The clean-up used to `pkill -f
-# "squawk.py serve"`, which killed every Squawk on the box — including the one
-# the worklog had just told you to start, with whatever scan it was running —
+# "squawk.py serve"`, which killed every Squawk on the host — including the one
+# you had just started yourself, with whatever scan it was running —
 # and the "left behind" check counted that server as a leak and FAILED. A check
 # that fails on the instruction it is paired with, then destroys the thing under
 # test, is the defect this file exists to catch. Only what it started is its
@@ -348,7 +350,7 @@ def check_aborted(work, port):
 def check_evidence_features(work, port):
     """One directory scanned four times: with the risky file, without it, with
     it again, and once with bandit hidden. That sequence is every claim the
-    worklog used to ask for by hand."""
+    manual checklist used to ask for by hand."""
     import squawk
     section("4 · Decisions live in the evidence store, not a browser")
     if not shutil.which("bandit"):
@@ -711,7 +713,7 @@ def check_stop_kills_the_scanner(work):
                                           "target": "http://127.0.0.1:3000"})
     check("a live probe is started through the server", code in (200, 303), "HTTP %s" % code)
     # Only the container THIS check started. Taking the first `squawk-zap-
-    # baseline-*` on the box picked up the owner's own probe on 2026-09-07 and
+    # baseline-*` on the host picked up the operator's own probe on 2026-09-07 and
     # then failed because stop had — correctly — left it alone: two red lines
     # from a working product. Section 12 holds this rule for servers; a
     # container is no different.

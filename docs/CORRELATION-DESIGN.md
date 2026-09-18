@@ -323,5 +323,5 @@ being named as one. PRODUCT's second question is "what gets fixed first", which
 a scale with no impact input cannot answer and a scale with an unstated one
 answers inconsistently.
 
-This is the owner's call and it is not made here. What this file will not do is
+This is the operator's call and it is not made here. What this file will not do is
 settle it silently in one row at a time.

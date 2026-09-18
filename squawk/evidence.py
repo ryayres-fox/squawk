@@ -53,8 +53,8 @@ def count_runs(evidence_root: str) -> int:
     The top bar shows this on every page, and the job page reloads every few
     seconds while a scan runs, so `len(list_runs(...))` meant parsing every
     manifest in the store several times a minute — eighty-five JSON documents
-    on the owner's box, for one number. Measured after the owner reported the
-    machine getting sluggish while watching a probe (#126, 2026-09-07)."""
+    on the operator's box, for one number. Measured after the operator reported the
+    machine getting sluggish while watching a probe (2026-09-07)."""
     if not os.path.isdir(evidence_root):
         return 0
     n = 0

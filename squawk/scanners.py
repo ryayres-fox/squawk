@@ -461,7 +461,7 @@ def _region_notes(data: dict, found: str) -> List[str]:
 def function_count(per: dict) -> int:
     """How many functions one region holds, from either shape of reading.
 
-    `functions` was a count until #207 made it the list, so the tile could
+    `functions` was a count before it became the list, so the tile could
     expand to its members. The reader was updated and this extractor was not:
     `int` of a non-empty list raises, `stage_coverage` swallows it, and the
     edge stage reported NO COVERAGE AT ALL on every populated account for
@@ -832,7 +832,7 @@ def norm_clouddata(raw: str, base: str) -> List[Finding]:
 # `--no-git` prints only the second. A directory that is not a repository,
 # scanned in repo scope, prints "0 commits scanned." and "scanned ~0 bytes" --
 # which is the case that matters, because until now it read as 0 finding(s) and
-# "No squawk. Nothing critical." on a real repository (the owner, 2026-09-12).
+# "No squawk. Nothing critical." on a real repository (the operator, 2026-09-12).
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _GITLEAKS_BYTES = re.compile(r"scanned ~(\d+) bytes")
 _GITLEAKS_COMMITS = re.compile(r"(\d+) commits scanned")

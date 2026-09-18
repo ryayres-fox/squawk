@@ -16,7 +16,9 @@
 # the CVE checks skip.
 
 set -uo pipefail
-HERE="$(cd "$(dirname "$0")" && pwd)"
+# The checks live in `dev/`; the app is one directory up, at the root of
+# the checkout.
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
 # One fixed evidence root, NOT a tmp dir, so squawk.log accumulates and the
 # final grep sweep can prove each mechanism logged.
 EV="$HOME/scan-evidence"
@@ -156,7 +158,7 @@ else bad "no squawk.log at $LOG — logging is off, which is itself a defect"; f
 # Two items, not five. The rest of what used to be listed here is asserted by
 # kali-check.py now, and repeating a check a script already makes is how a
 # checklist becomes something nobody runs.
-section "Needs your eyes — two things, then see WORKLOG 'Now'"
+section "Needs your eyes — two things"
 echo "  Start it:  python3 squawk.py restart   (serves http://127.0.0.1:8787)"
 echo "  a) A run with a gap: the stage row is AMBER, not grey."
 echo "  b) A correlated run (a public unencrypted bucket): the Findings page"

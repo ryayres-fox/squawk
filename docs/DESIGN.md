@@ -7,7 +7,7 @@ charter wins: honesty outranks polish.
 
 These are not style preferences. Each one is derived from what Squawk is (an
 evidence-first, read-only, single-operator security instrument) and who it is for
-(one person with no team and no enterprise stack; see [`POSITIONING.md`](POSITIONING.md)).
+(one person with no team and no enterprise stack).
 The visual language borrows from instrument panels the audience already trusts:
 Wiz and Tenable for security density, Splunk for evidence tables, Lightroom for a
 calm dark workspace, Claude and Brave for restraint.

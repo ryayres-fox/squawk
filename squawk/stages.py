@@ -41,7 +41,7 @@ def stage_gitleaks(ctx: RunContext) -> Tuple[List[str], int]:
     # `--no-git` was decided by SCOPE alone, and scope is what the operator
     # ASKED for; `.git` is what is actually there. Pointed at a directory that
     # holds repositories rather than being one -- "GitHub Repos/acme-platform" on
-    # the owner's machine -- gitleaks was told to walk a git history that does
+    # the operator's machine -- gitleaks was told to walk a git history that does
     # not exist, reported "0 commits scanned · scanned ~0 bytes", and found
     # nothing. Reproduced against gitleaks 8.30.1: a synthetic `ghp_`-shaped
     # token in that tree is MISSED entirely without this and found with it.
@@ -90,7 +90,7 @@ def stage_bandit(ctx: RunContext) -> Tuple[List[str], int]:
 def stage_checkov(ctx: RunContext) -> Tuple[List[str], int]:
     # `--compact` and `--quiet` are documented as "in case of CLI output" and
     # this asks for JSON, so they never did anything here -- and one of them is
-    # what a checkov on the owner's machine refused, which cost the whole IaC
+    # what a checkov on the operator's machine refused, which cost the whole IaC
     # half of a compliance run (2026-09-12). A flag that changes nothing about
     # the answer is a flag that can only fail.
     return ["checkov", "-d", ctx.target, "-o", "json"], 900
@@ -624,7 +624,7 @@ def dast_target_live(url: str, timeout: float = 4.0) -> Tuple[bool, str]:
     is thirty seconds of ZAP starting up, a spider that cannot connect, and a
     run that says a scanner went silent without saying why.
 
-    That happened on the owner's box (2026-09-08): Juice Shop was down, three
+    That happened on the operator's box (2026-09-08): Juice Shop was down, three
     probes failed in under half a minute each, and the evidence that named the
     cause — `Job spider failed to access URL … Connection refused` — was one
     line at the bottom of a log nobody had reason to open. The run should

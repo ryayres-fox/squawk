@@ -43,7 +43,9 @@ import urllib.error
 import urllib.request
 from typing import Dict, List, Optional, Tuple
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# The checks live in `dev/`; the app is one directory up, at the root of
+# the checkout.
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENTRY = os.path.join(HERE, "squawk.py")
 LAB = os.path.expanduser(os.environ.get("SQUAWK_LAB", "~/squawk-lab"))
 
@@ -381,7 +383,7 @@ TARGETS: List[dict] = [
      "service": "baggage", "flag": "--target",
      "must": {"trivy": ["CVE-2018-1000656", "CVE-2019-1010083", "CVE-2020-8203",
                         "CVE-2021-23337", "CVE-2019-10744"],
-              # grype names these by GHSA id (measured on the box, 2026-09-07):
+              # grype names these by GHSA id (measured on Kali, 2026-09-07):
               # 562c = CVE-2018-1000656, 5wv5 = CVE-2019-1010083 (flask);
               # 35jh = CVE-2021-23337, 29mw = CVE-2020-28500 (lodash)
               "grype": ["CVE-2018-1000656", "CVE-2019-1010083", "CVE-2020-8203",
