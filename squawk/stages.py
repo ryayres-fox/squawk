@@ -368,6 +368,24 @@ class Service(NamedTuple):
     not_covered: str
 
 
+#: A note is not a scan, so it is deliberately NOT in SERVICES: it takes no
+#: scanner, has no stages, and `squawk run note` would be a category error.
+#: It is a Service only so one finding recorded by hand goes through exactly
+#: the same evidence path as a scan -- the digest chain, the sealing, the
+#: identity model, the triage ledger, the history. A second store for hand-made
+#: findings would be a second thing to trust.
+#:
+#: The `not_covered` sentence is the whole discipline applied to this: a note
+#: enumerates nothing, so it has no denominator, and the absence of other
+#: findings beside it means nothing at all.
+NOTE_SERVICE = Service(
+    "note", "Operator note", "note", (),
+    "instant",
+    "One finding recorded by hand. This is not a scan: nothing was enumerated, "
+    "so there is no denominator and no coverage claim. Other findings being "
+    "absent here means only that nobody wrote them down.")
+
+
 SERVICES: Dict[str, Service] = {
     "preflight": Service(
         "preflight", "Pre-flight check", "repo",
@@ -668,6 +686,7 @@ def dast_target_live(url: str, timeout: float = 4.0) -> Tuple[bool, str]:
 
 
 __all__ = [
+    'NOTE_SERVICE',
     'READ_ONLY_POLICIES',
     'SERVICES',
     'STAGES',

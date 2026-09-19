@@ -3,9 +3,12 @@
 import argparse
 import json
 import os
+import shlex
 import shutil
 import socket
+import subprocess
 import sys
+import tempfile
 import time
 from typing import List, Optional
 
@@ -19,6 +22,7 @@ from squawk.analysis import (
     squawk_check,
     squawk_lines,
     verify_root,
+    verify_state,
 )
 from squawk.baselines import resolve_gh_repo, sync_baselines
 from squawk.core import (
@@ -27,6 +31,7 @@ from squawk.core import (
     DEFAULT_PORT,
     FEEDS_DIRNAME,
     LOG,
+    NOTE_TEMPLATE,
     PROFILE_REFUSED_NOTE,
     SCANNERS,
     SEVERITY_ORDER,
@@ -38,6 +43,8 @@ from squawk.core import (
     guard_host,
     human_seconds,
     mask_account,
+    note_problems,
+    parse_note,
     redact_identifiers,
     resolve_repo,
     setup_logging,
@@ -48,8 +55,18 @@ from squawk.core import (
     vuln_db_ages,
 )
 from squawk.decisions import who
-from squawk.engine import execute_service, profile_for, stage_rows
-from squawk.evidence import estate_runs, list_runs, load_findings, save_verify
+from squawk.engine import (
+    execute_service,
+    profile_for,
+    stage_rows,
+    write_note,
+)
+from squawk.evidence import (
+    estate_runs,
+    list_runs,
+    load_findings,
+    save_verify,
+)
 from squawk.feeds import (
     FEED_STALE_DAYS,
     estate_cves,
@@ -64,6 +81,7 @@ from squawk.installer import (
     run_installer,
 )
 from squawk.probes import self_audit_checks
+from squawk.report import report_markdown
 from squawk.retention import (
     DEFAULT_DROP_DAYS,
     DEFAULT_TRIM_DAYS,
@@ -429,7 +447,8 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     began = time.time()
     outcome = execute_service(service, target, root, base, progress=on_progress,
-                              profile=profile)
+                              profile=profile,
+                              session=args.session)
     print("\nRun %s  ·  %s" % (outcome["run_id"], human_seconds(time.time() - began)))
     print("Evidence written to %s" % outcome["run_dir"])
 
@@ -705,6 +724,106 @@ def cmd_prune(args: argparse.Namespace) -> int:
     return 1 if done["failed"] else 0
 
 
+def _edit(text: str) -> Optional[str]:
+    """Open $EDITOR on `text` and return what came back, or None if the editor
+    failed. The buffer is written where the run will not be: a half-filled note
+    in the evidence root would be a run directory nothing can read."""
+    editor = os.environ.get("SQUAWK_EDITOR") or os.environ.get("EDITOR") or "vi"
+    fd, path = tempfile.mkstemp(prefix="squawk-note-", suffix=".md")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        code = subprocess.call([*shlex.split(editor), path])
+        if code != 0:
+            sys.stderr.write("%s exited %d; nothing was written.\n"
+                             % (editor, code))
+            return None
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def cmd_note(args: argparse.Namespace) -> int:
+    """Record a finding an operator found, as a sealed run.
+
+    Refuses rather than writing something it would later have to explain away:
+    a note with no title, no severity or no account of how it was found is an
+    assertion rather than evidence, and the locker is worth exactly what its
+    weakest entry is worth.
+    """
+    target = (args.target or args.repo or "").strip()
+    if not target:
+        sys.stderr.write(
+            "A note needs a target: what the finding is about.\n"
+            "  squawk note --target 10.10.1.5 --session thm-blue\n")
+        return 2
+
+    missing = [a for a in args.attach if not os.path.isfile(a)]
+    if missing:
+        sys.stderr.write("No such file: %s\n" % ", ".join(missing))
+        return 2
+
+    head = ("# target: %s\n# session: %s\n"
+            % (target, args.session or "(none)"))
+    if args.attach:
+        head += "# attaching: %s\n" % ", ".join(os.path.basename(a)
+                                                 for a in args.attach)
+    text = _edit(head + NOTE_TEMPLATE)
+    if text is None:
+        return 2
+
+    fields = parse_note(text)
+    problems = note_problems(fields)
+    if problems:
+        sys.stderr.write("Not recorded — the note is incomplete:\n")
+        for p in problems:
+            sys.stderr.write("  %s\n" % p)
+        sys.stderr.write("Nothing was written. Run it again to try once more.\n")
+        return 2
+
+    root = args.evidence or env("EVIDENCE") or DEFAULT_EVIDENCE
+    out = write_note(root, target, fields, attachments=args.attach,
+                     session=args.session)
+    print("Recorded %s" % out["identity"])
+    print("  Run      : %s" % out["run_dir"])
+    attached = out["attachments"]
+    if attached:
+        print("  Attached : %s file(s), hashed into the run's digest" % attached)
+    if args.session:
+        print("  Session  : %s" % args.session)
+    print("\nThis is one finding, recorded by hand. It is not a scan: nothing "
+          "was\nenumerated, so nothing here says what was looked at and not "
+          "found.")
+    return 0
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    """One engagement as markdown on stdout.
+
+    Read-only. Writes nothing: a report is a rendering of evidence, and a run
+    directory is sealed.
+    """
+    root = args.evidence or env("EVIDENCE") or DEFAULT_EVIDENCE
+    session = (args.report or "").strip()
+    if not session:
+        sys.stderr.write(
+            "A report needs a session: which engagement to compile.\n"
+            "  squawk report thm-blue --evidence ~/squawk-work\n"
+            "Tag runs and notes with --session NAME as you go.\n")
+        return 2
+    text, count = report_markdown(root, session, verify=verify_state(root))
+    sys.stdout.write(text)
+    if not text.endswith("\n"):
+        sys.stdout.write("\n")
+    # The count goes to stderr so a redirect captures the document alone.
+    sys.stderr.write("\n%d finding(s) from session %r.\n" % (count, session))
+    return 0
+
+
 def cmd_sarif(args: argparse.Namespace) -> int:
     """One run as SARIF 2.1.0 on stdout.
 
@@ -905,6 +1024,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "and the chain, and the decisions ledger, then exit")
     p.add_argument("--json", action="store_true",
                    help="with verify: print the whole report as one JSON document")
+    p.add_argument("--note", action="store_true",
+                   help="record a finding you found yourself: opens $EDITOR "
+                        "with a template, writes it as a sealed run")
+    p.add_argument("--session", default="", metavar="NAME",
+                   help="the engagement this run or note belongs to, so a "
+                        "report can be compiled from it later")
+    p.add_argument("--attach", action="append", default=[], metavar="FILE",
+                   help="with note: a file to copy into the run and hash into "
+                        "its digest (repeatable). A screenshot that can be "
+                        "swapped afterwards proves nothing")
+    p.add_argument("--report", nargs="?", const="", metavar="SESSION",
+                   help="compile the runs and notes carrying this session tag "
+                        "into one markdown report on stdout, with what each "
+                        "service did NOT cover stated before the findings")
     p.add_argument("--sarif", nargs="?", const="", metavar="RUN",
                    help="print one run as SARIF 2.1.0 on stdout (default: the "
                         "newest run). A scanner that read nothing is an "
@@ -958,6 +1091,8 @@ SUBCOMMANDS = {
     "prune": ["--prune"], "verify": ["--verify"], "version": ["--version"],
     "config": ["--config"],
     "sarif": ["--sarif"],
+    "note": ["--note"],
+    "report": ["--report"],
 }
 
 
@@ -1054,6 +1189,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
     if args.run:
         return cmd_run(args)
+    if args.note:
+        return cmd_note(args)
+    if args.report is not None:
+        return cmd_report(args)
     if args.sarif is not None:
         return cmd_sarif(args)
     if args.verify:
@@ -1083,13 +1222,16 @@ def main(argv: Optional[List[str]] = None) -> int:
 __all__ = [
     'SUBCOMMANDS',
     '_compare_lines',
+    '_edit',
     '_raw_of',
     '_short',
     '_translate_argv',
     'build_parser',
     'cmd_config',
     'cmd_intel',
+    'cmd_note',
     'cmd_prune',
+    'cmd_report',
     'cmd_run',
     'cmd_sarif',
     'cmd_verify',

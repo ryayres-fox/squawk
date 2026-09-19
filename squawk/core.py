@@ -349,6 +349,110 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+#: The template `squawk note` opens in $EDITOR. Prose in a shell argument gets
+#: written badly or not at all, so the capture is an editor buffer with the
+#: questions already in it — the same reason `git commit` does not take -m for
+#: anything that matters.
+NOTE_TEMPLATE = """\
+# A finding you found yourself. Lines starting with # are ignored.
+#
+# `title` and `severity` are required, and so is `how found`: a finding with no
+# account of how it was found is not evidence, it is an assertion. Severity is
+# one of: critical, high, medium, low, info.
+
+title:
+severity:
+
+## how found
+# The commands, in the order you ran them. Enough that somebody else gets the
+# same result.
+
+## evidence
+# What you saw. Paste it verbatim — the response, the output, the error.
+
+## impact
+# What it gets an attacker. Say "not established" rather than guessing.
+
+## remediation
+# What fixes it, if you know.
+"""
+
+#: The sections the template offers, in the order a report wants them.
+NOTE_SECTIONS = ("how found", "evidence", "impact", "remediation")
+
+#: Required, and refused rather than written half-empty: a locker entry that
+#: cannot be reproduced is not worth the disk it sits on.
+NOTE_REQUIRED = ("title", "severity", "how found")
+
+
+def slug(text: str, cap: int = 48) -> str:
+    """A stable, path-safe fragment of a title, for a finding's identity.
+
+    Lower case, non-alphanumerics collapsed to a dash. The identity has to be
+    the same next time the same thing is recorded, or the differential reports
+    a new finding every session.
+    """
+    out = []
+    for ch in (text or "").lower():
+        out.append(ch if ch.isalnum() else "-")
+    joined = "".join(out)
+    while "--" in joined:
+        joined = joined.replace("--", "-")
+    return joined.strip("-")[:cap] or "note"
+
+
+def parse_note(text: str) -> Dict[str, str]:
+    """Read the filled-in template. Returns the fields, lower-cased keys.
+
+    Comment lines go. A `key: value` line before the first section is a field;
+    everything under a `## name` heading is that section's body. Unknown
+    headings are kept rather than dropped, because silently discarding what
+    somebody typed into an evidence locker is the worst possible manners.
+    """
+    fields: Dict[str, str] = {}
+    section = ""
+    body: Dict[str, List[str]] = {}
+    for raw in (text or "").split("\n"):
+        line = raw.rstrip()
+        # A heading before a comment: both start with "#", and checking the
+        # comment first swallowed every section. The first version did exactly
+        # that, and every line of a filled-in note was read as a field.
+        if line.startswith("## "):
+            section = line[3:].strip().lower()
+            body.setdefault(section, [])
+            continue
+        if line.startswith("#"):
+            continue
+        if section:
+            body[section].append(line)
+            continue
+        if ":" in line:
+            key, _, val = line.partition(":")
+            key = key.strip().lower()
+            if key:
+                fields[key] = val.strip()
+    for name, lines in body.items():
+        fields[name] = "\n".join(lines).strip()
+    return fields
+
+
+def note_problems(fields: Dict[str, str]) -> List[str]:
+    """Everything wrong with a filled-in note, all of it at once.
+
+    All of it at once because an editor round trip per mistake is how somebody
+    ends up writing the note in a text file instead.
+    """
+    bad: List[str] = []
+    for key in NOTE_REQUIRED:
+        if not (fields.get(key) or "").strip():
+            bad.append("%s is required and is empty" % key)
+    sev = (fields.get("severity") or "").strip().lower()
+    if sev and sev not in SEVERITY_ORDER:
+        bad.append("severity %r is not one of: %s"
+                   % (sev, ", ".join(SEVERITY_ORDER)))
+    return bad
+
+
 def fingerprint(identities: List[str]) -> str:
     """The per-scanner fingerprint the dashboards and baselines both use:
     sha256 over the sorted identity set, first 16 hex chars."""
@@ -1778,6 +1882,9 @@ __all__ = [
     'LOG_NAME',
     'LOOPBACK_HOSTS',
     'MODE_KINDS',
+    'NOTE_REQUIRED',
+    'NOTE_SECTIONS',
+    'NOTE_TEMPLATE',
     'NO_COVERAGE',
     'PID_FILENAME',
     'PROFILE_FILE',
@@ -1849,6 +1956,8 @@ __all__ = [
     'mask_email',
     'mask_key_id',
     'norm_severity',
+    'note_problems',
+    'parse_note',
     'parse_toml',
     'profile_path',
     'redact_identifiers',
@@ -1858,6 +1967,7 @@ __all__ = [
     'setup_logging',
     'sha256_file',
     'show_setting',
+    'slug',
     'stop_container',
     'sync_root',
     'terminate_children',

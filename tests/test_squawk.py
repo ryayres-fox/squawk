@@ -3000,7 +3000,8 @@ class TestLifecycle:
     def test_execute_service_records_abort_on_interrupt(self, tmp_path, monkeypatch):
         run_dir = str(tmp_path / "20260904T120000Z-repo")
 
-        def fake_inner(service, target, evidence_root, base, progress=None, profile=None):
+        def fake_inner(service, target, evidence_root, base, progress=None,
+                       profile=None, session=""):
             os.makedirs(run_dir)
             with open(os.path.join(run_dir, "started.json"), "w") as fh:
                 json.dump({"service": "customs", "scope": "repo", "target": "/t"}, fh)
@@ -3174,8 +3175,8 @@ class TestPackageShape:
     the version is stated once."""
 
     ORDER = ("core", "probes", "scanners", "stages", "evidence", "decisions", "analysis",
-             "engine", "feeds", "installer", "baselines", "retention", "runtime", "sarif",
-             "web", "service", "cli")
+             "engine", "feeds", "installer", "baselines", "retention", "report",
+             "runtime", "sarif", "web", "service", "cli")
 
     def _pkg(self):
         return os.path.dirname(os.path.abspath(squawk.__file__))
@@ -16181,3 +16182,210 @@ class TestSelfPermsSaysHowManyAreLoose:
             "/app/squawk/core.py": 0o666,
         })
         assert "/app/squawk/core.py" in got["detail"], got["detail"]
+
+
+class TestTheEvidenceLocker:
+    """A finding an operator found, recorded so a report can be written from it
+    months later — and so a reader can tell it from a scanner's.
+
+    The whole tool rests on one asymmetry: a scanner's finding comes with a
+    denominator, and a person's comes with an account of how they found it.
+    Rendering them identically would be the same lie as a scan that did not run
+    reading like a clean one, so `scanner` is `operator` and every surface says
+    so.
+    """
+
+    FILLED = ("title: IDOR on /api/user/{id}\n"
+              "severity: high\n"
+              "\n"
+              "## how found\n"
+              "curl -s http://10.10.1.5/api/user/2 -H 'Cookie: session=abc'\n"
+              "\n"
+              "## evidence\n"
+              "returned another user's email address\n"
+              "\n"
+              "## impact\n"
+              "any account's details, unauthenticated\n")
+
+    # --- the template and its parser ---------------------------------------
+
+    def test_a_heading_is_not_read_as_a_comment(self):
+        """Both start with `#`. The first version checked the comment first and
+        swallowed every section, so every line of a filled-in note was read as
+        a field — `curl -s http` became a key."""
+        f = squawk.parse_note(self.FILLED)
+        assert f["how found"].startswith("curl -s"), f
+        assert "curl -s http" not in f, "a section body was read as a field"
+
+    def test_a_colon_inside_a_section_stays_in_the_section(self):
+        """`Cookie: session=abc` is evidence, not a field."""
+        f = squawk.parse_note(self.FILLED)
+        assert "Cookie: session=abc" in f["how found"]
+
+    def test_the_empty_template_is_refused_with_every_reason_at_once(self):
+        """One editor round trip per mistake is how somebody ends up keeping
+        the note in a text file instead."""
+        bad = squawk.note_problems(squawk.parse_note(squawk.NOTE_TEMPLATE))
+        assert len(bad) == 3, bad
+        assert any("title" in b for b in bad)
+        assert any("severity" in b for b in bad)
+        assert any("how found" in b for b in bad)
+
+    def test_how_found_is_required(self):
+        """A finding with no account of how it was found is an assertion."""
+        f = squawk.parse_note("title: x\nseverity: high\n")
+        assert any("how found" in b for b in squawk.note_problems(f))
+
+    def test_an_invented_severity_is_refused(self):
+        f = squawk.parse_note("title: x\nseverity: catastrophic\n"
+                              "## how found\nran it\n")
+        assert any("catastrophic" in b for b in squawk.note_problems(f))
+
+    def test_the_identity_is_stable_across_sessions(self):
+        """Two recordings of the same thing must diff to nothing, or every
+        session reports its own findings as new."""
+        a = squawk.slug("IDOR on /api/user/{id}")
+        b = squawk.slug("IDOR on /api/user/{id}")
+        assert a == b == "idor-on-api-user-id"
+
+    # --- writing one --------------------------------------------------------
+
+    def _write(self, tmp_path, session="thm-blue", attach=None):
+        return squawk.engine.write_note(
+            str(tmp_path / "ev"), "10.10.1.5",
+            squawk.parse_note(self.FILLED),
+            attachments=attach, session=session)
+
+    def test_a_note_is_a_sealed_run_like_any_other(self, tmp_path):
+        out = self._write(tmp_path)
+        d = out["run_dir"]
+        for name in ("manifest.json", "findings.json", "digest.json",
+                     "identities.json"):
+            assert os.path.isfile(os.path.join(d, name)), name
+
+    def test_the_finding_says_a_person_recorded_it(self, tmp_path):
+        out = self._write(tmp_path)
+        f = json.load(open(os.path.join(out["run_dir"], "findings.json")))[0]
+        assert f["scanner"] == "operator", f
+        assert f["detail"]["source"] == "operator"
+        assert f["detail"]["how_found"].startswith("curl -s")
+
+    def test_a_note_claims_no_coverage_and_says_so(self, tmp_path):
+        """The invariant, applied to itself: a note enumerates nothing, so the
+        absence of other findings beside it means nothing."""
+        out = self._write(tmp_path)
+        man = json.load(open(os.path.join(out["run_dir"], "manifest.json")))
+        assert man["ledger"][0]["coverage"] is None
+        nc = man["not_covered"].lower()
+        assert "not a scan" in nc and "denominator" in nc, nc
+
+    def test_an_incomplete_note_writes_nothing_at_all(self, tmp_path):
+        """Refused rather than written half-empty — there must be no run
+        directory left behind to explain away."""
+        root = str(tmp_path / "ev")
+        with pytest.raises(ValueError):
+            squawk.engine.write_note(root, "10.10.1.5",
+                                     squawk.parse_note("title: x\n"))
+        assert not os.path.isdir(root) or not [
+            d for d in os.listdir(root) if d.startswith("2026")]
+
+    def test_the_session_is_recorded(self, tmp_path):
+        out = self._write(tmp_path, session="thm-blue")
+        man = json.load(open(os.path.join(out["run_dir"], "manifest.json")))
+        assert man["session"] == "thm-blue"
+
+    def test_no_session_is_an_empty_string_not_a_missing_field(self, tmp_path):
+        """A report has to be able to say which runs carried no session rather
+        than sweeping them in."""
+        out = self._write(tmp_path, session="")
+        man = json.load(open(os.path.join(out["run_dir"], "manifest.json")))
+        assert man["session"] == ""
+
+    # --- attachments --------------------------------------------------------
+
+    def test_an_attachment_is_copied_in_and_hashed(self, tmp_path):
+        """A screenshot that can be swapped afterwards proves nothing, and a
+        path reference to a file somewhere else proves less."""
+        shot = tmp_path / "shot.png"
+        shot.write_bytes(b"proof bytes")
+        out = self._write(tmp_path, attach=[str(shot)])
+        d = out["run_dir"]
+        assert os.path.isfile(os.path.join(d, "attachments", "shot.png"))
+        digest = json.load(open(os.path.join(d, "digest.json")))
+        assert "attachments/shot.png" in digest["files"], sorted(digest["files"])
+        f = json.load(open(os.path.join(d, "findings.json")))[0]
+        att = f["detail"]["attachments"][0]
+        assert att["name"] == "shot.png"
+        # The bytes, not a path to them. A mutation that wrote the source path
+        # into the destination passed every other assertion here: the file
+        # existed, it was in the digest, and the recorded hash was 64
+        # characters — of the path. "Copied, not referenced" is the claim, so
+        # it is the thing asserted.
+        assert open(os.path.join(d, "attachments", "shot.png"), "rb").read() \
+            == b"proof bytes"
+        assert att["sha256"] == squawk.sha256_file(str(shot)), \
+            "the recorded hash must be the hash of what was attached"
+        assert att["bytes"] == len(b"proof bytes")
+
+    def test_a_swapped_attachment_is_caught_by_verify(self, tmp_path):
+        """The claim the locker rests on, exercised rather than asserted."""
+        shot = tmp_path / "shot.png"
+        shot.write_bytes(b"proof bytes")
+        out = self._write(tmp_path, attach=[str(shot)])
+        root = str(tmp_path / "ev")
+        assert squawk.verify_runs(root)["runs"][0]["state"] == "ok"
+        planted = os.path.join(out["run_dir"], "attachments", "shot.png")
+        os.chmod(os.path.dirname(planted), 0o700)
+        os.chmod(planted, 0o600)
+        with open(planted, "wb") as fh:
+            fh.write(b"TAMPERED")
+        row = squawk.verify_runs(root)["runs"][0]
+        assert row["state"] != "ok", row
+        assert "attachments/shot.png" in row["altered"], row
+
+    # --- the report ---------------------------------------------------------
+
+    def test_the_report_names_what_was_not_covered_before_the_findings(
+            self, tmp_path):
+        """The section nobody else writes, and the reason this is a report
+        rather than a list."""
+        self._write(tmp_path)
+        text, n = squawk.report.report_markdown(str(tmp_path / "ev"), "thm-blue")
+        assert n == 1
+        assert text.index("## What was not covered") < text.index("## Findings")
+        assert "not a scan" in text
+
+    def test_the_report_marks_a_hand_recorded_finding_every_time(self, tmp_path):
+        self._write(tmp_path)
+        text, _ = squawk.report.report_markdown(str(tmp_path / "ev"), "thm-blue")
+        assert "recorded by hand" in text
+        assert "not a scanner finding" in text
+
+    def test_the_report_carries_how_it_was_found(self, tmp_path):
+        """Without this the document is a findings list, which is the thing a
+        security report is not."""
+        self._write(tmp_path)
+        text, _ = squawk.report.report_markdown(str(tmp_path / "ev"), "thm-blue")
+        assert "How it was found" in text
+        assert "curl -s http://10.10.1.5" in text
+
+    def test_a_session_with_no_runs_says_so_rather_than_reading_empty(
+            self, tmp_path):
+        """An empty report and an untagged engagement look identical, and one
+        of them is a lie."""
+        self._write(tmp_path, session="thm-blue")
+        text, n = squawk.report.report_markdown(str(tmp_path / "ev"), "thm-red")
+        assert n == 0
+        assert "No run carries this session tag" in text
+        assert "not the same as an engagement with no findings" in text
+
+    def test_a_run_from_another_session_is_not_swept_in(self, tmp_path):
+        self._write(tmp_path, session="thm-blue")
+        self._write(tmp_path, session="other-work")
+        text, n = squawk.report.report_markdown(str(tmp_path / "ev"), "thm-blue")
+        assert n == 1, text[:400]
+
+    def test_the_report_states_what_each_stage_read(self, tmp_path):
+        self._write(tmp_path)
+        text, _ = squawk.report.report_markdown(str(tmp_path / "ev"), "thm-blue")
+        assert "## What ran, and what it read" in text

@@ -23,6 +23,11 @@ python3 squawk.py --run selfaudit          # audit this machine, not a target
 python3 squawk.py --list-services          # the thirteen services
 python3 squawk.py --run compliance --repo /path/to/checkout
 python3 squawk.py sarif > squawk.sarif        # the last run, as SARIF 2.1.0
+
+# an engagement: tag the runs, record what you find by hand, compile it
+python3 squawk.py --run recon --target http://10.10.1.5 --session thm-blue
+python3 squawk.py note --target 10.10.1.5 --session thm-blue --attach shot.png
+python3 squawk.py report thm-blue > engagement.md
 ```
 
 `--doctor` exits non-zero on exactly two conditions: no scanner at all, or an
@@ -404,6 +409,7 @@ each imports only from the ones above it:
 | `baselines` | GitHub-issue baselines |
 | `retention` | what evidence is kept, what is let go, and what is said about it |
 | `runtime` | jobs in flight; the server's pid file |
+| `report` | an engagement as markdown: the findings, how each was found, the evidence attached to it, and — before any of them — what each service did not cover |
 | `sarif` | one run as SARIF 2.1.0: a stage that read nothing is an unsuccessful invocation carrying its denominator, and a correlation that could not be evaluated is a `notApplicable` result |
 | `web` | every page, and the request handler |
 | `service` | serve, daemonize, status, stop, the systemd unit |
