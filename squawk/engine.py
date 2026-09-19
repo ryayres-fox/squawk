@@ -5,6 +5,7 @@ import logging
 import logging.handlers
 import os
 import re
+import shutil
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -16,6 +17,7 @@ from squawk.analysis import (
 )
 from squawk.core import (
     LOG,
+    NOTE_SECTIONS,
     SCANNERS,
     SEVERITY_ORDER,
     STOP_REQUESTED,
@@ -29,7 +31,10 @@ from squawk.core import (
     human_seconds,
     is_contaminated,
     load_profile,
+    note_problems,
     run_cmd,
+    sha256_file,
+    slug,
     tool_path,
 )
 from squawk.evidence import (
@@ -46,6 +51,7 @@ from squawk.evidence import (
 )
 from squawk.scanners import NORMALIZERS, report_unreadable, stage_coverage
 from squawk.stages import (
+    NOTE_SERVICE,
     SERVICES,
     STAGE_KNOBS,
     STAGES,
@@ -561,7 +567,8 @@ def _run_one_stage(spec: StageSpec, ctx: RunContext, raw_file: str,
 
 def execute_service(service: Service, target: str, evidence_root: str,
                     base: str, progress: Optional[Callable[[dict], None]] = None,
-                    profile: Optional[Profile] = None) -> Dict[str, object]:
+                    profile: Optional[Profile] = None,
+                    session: str = "") -> Dict[str, object]:
     """Run a service and write its evidence. If the run is interrupted — a
     Ctrl-C, a server stop, a crash in a stage — the run directory it had
     already created is written up as aborted, under its target, rather than
@@ -576,7 +583,8 @@ def execute_service(service: Service, target: str, evidence_root: str,
 
     try:
         return _execute_service_inner(service, target, evidence_root, base,
-                                      progress=_capture, profile=profile)
+                                      progress=_capture, profile=profile,
+                                      session=session)
     except BaseException as exc:
         if seen.get("run_dir"):
             record_aborted_run(seen["run_dir"],
@@ -587,7 +595,8 @@ def execute_service(service: Service, target: str, evidence_root: str,
 def _execute_service_inner(service: Service, target: str, evidence_root: str,
                            base: str,
                            progress: Optional[Callable[[dict], None]] = None,
-                           profile: Optional[Profile] = None) -> Dict[str, object]:
+                           profile: Optional[Profile] = None,
+                           session: str = "") -> Dict[str, object]:
     # The profile is read before the run directory exists, so a profile that
     # is refused leaves no run behind — not even an aborted one.
     if profile is None:
@@ -669,7 +678,7 @@ def _execute_service_inner(service: Service, target: str, evidence_root: str,
                                None, corr_finds, 0, None))
 
     _write_evidence(run_dir, service, target, results, ledger_rows,
-                    correlations=correlations, profile=profile)
+                    correlations=correlations, profile=profile, session=session)
     return {"run_id": rid, "run_dir": run_dir, "results": results}
 
 
@@ -700,6 +709,69 @@ def _collect_identities(results: List[StageResult]) -> Dict[str, List[str]]:
 # --------------------------------------------------------------------------- #
 
 
+def write_note(evidence_root: str, target: str, fields: Dict[str, str],
+               attachments: Optional[List[str]] = None,
+               session: str = "") -> Dict[str, object]:
+    """Record one finding an operator found, as a sealed run.
+
+    It goes through `_write_evidence` like every scan does, so it inherits the
+    digest chain, the read-only sealing, the stable identity, the triage ledger
+    and the history. Attachments are copied INTO the run directory, which means
+    the digest covers them: a screenshot that proves a finding is worth nothing
+    if it can be swapped afterwards, and a path reference to a file somewhere
+    else proves nothing at all.
+
+    The finding's scanner is `operator`, never a tool's name. A hand-entered
+    finding that reads like a scanner's output is the same lie as a scan that
+    did not run reading like a clean one.
+    """
+    problems = note_problems(fields)
+    if problems:
+        raise ValueError("; ".join(problems))
+
+    sev = (fields.get("severity") or "").strip().lower()
+    title = (fields.get("title") or "").strip()
+    ident = "note:%s:%s" % (slug(target, 32), slug(title))
+
+    os.makedirs(evidence_root, exist_ok=True)
+    rid, run_dir = claim_run_dir(evidence_root, NOTE_SERVICE.scope)
+
+    kept: List[dict] = []
+    if attachments:
+        adir = os.path.join(run_dir, "attachments")
+        os.makedirs(adir, exist_ok=True)
+        for src in attachments:
+            name = os.path.basename(src)
+            dst = os.path.join(adir, name)
+            shutil.copy2(src, dst)
+            kept.append({"name": name, "sha256": sha256_file(dst),
+                         "bytes": os.path.getsize(dst)})
+
+    detail: Dict[str, object] = {
+        "description": title,
+        "source": "operator",
+        "recorded_at": time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())}
+    for key in NOTE_SECTIONS:
+        val = (fields.get(key) or "").strip()
+        if val:
+            detail[key.replace(" ", "_")] = val
+    if kept:
+        detail["attachments"] = kept
+
+    finding = Finding("operator", ident, sev, title, target, detail)
+    result = StageResult(
+        "operator", "note", "ok",
+        "1 finding recorded by hand%s"
+        % ("" if not kept else " with %d attachment(s)" % len(kept)),
+        None, [finding], 0, None, None)
+
+    _write_evidence(run_dir, NOTE_SERVICE, target, [result],
+                    ["operator\tnote\tok\trecorded by hand"],
+                    correlations=[], session=session)
+    return {"run_id": rid, "run_dir": run_dir, "identity": ident,
+            "attachments": len(kept)}
+
+
 def _finding_dict(f: "Finding") -> dict:
     """A Finding as the plain dict the evidence and correlation layers use."""
     return {"scanner": f.scanner, "identity": f.identity, "severity": f.severity,
@@ -709,7 +781,8 @@ def _finding_dict(f: "Finding") -> dict:
 def _write_evidence(run_dir: str, service: Service, target: str,
                     results: List[StageResult], ledger_rows: List[str],
                     correlations: Optional[List[dict]] = None,
-                    profile: Optional[Profile] = None) -> None:
+                    profile: Optional[Profile] = None,
+                    session: str = "") -> None:
     identities = _collect_identities(results)
     # What the run ran under: every value the profile changed, with the
     # built-in it replaced and the section it came from (I12).
@@ -752,6 +825,10 @@ def _write_evidence(run_dir: str, service: Service, target: str,
         "service_label": service.label,
         "scope": service.scope,
         "target": target,
+        # The engagement this run belongs to, or "". Empty is a real answer and
+        # is kept as one: a report over a session must be able to say which
+        # runs carried no session rather than quietly sweeping them in.
+        "session": session,
         "tools_requested": list(service.stages),
         "not_covered": service.not_covered,
         "counts": {"total": total, "excluded": excluded_total},
@@ -841,4 +918,5 @@ __all__ = [
     'profile_for',
     'run_id',
     'stage_rows',
+    'write_note',
 ]
