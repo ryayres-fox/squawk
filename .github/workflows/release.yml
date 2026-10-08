@@ -1,0 +1,95 @@
+name: release
+
+# The one-file build is the reason this tool exists on a locked-down machine:
+# no clone, no install, no network beyond copying one file onto it. Until this
+# workflow existed there was no way to GET that file without cloning the
+# repository and running a build script — which is exactly what the person it
+# is for cannot do. A distribution nobody can reach is not a distribution.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write        # only to create the release; nothing else is written
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: build and attach the zipapp
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with: { persist-credentials: false }
+
+      # Built on the floor the code claims, not on a newer interpreter. A
+      # zipapp built on 3.12 and shipped to a machine running 3.9 is a bug
+      # nobody finds until the machine that cannot debug it runs it.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with: { python-version: "3.9" }
+
+      - name: The tag and the version agree
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(python -c "
+          import re
+          print(re.search(r'^version = \"([^\"]+)\"', open('pyproject.toml').read(), re.M).group(1))
+          ")"
+          echo "tag=$tag  pyproject=$ver"
+          # A release whose artifact reports a different version than its tag is
+          # the supply-chain question asked of this project by its own charter:
+          # you cannot tell which code you are running.
+          [ "$tag" = "$ver" ] || { echo "::error::tag $tag does not match pyproject version $ver"; exit 1; }
+
+      - name: Build
+        run: bash build-zipapp.sh
+
+      # The artifact is tested, not assumed. It is copied somewhere with no
+      # package beside it, which is the state it will be in on the machine it
+      # was built for.
+      - name: The artifact runs on its own
+        run: |
+          set -eu
+          mkdir -p /tmp/alone && cp dist/squawk.pyz /tmp/alone/
+          cd /tmp/alone
+          out="$(python squawk.pyz --version)"
+          echo "$out"
+          echo "$out" | grep -q "${GITHUB_REF_NAME#v}" || { echo "::error::the built artifact reports $out, not ${GITHUB_REF_NAME#v}"; exit 1; }
+          python squawk.pyz services > /dev/null
+          # The one thing a zipapp could not do before it carried its installer.
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, "squawk.pyz")
+          import squawk
+          path, how = squawk.installer.installer_script()
+          assert how == "carried inside the app", how
+          assert path and open(path, encoding="utf-8").readline().startswith("#!")
+          print("installer:", how)
+          PY
+
+      - name: Checksum
+        run: |
+          cd dist && sha256sum squawk.pyz | tee squawk.pyz.sha256
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/squawk.pyz dist/squawk.pyz.sha256 \
+            --title "$GITHUB_REF_NAME" \
+            --notes "One file. Python 3.9 or newer, standard library only, nothing else to install.
+
+          \`\`\`
+          curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/squawk.pyz
+          python3 squawk.pyz --doctor
+          \`\`\`
+
+          Verify it: \`sha256sum -c squawk.pyz.sha256\`.
+
+          The scanners are not in here and are not redistributed — \`python3 squawk.pyz --install\` fetches each from its own publisher. See CHANGELOG.md for what is in this release."

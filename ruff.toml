@@ -1,0 +1,32 @@
+# Lint configuration, at the repository root so `ruff check` resolves the same
+# rules in CI, in an editor, and from any subdirectory. Without a file here,
+# ruff walks up past the repository and picks up whatever the developer happens
+# to have in their home directory, which makes "lint is clean" a statement
+# about a machine rather than about the code.
+
+line-length = 100
+target-version = "py311"
+
+[lint]
+select = ["E", "F", "I", "UP", "B", "S", "RUF"]
+ignore = [
+  "S101",  # assert is the point of a test file
+]
+
+[lint.per-file-ignores]
+"**/test_*.py" = ["S105", "S106"]  # fixtures name tokens that are not secrets
+
+# Squawk deliberately targets Python 3.9, so it stands up on a bare machine's
+# system Python. The pyupgrade (UP) rules are off for it: UP045 would rewrite
+# `Optional[X]` to `X | None`, PEP 604 syntax that parses on 3.9 and raises
+# when the annotation is evaluated, and UP036 flags the intentional 3.9 guard.
+#
+# S603/S607: running the installed scanners as fixed-argument subprocesses,
+# with no shell, is the entire purpose of the tool.
+#
+# S310/S323: the recon probe makes deliberate http/https requests — scheme
+# constrained to those two — to deliberately-vulnerable test targets that use
+# self-signed certificates. An unverified TLS context is required to reach
+# them, and sending that traffic is the point.
+"*.py" = ["UP", "S603", "S607", "S310", "S323"]
+"squawk/*.py" = ["UP", "S603", "S607", "S310", "S323"]

@@ -1,0 +1,77 @@
+name: ci
+
+# The gate. Every claim this project makes about itself is checked here, on
+# every pull request and every push to main, because a check that runs only
+# when someone remembers it is not a control.
+
+on:
+  push:
+    branches: [main]
+  # Every pull request, not only those targeting main. A stacked pull request
+  # aims at the branch below it, so a branch filter of [main] means the middle
+  # of a stack merges having never been tested — the gates exist and do not
+  # run, which is worse than not having them, because the checkmark is absent
+  # rather than red.
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTEST_VERSION: "9.0.3"
+  # pytest 9 requires Python 3.10, so the floor job below pins the newest
+  # release that still installs on 3.9.
+  PYTEST_39_VERSION: "8.4.2"
+  RUFF_VERSION: "0.16.3"
+  # mypy 2.x refuses `--python-version 3.9`; 1.20.2 is the newest release that
+  # accepts it, so the type checker reasons about the floor the code claims
+  # while running under the 3.11 interpreter.
+  MYPY_VERSION: "1.20.2"
+
+jobs:
+  tests:
+    name: tests and lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with: { python-version: "3.11" }
+      - run: pip install "pytest==${PYTEST_VERSION}" "ruff==${RUFF_VERSION}" "mypy==${MYPY_VERSION}"
+      - run: ruff check .
+      # A type checker that runs and is ignored is a control in source that is
+      # not enforced. This step fails the build on any error.
+      - run: mypy --python-version 3.9 --ignore-missing-imports squawk
+      - run: pytest -q
+
+      # Squawk targets Python 3.9 so it stands up on a bare machine's system
+      # Python. The suite above runs on 3.11, which would not notice a
+      # 3.9-invalid construct such as PEP 604 `X | Y` creeping in — the slip
+      # the UP lint ignore in ruff.toml exists to prevent.
+      #
+      # This step used to be `compileall` alone, and `compileall` does not
+      # catch that slip. `int | None` is a valid expression in every Python 3,
+      # so it compiles under 3.9 and raises only when the annotation is
+      # evaluated, which compiling never does. Measured on 3.9.25 with the
+      # construct injected: compileall rc=0 (passed it), import rc=1
+      # (TypeError), pytest rc=2 (collection error). The gate existed and did
+      # not hold, which is this project's own thesis turned on itself, so the
+      # floor is checked by importing the package and running its suite there.
+      # That is also the stronger claim: it works on 3.9, rather than merely
+      # parsing on 3.9. compileall stays because it is cheap and it names a
+      # file no import reaches.
+      - name: Squawk runs under its stated floor (Python 3.9)
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with: { python-version: "3.9" }
+      - run: pip install "pytest==${PYTEST_39_VERSION}"
+      - run: |
+          python -V
+          python -c "import sys; assert sys.version_info[:2] == (3, 9), sys.version"
+          python -m compileall -q .
+          python -c "import squawk; print('import ok', squawk.__version__)"
+          python -m pytest -q

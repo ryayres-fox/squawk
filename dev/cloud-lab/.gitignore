@@ -1,0 +1,9 @@
+# Terraform state holds the generated console password and every ARN in the
+# lab. It stays on the machine that applied it.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+.terraform.lock.hcl
+.build/
+crash.log
