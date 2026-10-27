@@ -23,6 +23,61 @@ Where a decision looks arbitrary, one of four documents says why:
 [`CORRELATION-DESIGN.md`](docs/CORRELATION-DESIGN.md) for how findings are
 joined across layers.
 
+## Unreleased
+
+## 0.10.0 — 2026-10-27
+
+### Engagements, a pre-handover checklist, and reports you can hand over
+
+- **Engagements.** The web UI groups the estate by engagement and scopes each
+  page to one; an `engagements.json` maps targets to an engagement by glob
+  without re-scanning. Remove an engagement (the runs stay, read as
+  `Unassigned`) and hide a report (the runs stay) from the UI.
+- **A pre-handover checklist.** A per-engagement manual-review signoff (OWASP
+  WSTG / ASVS by default, overridable with `checklist.md`). Each tick is a
+  sealed, chained ledger line that `verify` now checks, and "ready to hand over"
+  turns green only when every item is `pass` or `N/A`.
+- **Handover reports.** `report --share` writes an executive and an engineer
+  report (Markdown, HTML, PDF), redacted at render time, the reviewer's findings
+  and attacker abilities first, each image summarised by what it exposes. Every
+  report carries remediation deadlines, and a sealed decision can close a finding.
+- **A grep backup** for the checklist: a manual-review sweep grouped by the
+  checklist's coverage areas, cross-language, high recall — a corroboration of
+  the scanners and a lead where they are blind.
+
+### Authenticated DAST, and more scanners
+
+- **`authdast`** logs in to a running web app and tests the authenticated
+  surface — including a login behind a per-request CSRF token (DVWA's
+  `user_token`, Rails' `authenticity_token`, a Flask-WTF `csrf_token`).
+  Credentials come from the environment, never argv, and the session is never
+  written to disk.
+- **An object-authorization (BOLA) probe**, **schemathesis** against a running
+  API's OpenAPI schema, and **zizmor** for GitHub Actions workflows.
+- **hadolint, trufflehog, dockle and osv-scanner** added through the registry,
+  each with its own coverage denominator (or a stated reason it has none).
+- **Headless count lines name the test share** — `N finding(s) (X in tests, Y in
+  product)` — so a flood of a test idiom never buries the product findings.
+
+### `verify` covers the checklist ledger
+
+- `squawk verify` now walks the pre-handover checklist's signoff chain as well
+  as the runs and the decisions ledger, so a tampered or back-dated signoff is
+  reported, not passed silently.
+
+### `stop` stops the server in the evidence root again, whatever port it is on
+
+`stop --evidence X` was refused for any server not on port 8787. The port
+check — a typed `--port` must match the server about to be stopped, so a stop
+aimed at one server cannot land on another — received the built-in default as
+though it had been typed, because the parser supplied one. The parser no
+longer does: the port is filled in after parsing for the commands that serve,
+and `stop` checks a port only when one was typed. Found by the field check,
+which starts its servers on free ports and could not stop any of them; the
+unit tests for the check called the function directly and never met the
+parser, and the one with no port used 8787. They go through the command line
+now, on a port that is not the default.
+
 ## 0.9.1 — 2026-10-08
 
 ### First release of this repository

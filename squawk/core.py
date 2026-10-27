@@ -1,6 +1,7 @@
 """Constants, logging, the finding model, and the small helpers everything else uses."""
 
 import calendar
+import datetime
 import hashlib
 import json
 import logging
@@ -375,6 +376,17 @@ severity:
 
 ## remediation
 # What fixes it, if you know.
+
+## retest
+# The steps that show it is fixed: how it was found, run again, and the
+# result that means fixed. Left empty, the report says to repeat how it was
+# found. Start no line with #: it is read as a comment.
+
+## references
+# One per line: the CWE, the OWASP entry, the vendor's guidance.
+
+# Any other `## heading` you add (a control mapping, a ticket) is kept and
+# printed in the report after these.
 """
 
 #: The sections the template offers, in the order a report wants them.
@@ -436,6 +448,25 @@ def parse_note(text: str) -> Dict[str, str]:
     return fields
 
 
+def split_note_blocks(text: str) -> List[str]:
+    """The notes in one file, for `note --from`.
+
+    Three shapes, tried in order: fenced code blocks whose first line is a
+    `title:` field (how a review hands its notes over, with prose around them);
+    blocks separated by a line holding only `---`; otherwise the whole file is
+    one note. A fenced block that does not start with `title:` is somebody's
+    code sample, not a note, and is left alone."""
+    text = (text or "").replace("\r\n", "\n")
+    fenced = re.findall(r"^```[^\n]*\n(.*?)^```[ \t]*$", text, re.M | re.S)
+    notes = [b for b in fenced if b.lstrip().lower().startswith("title:")]
+    if notes:
+        return [b.strip("\n") + "\n" for b in notes]
+    parts = [p for p in re.split(r"^---[ \t]*$", text, flags=re.M) if p.strip()]
+    if len(parts) > 1:
+        return [p.strip("\n") + "\n" for p in parts]
+    return [text] if text.strip() else []
+
+
 def note_problems(fields: Dict[str, str]) -> List[str]:
     """Everything wrong with a filled-in note, all of it at once.
 
@@ -450,6 +481,113 @@ def note_problems(fields: Dict[str, str]) -> List[str]:
     if sev and sev not in SEVERITY_ORDER:
         bad.append("severity %r is not one of: %s"
                    % (sev, ", ".join(SEVERITY_ORDER)))
+    return bad
+
+
+# --------------------------------------------------------------------------- #
+# Remediation deadlines, and the decisions that close a finding.
+#
+# The HIPAA Security Rule in force sets no deadline: it requires risks be
+# reduced "to a reasonable and appropriate level" (45 CFR 164.308(a)(1)(ii)(B))
+# and the decisions documented and kept six years (164.316(b)). A deadline is
+# policy, so each built-in below says where its number comes from (report.py
+# prints the sources), and a profile's [remediation] table can change any of
+# them. The clock starts at the first sealed run that reported the finding.
+#
+# A finding is worked through sealed decisions, one of four states: in progress
+# (being fixed; closes nothing), fixed (for a finding a re-run cannot check, the
+# retest's evidence), risk accepted (by a role, with the reason, compensating
+# controls and an expiry), or false positive (with the reason). A finding with
+# none of these closed by its due date is overdue. An auditor reads the
+# decision and the evidence for it, not a status somebody typed into a tracker.
+# --------------------------------------------------------------------------- #
+
+#: Days from first seen to due, by severity. info and unknown have none.
+REMEDIATION_DAYS: Dict[str, int] = {"critical": 15, "high": 30, "medium": 90, "low": 180}
+#: A known exploited vulnerability is due in this many days, or by its
+#: severity's window if that is sooner.
+REMEDIATION_KEV_DAYS = 14
+#: The longest a risk acceptance runs before it must be decided again.
+ACCEPT_MAX_DAYS = 365
+REMEDIATION_KEYS = ("critical", "high", "medium", "low", "kev", "accept_max_days")
+
+#: Where a decision run keeps its decisions; the run digest covers it.
+DISPOSITIONS_FILE = "dispositions.json"
+DISPOSITION_STATES = ("in progress", "fixed", "risk accepted", "false positive")
+DISPOSITION_FIELDS = ("finding", "state", "by", "ticket", "expires")
+DISPOSITION_SECTIONS = ("reason", "compensating controls", "evidence", "note")
+#: What each state must carry beyond finding, state and by. A risk acceptance
+#: with no expiry is a finding nobody will look at again.
+DISPOSITION_NEEDS: Dict[str, Tuple[str, ...]] = {
+    "in progress": (),
+    "fixed": ("evidence",),
+    "risk accepted": ("expires", "reason", "compensating controls"),
+    "false positive": ("reason",),
+}
+
+DISPOSITION_TEMPLATE = """\
+# A decision about one finding. Lines starting with # are ignored. Several
+# decisions go in one file, separated by a line holding only ---.
+#
+# finding: the finding's ID, the `id` column of the report's CSV.
+# state: in progress, fixed, risk accepted or false positive.
+# by: the role that decided, not a person's name.
+
+finding:
+state:
+by:
+# ticket: where the work is tracked (optional)
+# expires: YYYY-MM-DD, for a risk acceptance (required for one)
+
+## reason
+# Why. Required for risk accepted and false positive.
+
+## compensating controls
+# What reduces the risk meanwhile. Required for risk accepted.
+
+## evidence
+# For fixed: the retest's output. Start no line with #.
+
+## note
+"""
+
+
+def disposition_problems(fields: Dict[str, str], today: str,
+                         accept_max_days: int = ACCEPT_MAX_DAYS) -> List[str]:
+    """Everything wrong with one decision, all at once. `today` is YYYY-MM-DD.
+
+    An unknown field is refused by name rather than kept: a misspelt `expires`
+    kept as an extra field would be a risk acceptance with no expiry."""
+    bad: List[str] = []
+    known = DISPOSITION_FIELDS + DISPOSITION_SECTIONS
+    for key in sorted(k for k in fields if k not in known):
+        bad.append("%r is not a field a decision has; the fields are %s"
+                   % (key, ", ".join(known)))
+    for key in ("finding", "state", "by"):
+        if not (fields.get(key) or "").strip():
+            bad.append("%s is required and is empty" % key)
+    state = (fields.get("state") or "").strip().lower()
+    if state and state not in DISPOSITION_STATES:
+        bad.append("state %r is not one of: %s" % (state, ", ".join(DISPOSITION_STATES)))
+    for key in DISPOSITION_NEEDS.get(state, ()):
+        if not (fields.get(key) or "").strip():
+            bad.append("a %s decision needs %s" % (
+                state, key if key in DISPOSITION_FIELDS else "a ## %s section" % key))
+    expires = (fields.get("expires") or "").strip()
+    if expires and state and state != "risk accepted":
+        bad.append("expires belongs to a risk acceptance, not to %s" % state)
+    elif expires:
+        try:
+            until = datetime.date.fromisoformat(expires)
+        except ValueError:
+            bad.append("expires %r is not a date written YYYY-MM-DD" % expires)
+        else:
+            now = datetime.date.fromisoformat(today)
+            if until <= now:
+                bad.append("expires %s is not after today, %s" % (expires, today))
+            elif (until - now).days > accept_max_days:
+                bad.append("expires %s is more than %d days away; a risk acceptance is "
+                           "decided again at least that often" % (expires, accept_max_days))
     return bad
 
 
@@ -546,21 +684,52 @@ def result_kind(tool: str, mode: str) -> str:
 SCANNERS: Dict[str, Scanner] = {
     "gitleaks": Scanner("gitleaks", "gitleaks", "secrets", ("version",), False,
                         "secrets, including git history"),
+    "trufflehog": Scanner("trufflehog", "trufflehog", "secrets", ("--version",),
+                          False, "secrets in the files as they stand, matched "
+                          "by each provider's credential format; never "
+                          "verified, so nothing found leaves this machine"),
     "semgrep": Scanner("semgrep", "semgrep", "sast", ("--version",), True,
                        "code patterns from the registry"),
     "bandit": Scanner("bandit", "bandit", "sast", ("--version",), False,
                       "Python-specific weaknesses"),
     "checkov": Scanner("checkov", "checkov", "iac", ("--version",), False,
                        "Terraform / IaC policy"),
+    "dockle": Scanner("dockle", "dockle", "iac", ("--version",), True,
+                      "how the built image is configured: the user it runs as, "
+                      "files it should not carry, setuid binaries, caches left "
+                      "in its layers (it pulls the image when it is not local)"),
+    "zizmor": Scanner("zizmor", "zizmor", "iac", ("--version",), False,
+                      "GitHub Actions workflows: triggers that run a pull "
+                      "request's code with secrets, broad permissions, actions "
+                      "not pinned to a commit, credentials left on disk, secrets "
+                      "outside a protected environment"),
+    "hadolint": Scanner("hadolint", "hadolint", "iac", ("--version",), False,
+                        "how each Dockerfile is written: unpinned bases and "
+                        "packages, ADD for COPY, a pipe without pipefail, and "
+                        "the shell in every RUN line"),
     "trivy": Scanner("trivy", "trivy", "sca", ("--version",), True,
                      "dependencies, misconfig, secrets, image layers"),
+    "osv-scanner": Scanner("osv-scanner", "osv-scanner", "sca", ("--version",), True,
+                           "known vulnerabilities in the dependencies a lockfile "
+                           "or manifest names, matched here against OSV's "
+                           "downloaded database; what a manifest pulls in is "
+                           "resolved by asking deps.dev about its packages"),
     "syft": Scanner("syft", "syft", "sbom", ("version",), False,
                     "SBOM — the component inventory"),
     "grype": Scanner("grype", "grype", "sca", ("version",), True,
                      "CVEs, read from the SBOM"),
+    "schemathesis": Scanner("schemathesis", "schemathesis", "dast", ("--version",), True,
+                            "property-based testing of a RUNNING API from its "
+                            "OpenAPI schema (Schemathesis): generated requests "
+                            "to every operation, checking conformance, "
+                            "unhandled 5xx errors, and schema validity"),
     "zap": Scanner("zap", "docker", "dast", ("--version",), True,
                    "dynamic testing of a RUNNING app (OWASP ZAP, via its Docker "
                    "image unless zap-baseline.py / zap-full-scan.py are on PATH)"),
+    "garak": Scanner("garak", "garak", "dast", ("--version",), True,
+                     "red-teaming a RUNNING LLM app (NVIDIA garak, an external "
+                     "scanner squawk orchestrates; found on PATH or named by "
+                     "SQUAWK_GARAK_BIN)", internal=True),
     "awscli": Scanner("awscli", "aws", "cloud", ("--version",), True,
                       "the findings an AWS account already holds (Security Hub, "
                       "read-only, as the identity in your credential chain)"),
@@ -620,6 +789,16 @@ SCANNERS: Dict[str, Scanner] = {
     "recon": Scanner("recon", "", "recon", (), True,
                      "discovers reachable web apps on a target so the kiosk "
                      "knows what to scan", internal=True),
+    "authz": Scanner("authz", "", "dast", (), True,
+                     "object-level authorization of a RUNNING API (BOLA, OWASP "
+                     "API1): seeds a canary per identity and checks whether one "
+                     "identity can read another's object", internal=True),
+    "webauth": Scanner("webauth", "", "dast", (), True,
+                       "authenticated DAST of a RUNNING web app: logs in with "
+                       "credentials from the environment, captures the session, "
+                       "and runs the authenticated checks (session cookie flags, "
+                       "username enumeration, unauthenticated access to protected "
+                       "paths)", internal=True),
     "skillaudit": Scanner("skillaudit", "", "agentic", (), False,
                           "audits agent skills and MCP configs against the "
                           "OWASP Agentic Skills Top 10", internal=True),
@@ -641,7 +820,7 @@ SUPPORTING = {
 
 DB_STALE_DAYS = 7          # vulnerability data is published daily
 STALE_SCAN_DAYS = 7        # the overview's own words: a week with no scan is a gap
-__version__ = "0.9.1"
+__version__ = "0.10.0"
 PID_FILENAME = "squawk.pid"      # under the evidence root; who is serving, where
 SERVE_LOG = "squawk-serve.log"   # stdout/stderr of a background (--daemon) server
 ABORT_SWEEP_AGE = 3 * 3600       # an unfinished run older than this is recorded aborted
@@ -720,11 +899,66 @@ def vuln_db_ages() -> List[Tuple[str, Optional[int], str]]:
         blob = "\n".join(x for x in (txt, err) if x)
         age = _age_days(blob)
         detail = ""
-        if age is None:
+        refused = _grype_refusal(blob)
+        if refused:
+            # grype's verdict beats this arithmetic. It refuses a database past
+            # its own limit (five days by default, shorter than DB_STALE_DAYS),
+            # and a refused database matches nothing: reported as unusable, not
+            # as "5 day(s) old, ok", which is what the doctor said on 2026-10-22
+            # while every grype stage matched nothing.
+            age, detail = None, refused
+        elif age is None:
             detail = ("no database downloaded yet" if _db_never_built(blob)
                       else "could not read db status")
         out.append(("grype", age, detail))
+    if tool_path("osv-scanner"):
+        age = _osv_db_age()
+        out.append(("osv-scanner", age, "" if age is not None else
+                    "no database downloaded yet; each run downloads the "
+                    "ecosystems it needs"))
     return out
+
+
+def _osv_db_dir() -> str:
+    """Where osv-scanner keeps its downloaded databases: Go's user cache
+    directory, then `osv-scalibr/<ecosystem>/all.zip`."""
+    if sys.platform == "darwin":
+        root = os.path.expanduser("~/Library/Caches")
+    else:
+        root = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(root, "osv-scalibr")
+
+
+def _osv_db_age(now: Optional[float] = None) -> Optional[int]:
+    """Days since the newest ecosystem database was written, or None."""
+    newest = 0.0
+    try:
+        for eco in os.listdir(_osv_db_dir()):
+            try:
+                newest = max(newest, os.path.getmtime(
+                    os.path.join(_osv_db_dir(), eco, "all.zip")))
+            except OSError:
+                continue
+    except OSError:
+        return None
+    if not newest:
+        return None
+    return max(0, int(((now or time.time()) - newest) // 86400))
+
+
+def _grype_refusal(status_text: str) -> str:
+    """Why grype will not use its database, from `grype db status`, or "".
+
+    grype prints `Status: invalid` and an ERROR line naming the reason."""
+    if not re.search(r"^Status:\s*invalid\b", status_text or "", re.M):
+        return ""
+    reason = ""
+    for line in (status_text or "").splitlines():
+        if "ERROR" in line or "error=" in line:
+            reason = re.sub(r"^\[\d+\]\s*(ERROR|WARN)\s*", "", line.strip())
+            reason = reason.split("error=", 1)[-1].strip()
+            break
+    return "grype refuses its database%s" % (": " + reason if reason else "")
 
 
 # A bare twelve-digit run is an AWS account id, in a target or inside an ARN.
@@ -994,15 +1228,71 @@ def terminate_children(grace: float = CHILD_GRACE_SECONDS) -> List[Dict[str, obj
     return out
 
 
+def aws_child_env(base: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
+    """The environment an `aws` child runs with.
+
+    With no credentials elsewhere, the AWS CLI asks the instance-metadata
+    address, 169.254.169.254, before anything else. On a cloud VM that hands
+    the run the machine's role without anyone choosing it; anywhere else it is
+    a request that should not leave the machine. On 2026-10-16 an eBPF probe
+    on a Kali workstation caught `--doctor`'s identity check doing it. So every
+    `aws` child gets AWS_EC2_METADATA_DISABLED=true, unless SQUAWK_AWS_IMDS=1
+    says the machine's role is the identity meant (credential rule 1: the
+    identity is the operator's choice)."""
+    child = dict(os.environ if base is None else base)
+    if env("AWS_IMDS") != "1":
+        child["AWS_EC2_METADATA_DISABLED"] = "true"
+    return child
+
+
+def _is_aws(cmd: List[str]) -> bool:
+    return bool(cmd) and os.path.basename(cmd[0]) == "aws"
+
+
+# Environment variables a scanner reads that change what it reports, with
+# nothing in its output to say so. Measured against dockle 0.4.15:
+# DOCKLE_IGNORES=CIS-DI-0006 removed that check and counted it as passed, and
+# DOCKLE_OUTPUT_FILE sends the report to a file and leaves stdout empty. A
+# child of these scanners runs without them, and the run records which were
+# set and set aside.
+SCANNER_ENV_IGNORED: Dict[str, Tuple[str, ...]] = {
+    "dockle": ("DOCKLE_IGNORES", "DOCKLE_ACCEPT_KEYS", "DOCKLE_REJECT_KEYS",
+               "DOCKLE_ACCEPT_FILES", "DOCKLE_REJECT_FILES",
+               "DOCKLE_ACCEPT_FILE_EXTENSIONS", "DOCKLE_REJECT_FILE_EXTENSIONS",
+               "DOCKLE_EXIT_CODE", "DOCKLE_EXIT_LEVEL", "DOCKLE_OUTPUT_FORMAT",
+               "DOCKLE_OUTPUT_FILE"),
+}
+
+
+def env_set_aside(cmd: List[str]) -> List[str]:
+    """The variables in this environment that `cmd`'s scanner would read and
+    Squawk withholds from it."""
+    names = SCANNER_ENV_IGNORED.get(os.path.basename(cmd[0])) if cmd else None
+    return sorted(k for k in (names or ()) if k in os.environ)
+
+
+def child_env(cmd: List[str]) -> Optional[Dict[str, str]]:
+    """The environment a scanner runs with, or None to inherit it unchanged."""
+    if _is_aws(cmd):
+        return aws_child_env()
+    aside = env_set_aside(cmd)
+    if aside:
+        return {k: v for k, v in os.environ.items() if k not in aside}
+    return None
+
+
 def run_cmd(cmd: List[str], cwd: Optional[str], timeout: int) -> Tuple[int, str, str]:
     """Run one scanner and capture its output. The child gets its own process
     group and is registered while it runs, so a timeout, a Ctrl-C or a server
     stop ends the scanner and everything it spawned, not only the front
-    process. See `terminate_children`."""
+    process. See `terminate_children`. An `aws` child also gets
+    `aws_child_env`, and a scanner in `SCANNER_ENV_IGNORED` runs without the
+    variables named there; every other child inherits the environment
+    unchanged."""
     try:
         proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True,
-                                start_new_session=True)
+                                start_new_session=True, env=child_env(cmd))
     except FileNotFoundError:
         return 127, "", "binary not found"
     except Exception as exc:  # a bad scanner must never crash the run
@@ -1136,6 +1426,11 @@ class RunContext:
         self.raw_path = ""            # set by the runner before each build
         self.service = service        # the service key, for the profile lookup
         self.profile = profile        # the budgets this run runs under, if any
+        # What a builder found and put on the command line, for a scanner whose
+        # report never says what it read. hadolint's JSON is a list of findings
+        # and nothing else; the files it linted are the ones it was handed. Set
+        # by the builder, cleared by the runner before each stage.
+        self.handed: "Optional[Coverage]" = None
 
 
 # --------------------------------------------------------------------------- #
@@ -1149,7 +1444,7 @@ class RunContext:
 # --------------------------------------------------------------------------- #
 
 PROFILE_FILE = "squawk.toml"
-PROFILE_TABLES = ("defaults", "services", "targets", "scanners")
+PROFILE_TABLES = ("defaults", "services", "targets", "scanners", "remediation")
 
 
 class Knob(NamedTuple):
@@ -1172,6 +1467,10 @@ PROFILE_KEYS: Dict[str, Knob] = {
     "zap_startup_wait": Knob(
         20, "minutes",
         "-T on the active probe: startup and passive-scan wait, not a cap"),
+    "schemathesis_examples": Knob(
+        50, "examples",
+        "-n on the API probe: generated test cases per operation, the bound "
+        "on how long the fuzzing runs"),
     # ZAP's launcher takes a quarter of the memory it thinks it has as its
     # heap. In a container under cgroup v2 it reads the HOST's memory — the
     # code that would read the limit looks for a cgroup v1 file that is not
@@ -1288,6 +1587,57 @@ SECRET_SHAPES = (
 )
 SECRET_KEY_WORDS = ("password", "passwd", "secret", "token", "api_key", "apikey",
                     "credential", "auth")
+
+
+# Where the semgrep rules a profile adds are copied in a run, beside the raw
+# report, and the name semgrep then gives them. semgrep names a local rule by
+# the dotted path of its file from the working directory: run from the home
+# directory a rule was `Security.semgrep.rules.<id>`, run from /tmp it was
+# `home.<user>.Security.semgrep.rules.<id>` (measured 2026-10-23, semgrep
+# 1.180.0). An identity that moves with the working directory is not an
+# identity, and that one carried the user name. Copied here and run from the
+# raw directory, every rule is `own-rules.<id>` on every machine, and the
+# rules that ran are sealed with the run.
+OWN_RULES_DIR = "own-rules"
+
+
+def semgrep_rule_files(paths: List[str]) -> List[Tuple[str, str]]:
+    """The rule files under each configured path, as (source, file name),
+    in a stable order. A directory is walked for .yml and .yaml files,
+    hidden directories skipped. Raises ValueError naming the fault: a URL
+    (a registry pack belongs in extra_args), a path that is not here, a
+    directory with no rule file, or two files of one name, which would land
+    on each other in the copy."""
+    out: List[Tuple[str, str]] = []
+    seen: Dict[str, str] = {}
+    for p in paths:
+        if "://" in p:
+            raise ValueError("%r is a URL; rules names local files, and a registry "
+                             "pack goes in extra_args" % p)
+        full = os.path.abspath(os.path.expanduser(p))
+        if os.path.isfile(full):
+            found = [full]
+        elif os.path.isdir(full):
+            found = []
+            for cur, dirs, files in os.walk(full):
+                dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+                found += [os.path.join(cur, n) for n in sorted(files)]
+        else:
+            raise ValueError("%r is not a file or a directory on this machine" % p)
+        found = [f for f in found if f.lower().endswith((".yml", ".yaml"))]
+        if not found:
+            raise ValueError("%r holds no .yml or .yaml rule file" % p)
+        for f in found:
+            name = os.path.basename(f)
+            if name in seen:
+                if seen[name] == f:
+                    continue
+                raise ValueError("two rule files are named %s (%s and %s); copied "
+                                 "for the run, one would replace the other"
+                                 % (name, seen[name], f))
+            seen[name] = f
+            out.append((f, name))
+    return out
 
 
 class ProfileError(ValueError):
@@ -1594,6 +1944,16 @@ class Profile:
             if name == "defaults":
                 self._check_keys(where, "[defaults]", table, extra_ok=False)
                 continue
+            if name == "remediation":
+                for key, val in table.items():
+                    if key not in REMEDIATION_KEYS:
+                        raise ProfileError("%s: [remediation] %s is not a setting — the "
+                                           "settings are %s"
+                                           % (where, key, ", ".join(REMEDIATION_KEYS)))
+                    if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+                        raise ProfileError("%s: [remediation] %s must be a whole number "
+                                           "of days, at least 1" % (where, key))
+                continue
             for sub, inner in table.items():
                 if not isinstance(inner, dict):
                     raise ProfileError("%s: [%s] holds one table per %s — [%s.%s] — "
@@ -1611,6 +1971,19 @@ class Profile:
                 raise ProfileError("%s: %s %s looks like a credential — a profile never "
                                    "holds one (PRODUCT rule 1); the value was not "
                                    "printed" % (where, section, key))
+            if key == "rules":
+                if section != "[scanners.semgrep]":
+                    raise ProfileError("%s: %s rules belongs under [scanners.semgrep]"
+                                       % (where, section))
+                if (not isinstance(val, list) or not val
+                        or not all(isinstance(x, str) for x in val)):
+                    raise ProfileError("%s: %s rules must be a list of paths to rule "
+                                       "files or directories" % (where, section))
+                try:
+                    semgrep_rule_files([str(x) for x in val])
+                except ValueError as exc:
+                    raise ProfileError("%s: %s rules: %s" % (where, section, exc)) from None
+                continue
             if key == "extra_args":
                 if not extra_ok:
                     raise ProfileError("%s: %s extra_args belongs under [scanners.<tool>]"
@@ -1672,6 +2045,24 @@ class Profile:
                 value, section = table[key], shown
         return Setting(key, value, builtin, section)
 
+    def remediation(self) -> Dict[str, Tuple[int, str]]:
+        """Each remediation window in days, with where it came from: the
+        built-in or this profile's [remediation] table."""
+        table = self.data.get("remediation")
+        mine = table if isinstance(table, dict) else {}
+        builtin = dict(REMEDIATION_DAYS, kev=REMEDIATION_KEV_DAYS,
+                       accept_max_days=ACCEPT_MAX_DAYS)
+        return {k: ((int(mine[k]), "%s [remediation]" % (self.path or PROFILE_FILE))
+                    if k in mine else (builtin[k], "built-in"))
+                for k in REMEDIATION_KEYS}
+
+    def semgrep_rules(self) -> List[str]:
+        """The rule paths the profile adds to semgrep, as written."""
+        table = self.data.get("scanners")
+        inner = table.get("semgrep") if isinstance(table, dict) else None
+        rules = inner.get("rules") if isinstance(inner, dict) else None
+        return [str(r) for r in rules] if isinstance(rules, list) else []
+
     def extra_args(self, tool: str) -> List[str]:
         table = self.data.get("scanners")
         inner = table.get(tool) if isinstance(table, dict) else None
@@ -1719,8 +2110,17 @@ class Profile:
             if args and tool not in extra:
                 extra[tool] = args
         changed = [s for s in settings if s["section"] != "built-in"]
+        rules: List[dict] = []
+        if any(str(r.get("tool")) == "semgrep" for r in rows):
+            for path in self.semgrep_rules():
+                try:
+                    n = len(semgrep_rule_files([path]))
+                except ValueError:
+                    n = 0
+                rules.append({"path": path, "files": n})
         return {"path": self.path, "source": self.source, "changed": changed,
-                "settings": settings, "extra_args": extra, "notes": notes}
+                "settings": settings, "extra_args": extra, "notes": notes,
+                "semgrep_rules": rules}
 
 
 def show_setting(value: object) -> str:
@@ -1801,6 +2201,13 @@ def resolve_repo(explicit: Optional[str]) -> Optional[str]:
         cur = parent
 
 
+def running_as_root() -> bool:
+    """Whether this process runs as root; False where the platform has no
+    such idea. Here so the POSIX-only calls stay where the README says."""
+    geteuid = getattr(os, "geteuid", None)
+    return bool(geteuid is not None and geteuid() == 0)
+
+
 def evidence_writable(root: str) -> bool:
     try:
         os.makedirs(root, exist_ok=True)
@@ -1861,6 +2268,7 @@ FEEDS_DIRNAME = "feeds"
 
 __all__ = [
     'ABORT_SWEEP_AGE',
+    'ACCEPT_MAX_DAYS',
     'APP_DIR',
     'BASE_TITLE',
     'CHILD_GRACE_SECONDS',
@@ -1870,6 +2278,12 @@ __all__ = [
     'DEFAULT_EVIDENCE',
     'DEFAULT_PORT',
     'DESTRUCTIVE_TOKENS',
+    'DISPOSITIONS_FILE',
+    'DISPOSITION_FIELDS',
+    'DISPOSITION_NEEDS',
+    'DISPOSITION_SECTIONS',
+    'DISPOSITION_STATES',
+    'DISPOSITION_TEMPLATE',
     'ENTRY_PATH',
     'FEEDS_DIRNAME',
     'GO_ZERO_TIME',
@@ -1884,13 +2298,18 @@ __all__ = [
     'NOTE_SECTIONS',
     'NOTE_TEMPLATE',
     'NO_COVERAGE',
+    'OWN_RULES_DIR',
     'PID_FILENAME',
     'PROFILE_FILE',
     'PROFILE_KEYS',
     'PROFILE_REFUSED_NOTE',
     'PROFILE_TABLES',
     'READ_ONLY_EXEMPT',
+    'REMEDIATION_DAYS',
+    'REMEDIATION_KEV_DAYS',
+    'REMEDIATION_KEYS',
     'SCANNERS',
+    'SCANNER_ENV_IGNORED',
     'SECRET_KEY_WORDS',
     'SECRET_SHAPES',
     'SERVE_LOG',
@@ -1924,9 +2343,13 @@ __all__ = [
     '_bracket_depth',
     '_container_alive',
     '_db_never_built',
+    '_grype_refusal',
+    '_is_aws',
     '_kill_group',
     '_looks_secret',
     '_mode_of',
+    '_osv_db_age',
+    '_osv_db_dir',
     '_rel',
     '_report',
     '_rows',
@@ -1938,8 +2361,12 @@ __all__ = [
     'app_sources',
     'append_chained',
     'as_text',
+    'aws_child_env',
+    'child_env',
     'container_of',
+    'disposition_problems',
     'env',
+    'env_set_aside',
     'evidence_writable',
     'fingerprint',
     'guard_host',
@@ -1962,10 +2389,13 @@ __all__ = [
     'resolve_repo',
     'result_kind',
     'run_cmd',
+    'running_as_root',
+    'semgrep_rule_files',
     'setup_logging',
     'sha256_file',
     'show_setting',
     'slug',
+    'split_note_blocks',
     'stop_container',
     'sync_root',
     'terminate_children',

@@ -32,6 +32,11 @@ Two rails stand in front of it: the run is refused unless you set
 `SQUAWK_CLOUD_ACK=1`, and it is refused again if the credential chain resolves
 to nobody.
 
+Squawk does not let the AWS CLI fall back to the instance-metadata address
+(`AWS_EC2_METADATA_DISABLED=true` on every `aws` it starts), so on a cloud VM
+the VM's own role is never used by accident. If that role is the identity you
+mean, set `SQUAWK_AWS_IMDS=1` (PRODUCT credential rule 9).
+
 ## Before you start
 
 **Use a read-only identity.** AWS `SecurityAudit` or `ViewOnlyAccess` is the

@@ -1,0 +1,4 @@
+# The CLI configuration (fake keys for the emulator), the lab name, the
+# function zip and the validation report of the last run. Rebuilt by
+# `moto-lab.py plant`; nothing here belongs in the repository.
+.state/

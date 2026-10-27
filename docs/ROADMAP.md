@@ -71,6 +71,17 @@ run that produced evidence.
 | Phase 1 finished: error channels carried, cross-scanner differential | merged |
 | Correlation across scanners, stating the denominator | merged |
 | Phase 1 field-check script for the full-toolbench paths | merged |
+| The engagement brief, sealed and quoted from the target's README/PRD | merged |
+| Remediation deadlines in every report; sealed decisions that close a finding | merged |
+| The engineering report says how to retest each finding, with status and references | merged |
+| schemathesis reads a running API against its OpenAPI schema; zizmor reads how each workflow is written | merged |
+| Object-authorization (BOLA) probe: two identities, replay each object as the other | merged |
+| Authenticated DAST (`authdast`): logs in to a running app — including a login behind a per-request CSRF token — and tests the authenticated surface | merged |
+| Engagements in the UI: group and scope the estate by engagement; `engagements.json` maps by glob without re-scanning; remove (unmap) and hide-report | merged |
+| The pre-handover checklist: a per-engagement signoff, each tick a sealed ledger line; ready-to-hand-over gated on every item pass/N·A | merged |
+| `squawk greps`: a manual-review grep sweep grouped by the checklist's coverage areas, a backup to the scanners | merged |
+| The SharePad handover report: executive and engineer PDFs, redacted at render time; the engineer findings table carries First seen + Due with Where/Source as call-outs | merged |
+| Headless count lines name the test share, so product findings are not buried | merged |
 
 ## In review, not merged
 
@@ -135,6 +146,11 @@ run rather than from an artifact. Measured, not assumed:
 | bandit | `metrics` per file, `_totals.loc`, `errors` |
 | trivy | `Results` blocks and the `Target` each covers |
 | checkov | `summary.passed` / `failed` / `resource_count` |
+| hadolint | nothing: a list of what it flagged. The denominator is the Dockerfiles Squawk handed it |
+| zizmor | nothing in its JSON; a `completed <path>` line per file on stderr, and a `failed to parse input` warning per file it could not read |
+| trufflehog | `bytes` and `chunks` on its `finished scanning` log line, on stderr |
+| dockle | `summary`: `fatal`, `warn`, `info`, `skip`, `pass`, every check counted |
+| osv-scanner | every package it resolved, with `--all-packages`; the count it filtered, on stderr |
 
 Two runs that prove the point. Semgrep with an empty ruleset: **0 findings, 0
 files scanned.** Semgrep with real rules on the same tree: **0 findings, 6 files
@@ -379,6 +395,21 @@ first day at a new organisation.
       of them. What is still one-checkout-at-a-time is *running* a scan: there
       is no "scan these six" action, and that is the part left.
 
+- [x] **Object-authorization (BOLA) probe.** *Shipped.* A native url-scope probe that is
+      given two tenant identities, walks object IDs from the OpenAPI schema (the
+      `apiprobe` already reads it), and replays each as the other identity: a
+      `200` for an object that is not the caller's is a cross-tenant read. This
+      is OWASP API1 (BOLA), the one class no scanner catches without a multi-identity
+      setup — the tools that do it (StackHawk's business-logic testing, Akto,
+      Burp's Autorize) all use the same record-and-replay-across-identities
+      technique, and none is a CLI to orchestrate, so it is a native probe like
+      `recon` and `selfaudit`. Read-only cross-tenant enumeration (GET) fits the
+      `liveprobe` posture and ships first; the write-based checks (cross-tenant
+      PUT/DELETE) are `activeprobe`-tier; the authenticated variant shipped as
+      the `webauth` probe once it met the credential-handling gate below (see
+      "Authenticated DAST shipped"). Found by hand on two engagements in 2026-10, where it was
+      the finding that carried the review.
+
 **Exit criterion:** a read-only cloud identity produces a ranked, deduplicated
 list that diffs across two runs, with the same identity guarantees as a code
 finding.
@@ -549,8 +580,52 @@ effort. The load-bearing ones: provider credential chain only and never argv,
 which is visible in the process table; read-only identities only; `--doctor`
 names the identity before anything queries with it; evidence is never committed.
 
-Authenticated DAST, private registry images, and anything that reads a cloud
-account wait behind that.
+Private registry images and anything that reads a cloud account wait behind
+that.
+
+**Authenticated DAST shipped (2026-10-24)** as the `webauth` probe (service
+`authdast`), once it could meet the gate: credentials come from
+`SQUAWK_WEBAUTH_*` in the environment, never argv and never a profile; the
+session (a cookie jar) lives in memory for the run and is never written to
+disk; no credential or cookie value reaches a log, a report or an identity key;
+and it runs behind the same private-target rail as the rest of DAST. The login
+flow is configured per target (`SQUAWK_WEBAUTH_PATH`, `_METHOD`, `_FIELDS`), and
+the checks it runs are a registry — session cookie flags, login username
+enumeration, and configured protected paths reachable with no session — so a
+new check for a new target is a function added to that registry, not a new
+service.
+
+---
+
+## Evaluated 2026-10-24, and why they do not fit
+
+Modern and widely used, and still not Squawk's to build. Checked against the
+charter after an engagement surfaced them, and recorded so each is answered once.
+
+- **Reachability-based SCA** (Endor Labs, Semgrep Supply Chain, Snyk, Mend). The
+  current way to cut dependency-scan noise: does the app actually call the
+  vulnerable function, not only import the package. It needs a per-language
+  call-graph engine, which is a scanner in its own right — the "writing scanners
+  that already exist and are better" line below. The honest limit the tools
+  themselves name is that function-level reachability still cannot tell whether
+  the input is attacker-controlled, and the noise-reduction figures are vendor
+  claims, not independent benchmarks. Left to the tools that do it; Squawk keeps
+  reporting the floor with its denominator rather than guessing exploitability.
+- **A build-gate / fail-on-new mode.** This is "becoming a CI tool", already
+  below. Squawk emits SARIF (Phase 4) so a pipeline can gate on its output; the
+  new-vs-known diff is the decisions baseline's job, and the pipeline — not
+  Squawk — is what fails the build.
+- **Live secret verification** (sending a found secret to its provider to see if
+  it still works, as TruffleHog's verified mode does). Against the read-only
+  posture: `contraband` deliberately sends nothing it finds to a provider. It is
+  outbound use of a credential, the opposite of what the tool promises; Squawk
+  reports the secret and leaves proving it live to a person.
+- **Shipping opinionated rule packs** (a built-in taint set, a bundled policy
+  library). Squawk orchestrates semgrep and carries the registry; a user's own
+  rules load through a profile — the authorization, tenancy, CI/CD and appsec
+  rules used on recent engagements did exactly this. A pack baked into the tool
+  makes it non-neutral and duplicates the registry. The supported path is a
+  documented profile rules directory, not a pack in core.
 
 ---
 

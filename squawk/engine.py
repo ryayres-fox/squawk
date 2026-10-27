@@ -1,5 +1,6 @@
 """Running a service: stages, coverage, contamination, and writing the evidence."""
 
+import hashlib
 import json
 import logging
 import logging.handlers
@@ -16,6 +17,9 @@ from squawk.analysis import (
     scanner_differential,
 )
 from squawk.core import (
+    DISPOSITION_FIELDS,
+    DISPOSITION_SECTIONS,
+    DISPOSITIONS_FILE,
     LOG,
     NOTE_SECTIONS,
     SCANNERS,
@@ -27,9 +31,11 @@ from squawk.core import (
     RunContext,
     RunInterrupted,
     StageResult,
+    env_set_aside,
     fingerprint,
     human_seconds,
     is_contaminated,
+    is_test_code,
     load_profile,
     note_problems,
     run_cmd,
@@ -49,8 +55,9 @@ from squawk.evidence import (
     seal_run,
     write_digest,
 )
-from squawk.scanners import NORMALIZERS, report_unreadable, stage_coverage
+from squawk.scanners import NORMALIZERS, SCRUBBERS, report_unreadable, stage_coverage
 from squawk.stages import (
+    DISPOSITION_SERVICE,
     NOTE_SERVICE,
     SERVICES,
     STAGE_KNOBS,
@@ -58,6 +65,7 @@ from squawk.stages import (
     ZAP_JVM_PROPS,
     Service,
     StageSpec,
+    config_path,
 )
 
 # --------------------------------------------------------------------------- #
@@ -269,7 +277,8 @@ def _upstream_coverage(ctx: "RunContext", key: str) -> "Optional[Coverage]":
 
 def _apply_coverage(tool: str, out: str, findings: list, status: str,
                     detail: str, stdout: str = "", stderr: str = "",
-                    inherited: "Optional[Coverage]" = None
+                    inherited: "Optional[Coverage]" = None,
+                    handed: "Optional[Coverage]" = None
                     ) -> "Tuple[str, str, Optional[Coverage]]":
     """Fold coverage into a stage's verdict.
 
@@ -283,8 +292,15 @@ def _apply_coverage(tool: str, out: str, findings: list, status: str,
     `inherited` is the exception, and it is not an invention: a stage that reads
     an artifact another stage wrote covered exactly what that artifact holds.
     grype publishes nothing about what it examined, and it examines the SBOM it
-    was handed, which syft already counted."""
+    was handed, which syft already counted.
+
+    `handed` is the same idea one step earlier: the files the stage's builder
+    found and put on the command line, for a scanner whose report lists only
+    what it flagged (hadolint). The tool's own count still wins when it has
+    one."""
     cov = stage_coverage(tool, out, stdout, stderr)
+    if cov.examined is None and handed is not None:
+        cov = handed
     if (cov.examined is None and inherited is not None
             and inherited.examined is not None):
         cov = inherited._replace(
@@ -321,6 +337,21 @@ def _apply_coverage(tool: str, out: str, findings: list, status: str,
     return (status, detail, cov)
 
 
+def _count_detail(kept: list) -> str:
+    """The per-scanner count line. Findings in test code are counted but shown
+    apart, so a flood of the test idiom (bandit's B101 `assert` across a test
+    suite) cannot bury the product's findings behind one number. Nothing is
+    dropped — the total leads and the test share is named (core.is_test_code,
+    I12: the cap that is printed is not a cap)."""
+    n = len(kept)
+    in_tests = sum(1 for f in kept if is_test_code(getattr(f, "path", "") or ""))
+    if not in_tests:
+        return "%d finding(s)" % n
+    if in_tests == n:
+        return "%d finding(s) (all in tests)" % n
+    return "%d finding(s) (%d in tests, %d in product)" % (n, in_tests, n - in_tests)
+
+
 def _run_one_stage(spec: StageSpec, ctx: RunContext, raw_file: str,
                    base: str, run_dir: str,
                    progress: Optional[Callable[[dict], None]] = None) -> StageResult:
@@ -355,7 +386,7 @@ def _run_one_stage(spec: StageSpec, ctx: RunContext, raw_file: str,
         findings = NORMALIZERS[spec.tool](out, base)
         kept = [f for f in findings if not is_contaminated(f.path)]
         status = "error" if err_detail else (forced_status or "ok")
-        detail = err_detail or forced_detail or "%d finding(s)" % len(kept)
+        detail = err_detail or forced_detail or _count_detail(kept)
         drift = report_unreadable(spec.tool, out) if not findings else None
         if drift and status == "ok":
             status = "error"
@@ -389,12 +420,16 @@ def _run_one_stage(spec: StageSpec, ctx: RunContext, raw_file: str,
                            % spec.requires, None, [], 0)
 
     ctx.raw_path = raw_file              # a writes_report stage targets this
+    ctx.handed = None                    # the builder sets it; never carried over
     cmd, timeout = spec.build(ctx)
     if not cmd:
         LOG.warning("GAP %s: nothing to run against", spec.tool)
+        handed = ctx.handed
+        what = (handed.unit if handed is not None and handed.examined == 0
+                else spec.requires or "input")
         return StageResult(spec.tool, spec.mode, "gap",
-                           "no %s to read — nothing to run against"
-                           % (spec.requires or "input"), None, [], 0)
+                           "no %s to read — nothing to run against" % what,
+                           None, [], 0, handed)
 
     # The budget this stage runs under, and where it came from. The profile's
     # stage_timeout replaces the builder's; its extra_args are appended, never
@@ -420,6 +455,36 @@ def _run_one_stage(spec: StageSpec, ctx: RunContext, raw_file: str,
         progress({"phase": "budget", "tool": spec.tool, "mode": spec.mode,
                   "timeout": timeout, "timeout_from": timeout_from})
 
+    if spec.config:
+        conf = config_path(raw_file, spec.config_suffix)
+        try:
+            with open(conf, "w", encoding="utf-8") as fh:
+                fh.write(spec.config)
+        except OSError as exc:
+            return StageResult(spec.tool, spec.mode, "error",
+                               "could not write its pinned configuration: %s"
+                               % (exc.strerror or exc), None, [], 0, None, ran)
+        ran["config"] = os.path.relpath(conf, run_dir)
+
+    if spec.bundle is not None:
+        bundled: List[dict] = []
+        try:
+            for src, rel in spec.bundle(ctx):
+                dest = os.path.join(os.path.dirname(raw_file), rel)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.copyfile(src, dest)
+                with open(dest, "rb") as fh:
+                    digest = hashlib.sha256(fh.read()).hexdigest()
+                bundled.append({"file": os.path.relpath(dest, run_dir),
+                                "from": src, "sha256": digest})
+        except (OSError, ValueError) as exc:
+            return StageResult(spec.tool, spec.mode, "error",
+                               "could not copy the files it reads: %s"
+                               % (getattr(exc, "strerror", None) or exc), None, [], 0,
+                               None, ran)
+        if bundled:
+            ran["bundled"] = bundled
+
     # `monotonic`, because that is the clock the budget is measured against.
     # `subprocess` computes its timeout deadline with `time.monotonic`, which on
     # darwin is `mach_absolute_time()` and does not advance while the machine is
@@ -430,8 +495,20 @@ def _run_one_stage(spec: StageSpec, ctx: RunContext, raw_file: str,
     # elapsed on one clock against a budget on
     # another is a claim about a control that was never measured.
     started = time.monotonic()
-    code, out, err = run_cmd(cmd, cwd=None, timeout=timeout)
+    aside = env_set_aside(cmd)
+    if aside:
+        ran["env_set_aside"] = aside
+        LOG.warning("%s runs without %s from the environment: each changes what "
+                    "it reports", spec.tool, ", ".join(aside))
+    code, out, err = run_cmd(cmd, cwd=os.path.dirname(raw_file) if spec.cwd_raw
+                             else None, timeout=timeout)
     ran["elapsed"] = round(time.monotonic() - started, 1)
+    # Before anything is written or read: a scanner that prints the secret it
+    # found (trufflehog has no redaction flag) has it removed here, so no file
+    # in the locker and no page ever holds it.
+    scrub = SCRUBBERS.get(spec.tool)
+    if scrub is not None and not spec.writes_report:
+        out = scrub(out)
     # Everything the scanner said on stderr, kept as evidence rather than the
     # first line of it. A ZAP probe that failed in 25 seconds left a run
     # holding one line — enough to know it failed,
@@ -480,9 +557,16 @@ def _run_one_stage(spec: StageSpec, ctx: RunContext, raw_file: str,
 
     # non-zero exit with no parseable output is an error; a non-zero exit that
     # still produced findings is normal for scanners that signal via exit code.
+    #
+    # Whether or not it says why. This used to need a message on stderr too,
+    # and grype run with -q on a database past its own age limit exits 1 with
+    # nothing on stdout or stderr: the stage read "ok, 0 finding(s) across 34
+    # packages", the count borrowed from syft, on 2026-10-22. No scanner here
+    # reports a clean result as empty output; a clean result is a document.
     drift = report_unreadable(spec.tool, out) if not findings else None
-    if code != 0 and not findings and err.strip() and not out.strip():
-        status, detail = "error", err.strip().splitlines()[0][:120]
+    if code != 0 and not findings and not out.strip():
+        first = err.strip().splitlines()[0][:120] if err.strip() else ""
+        status, detail = "error", first or "exited %d and wrote nothing" % code
     elif drift:
         # The scanner ran and produced output we could not understand. Reporting
         # that as "0 findings" is the exact substitution this tool refuses to
@@ -492,12 +576,13 @@ def _run_one_stage(spec: StageSpec, ctx: RunContext, raw_file: str,
                     spec.tool, drift)
     else:
         status = "ok"
-        detail = "%d finding(s)" % len(kept)
+        detail = _count_detail(kept)
         if excluded:
             detail += " (%d excluded)" % excluded
     status, detail, cov = _apply_coverage(
         spec.tool, out, kept, status, detail, stdout, err,
-        inherited=_upstream_coverage(ctx, spec.requires) if spec.requires else None)
+        inherited=_upstream_coverage(ctx, spec.requires) if spec.requires else None,
+        handed=ctx.handed)
     # A stage that died with a heap set by the operator must say so: ZAP's own
     # message is about a summary file and says nothing about memory, and the
     # operator chose that number. Measured 2026-09-08 — a heap too small fails
@@ -755,6 +840,15 @@ def write_note(evidence_root: str, target: str, fields: Dict[str, str],
         val = (fields.get(key) or "").strip()
         if val:
             detail[key.replace(" ", "_")] = val
+    # Anything else the operator wrote -- a heading of their own, or a
+    # `key: value` line the template does not name -- is kept as typed.
+    # parse_note keeps it; this copy used to take the four template sections
+    # only, so a control mapping vanished between the editor and the report.
+    extra = {k: (v or "").strip() for k, v in fields.items()
+             if k not in NOTE_SECTIONS and k not in ("title", "severity")
+             and (v or "").strip()}
+    if extra:
+        detail["sections"] = extra
     if kept:
         detail["attachments"] = kept
 
@@ -770,6 +864,52 @@ def write_note(evidence_root: str, target: str, fields: Dict[str, str],
                     correlations=[], session=session)
     return {"run_id": rid, "run_dir": run_dir, "identity": ident,
             "attachments": len(kept)}
+
+
+def write_disposition(evidence_root: str, session: str,
+                      records: List[Dict[str, str]],
+                      keys: Dict[str, dict]) -> Dict[str, object]:
+    """Record decisions about findings already in `session`, as one sealed run.
+
+    The caller has validated each record (core.disposition_problems) and that
+    each names a finding the session holds; this writes, it does not judge.
+    `keys` maps each finding ID to the targets and scanner identities the
+    decision is filed under (report.tracked_keys), so it follows the finding
+    into a later session on the same target and onto no other target.
+    The decisions go in dispositions.json inside the run directory, so the
+    digest covers them: a risk acceptance that could be edited afterwards
+    is not a record of a decision. The run carries no findings."""
+    if not session:
+        raise ValueError("a decision belongs to a session")
+    if not records:
+        raise ValueError("no decision to record")
+    at = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    kept: List[Dict[str, object]] = []
+    # Every row is built and checked before a run directory is claimed, so a
+    # refusal leaves nothing behind.
+    for rec in records:
+        row: Dict[str, object] = {k.replace(" ", "_"): (rec.get(k) or "").strip()
+                                  for k in DISPOSITION_FIELDS + DISPOSITION_SECTIONS
+                                  if (rec.get(k) or "").strip()}
+        fid = str(row.get("finding") or "")
+        k = keys.get(fid) or {}
+        if not (k.get("targets") and k.get("identities")):
+            raise ValueError("no targets and identities for finding %r" % fid)
+        row.update(state=str(row.get("state") or "").lower(), recorded_at=at,
+                   targets=list(k["targets"]), identities=list(k["identities"]))
+        kept.append(row)
+    os.makedirs(evidence_root, exist_ok=True)
+    rid, run_dir = claim_run_dir(evidence_root, DISPOSITION_SERVICE.scope)
+    with open(os.path.join(run_dir, DISPOSITIONS_FILE), "w", encoding="utf-8") as fh:
+        json.dump({"schema": 1, "session": session, "decisions": kept}, fh,
+                  indent=2, sort_keys=True)
+    result = StageResult(
+        "operator", "disposition", "ok",
+        "%d decision(s) recorded by hand" % len(kept), None, [], 0, None, None)
+    _write_evidence(run_dir, DISPOSITION_SERVICE, session, [result],
+                    ["operator\tdisposition\tok\trecorded by hand"],
+                    correlations=[], session=session)
+    return {"run_id": rid, "run_dir": run_dir, "decisions": len(kept)}
 
 
 def _finding_dict(f: "Finding") -> dict:
@@ -905,6 +1045,7 @@ __all__ = [
     '_apply_coverage',
     '_as_int',
     '_collect_identities',
+    '_count_detail',
     '_execute_service_inner',
     '_finding_dict',
     '_heap_set',
@@ -918,5 +1059,6 @@ __all__ = [
     'profile_for',
     'run_id',
     'stage_rows',
+    'write_disposition',
     'write_note',
 ]

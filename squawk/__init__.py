@@ -18,17 +18,21 @@ Design commitments:
 
 The package is layered; each module imports only from the ones before it:
 core, probes, scanners, stages, evidence, decisions, analysis, engine, feeds,
-installer, baselines, retention, runtime, web, service, cli. `squawk.py` beside this package is the
-entry point, and `python3 -m squawk` works too.
+installer, baselines, engagements, checklist, retention, runtime, web, service,
+cli.
+`squawk.py` beside this package is the entry point, and `python3 -m squawk`
+works too.
 """
 
 from squawk.analysis import *  # noqa: F403
 from squawk.baselines import *  # noqa: F403
+from squawk.checklist import *  # noqa: F403
 from squawk.cli import *  # noqa: F403
 from squawk.cli import main  # noqa: F401
 from squawk.core import *  # noqa: F403
 from squawk.core import __version__  # noqa: F401
 from squawk.decisions import *  # noqa: F403
+from squawk.engagements import *  # noqa: F403
 from squawk.engine import *  # noqa: F403
 from squawk.evidence import *  # noqa: F403
 from squawk.feeds import *  # noqa: F403

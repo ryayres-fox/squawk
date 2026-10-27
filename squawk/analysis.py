@@ -32,6 +32,7 @@ from squawk.core import (
     redact_identifiers,
     result_kind,
     vuln_db_ages,
+    walk_chain,
 )
 from squawk.decisions import current_decisions, summarize, verify_ledger
 from squawk.evidence import (
@@ -4660,6 +4661,39 @@ VERIFY_EXIT_FAILED = 1
 VERIFY_EXIT_UNVERIFIABLE = 3
 
 
+# The pre-handover checklist (checklist.record_check) writes each signoff to a
+# chained ledger, the same tamper-evident shape as the decisions ledger. Its
+# verifier lives here, beside verify_root, because verify_root composes the
+# whole-root answer and `checklist` sits ABOVE this module in the layering, so
+# it cannot be imported. The two facts duplicated from checklist.py — the
+# ledger path and the valid states — are held to their source by
+# test_the_checklist_verifier_matches_the_checklist_module.
+_CHECKLIST_LEDGER = ("checklist", "ledger.jsonl")
+_CHECKLIST_STATES = ("open", "pass", "na", "fail")
+
+
+def verify_checklist(evidence_root: str, since_head: str = "") -> dict:
+    """Walk the pre-handover checklist ledger and name the first line that does
+    not hold. The same chain walk as the decisions ledger, plus the one
+    checklist rule: every chained line is a signoff (a known status on an item).
+    A tick written before the chain existed is `unverifiable`, never `ok`."""
+    path = os.path.join(evidence_root, *_CHECKLIST_LEDGER)
+    out = walk_chain(path, since_head, min_version=2, what="signoff")
+    events = out.pop("events", [])
+    if not out["present"]:
+        out["detail"] = ("no checklist signoff recorded" if not since_head
+                         else "the checklist ledger verified earlier is gone")
+        return out
+    if out["state"] == "ok":
+        bad = [i + 1 for i, ev in enumerate(events)
+               if ev.get("status") not in _CHECKLIST_STATES or not ev.get("item")]
+        if bad:
+            out.update(state="broken", broken_at=bad[0],
+                       detail="line %d is chained but is not a checklist signoff"
+                       % bad[0])
+    return out
+
+
 def verify_root(root: str, progress: Optional[Callable[[dict], None]] = None) -> dict:
     """Everything in one evidence root: the retention record's own chain, then
     every run against its digest, the chain and the previous verify, then the
@@ -4674,6 +4708,7 @@ def verify_root(root: str, progress: Optional[Callable[[dict], None]] = None) ->
     retention = verify_retention(root, str((last.get("retention") or {}).get("head", "")))
     runs = verify_runs(root, previous=last, progress=progress)
     ledger = verify_ledger(root, str((last.get("ledger") or {}).get("head", "")))
+    checklist = verify_checklist(root, str((last.get("checklist") or {}).get("head", "")))
     report = {"root": root,
               "at": time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
               "previous_at": last.get("at", ""),
@@ -4681,7 +4716,7 @@ def verify_root(root: str, progress: Optional[Callable[[dict], None]] = None) ->
               "total": runs["total"], "dropped": runs["dropped"],
               "pruned_runs": runs["pruned_runs"], "digests": runs["digests"],
               "failed": runs["failed"], "unverifiable": runs["unverifiable"],
-              "ledger": ledger, "retention": retention}
+              "ledger": ledger, "checklist": checklist, "retention": retention}
     report["status"], report["exit"], report["summary"] = _verify_verdict(report)
     return report
 
@@ -4692,6 +4727,7 @@ def _verify_verdict(report: dict) -> Tuple[str, int, str]:
     failure and never reads as either."""
     ledger = report.get("ledger", {})
     retention = report.get("retention", {})
+    checklist = report.get("checklist", {})
     pruned = report.get("pruned_runs") or []
     drops = [r for r in pruned if r.get("kind") == "drop"]
     trims = [r for r in pruned if r.get("kind") == "trim"]
@@ -4700,7 +4736,8 @@ def _verify_verdict(report: dict) -> Tuple[str, int, str]:
         relied = " Retention removed %d run(s) and trimmed %d, each listed above" \
                  " — a record, not a proof." % (len(drops), len(trims))
     if report["failed"] or ledger.get("state") == "broken" \
-            or retention.get("state") == "broken":
+            or retention.get("state") == "broken" \
+            or checklist.get("state") == "broken":
         parts = []
         for state in ("altered", "missing", "extra", "chain broken"):
             n = report["counts"].get(state, 0)
@@ -4712,10 +4749,14 @@ def _verify_verdict(report: dict) -> Tuple[str, int, str]:
         if retention.get("state") == "broken":
             parts.append("the retention record broken (%s)"
                          % retention.get("detail", "no detail"))
+        if checklist.get("state") == "broken":
+            parts.append("the checklist ledger broken (%s)"
+                         % checklist.get("detail", "no detail"))
         return ("failed", VERIFY_EXIT_FAILED,
                 "%d run(s) checked; %s.%s" % (report["total"], ", ".join(parts), relied))
     if report["unverifiable"] or ledger.get("state") == "unverifiable" \
-            or retention.get("state") == "unverifiable":
+            or retention.get("state") == "unverifiable" \
+            or checklist.get("state") == "unverifiable":
         bits = []
         rows = report.get("runs") or []
         legacy = sum(1 for r in rows if r["state"] == "unverifiable"
@@ -4735,6 +4776,9 @@ def _verify_verdict(report: dict) -> Tuple[str, int, str]:
         if retention.get("state") == "unverifiable":
             bits.append("the retention record: %s"
                         % retention.get("detail", "could not be checked"))
+        if checklist.get("state") == "unverifiable":
+            bits.append("the checklist ledger: %s"
+                        % checklist.get("detail", "could not be checked"))
         return ("unverifiable", VERIFY_EXIT_UNVERIFIABLE,
                 "%d of %d run(s) verified; %s.%s"
                 % (report["counts"].get("ok", 0), report["total"], "; ".join(bits),
@@ -4793,6 +4837,8 @@ __all__ = [
     'VERIFY_EXIT_UNVERIFIABLE',
     'WITNESS_KINDS',
     '_ATTACK_RE',
+    '_CHECKLIST_LEDGER',
+    '_CHECKLIST_STATES',
     '_TROUBLE',
     'CloudGraph',
     'CloudRule',
@@ -4923,6 +4969,7 @@ __all__ = [
     'storage_caveats',
     'storage_findings',
     'storage_summary',
+    'verify_checklist',
     'verify_root',
     'verify_state',
     'watching_gaps',

@@ -9,15 +9,21 @@ from urllib.parse import urlparse
 
 from squawk.core import (
     LOG,
+    OWN_RULES_DIR,
     PROFILE_KEYS,
+    Coverage,
     RunContext,
     _report,
     env,
+    is_contaminated,
     redact_identifiers,
     run_cmd,
+    semgrep_rule_files,
     tool_path,
 )
 from squawk.probes import (
+    ai_garak_probe,
+    authz_probe,
     aws_analyzer,
     aws_containers,
     aws_dataservices,
@@ -31,6 +37,7 @@ from squawk.probes import (
     recon_probe,
     self_audit,
     skill_audit,
+    webauth_probe,
 )
 
 
@@ -79,12 +86,163 @@ def _inside_a_repository(path: str) -> bool:
         here = parent
 
 
+# trufflehog reads `.git` as files and decodes the objects in it, so a secret
+# committed once was reported twice, the second time at a path like
+# `.git/objects/59/80b1...` that tells a reader nothing. History is gitleaks's
+# half, beside it in every service that runs this. Measured on the lab's
+# secrets corpus: 28,077 bytes read with `.git`, 436 without, the same one
+# finding in the tree.
+TRUFFLEHOG_EXCLUDE = "(^|/)\\.git/\n"
+TRUFFLEHOG_EXCLUDE_SUFFIX = ".exclude.txt"
+
+
+def stage_trufflehog(ctx: RunContext) -> Tuple[List[str], int]:
+    # --no-verification: verifying sends each secret found to its provider to
+    # test it, and Squawk transmits no secret anywhere (plan 05, PRODUCT rule
+    # 6). --no-update: by default trufflehog checks for a newer version of
+    # itself on every run and replaces itself with it.
+    return ["trufflehog", "filesystem", ctx.target, "--json",
+            "--no-verification", "--no-update", "--no-color",
+            "--exclude-paths", config_path(ctx.raw_path, TRUFFLEHOG_EXCLUDE_SUFFIX)], 600
+
+
 def stage_semgrep(ctx: RunContext) -> Tuple[List[str], int]:
-    return ["semgrep", "--config", "auto", "--json", "--quiet", ctx.target], 1200
+    cmd = ["semgrep", "--config", "auto"]
+    profile = getattr(ctx, "profile", None)
+    if profile is not None and profile.semgrep_rules():
+        # Relative on purpose: the stage runs from the raw directory, where
+        # the runner has copied the rules (`semgrep_bundle`).
+        cmd += ["--config", OWN_RULES_DIR]
+    return [*cmd, "--json", "--quiet", ctx.target], 1200
+
+
+def semgrep_bundle(ctx: RunContext) -> List[Tuple[str, str]]:
+    """The rules a profile adds, as (source, path under the raw directory),
+    for the runner to copy before semgrep starts."""
+    profile = getattr(ctx, "profile", None)
+    if profile is None:
+        return []
+    return [(src, os.path.join(OWN_RULES_DIR, name))
+            for src, name in semgrep_rule_files(profile.semgrep_rules())]
 
 
 def stage_bandit(ctx: RunContext) -> Tuple[List[str], int]:
     return ["bandit", "-r", ctx.target, "-f", "json", "-q"], 600
+
+
+# The names a Dockerfile goes by. `Containerfile` is podman's and buildah's,
+# and `Dockerfile.prod` / `api.Dockerfile` are how a repository with more than
+# one image names them.
+# `Dockerfile.md` is a page about one, not one; hadolint would report it as a
+# parse error and the run would carry that as a finding.
+_NOT_A_DOCKERFILE = (".md", ".txt", ".rst", ".adoc", ".html", ".orig", ".bak",
+                     ".swp", ".j2", ".tmpl", ".template")
+
+
+def is_dockerfile(name: str) -> bool:
+    low = name.lower()
+    if low.endswith(_NOT_A_DOCKERFILE):
+        return False
+    return (low in ("dockerfile", "containerfile")
+            or low.startswith(("dockerfile.", "containerfile."))
+            or low.endswith((".dockerfile", ".containerfile")))
+
+
+# A pinned configuration, written beside the raw report and sealed with it.
+# Without it hadolint reads `.hadolint.yaml` from whatever directory Squawk was
+# started in and from the home directory, and an `ignored:` list in either
+# drops a rule from the run with nothing on the page to say so. Measured
+# against hadolint 2.15.1: a stray `.hadolint.yaml` ignoring DL3066 in the
+# working directory turned one finding into `[]`; with `-c` it came back. An
+# empty file is not a configuration hadolint accepts, so it is this one line.
+HADOLINT_CONFIG = "ignored: []\n"
+
+
+def dockerfiles_in(root: str, limit: int = 500) -> List[str]:
+    """Every Dockerfile under `root`, sorted, skipping `.git`, `node_modules`
+    (a package's own build files are not this repository's) and the
+    directories whose findings would be excluded anyway. A file target is
+    returned as itself when it is a Dockerfile."""
+    if os.path.isfile(root):
+        return [root] if is_dockerfile(os.path.basename(root)) else []
+    found: List[str] = []
+    for cur, dirs, files in os.walk(root):
+        rel = os.path.relpath(cur, root)
+        dirs[:] = sorted(d for d in dirs if d not in (".git", "node_modules")
+                         and not is_contaminated(os.path.join(rel, d)))
+        for name in sorted(files):
+            if is_dockerfile(name):
+                found.append(os.path.join(cur, name))
+                if len(found) >= limit:
+                    return found
+    return found
+
+
+def stage_hadolint(ctx: RunContext) -> Tuple[List[str], int]:
+    files = [os.path.abspath(f) for f in dockerfiles_in(ctx.target)]
+    # hadolint's report names no file it found clean, so what it examined is
+    # what it was given. Recorded here, before the run, so a tree with none is
+    # "examined 0 Dockerfiles" and a gap, not a clean result.
+    ctx.handed = Coverage(len(files), "Dockerfiles", 0, 0,
+                          "" if files else "no Dockerfile in the tree")
+    if not files:
+        return [], 0
+    # --no-fail: hadolint exits 1 for "found something", which would leave the
+    # exit code unable to tell a finding from a file it could not open.
+    return ["hadolint", "-c", config_path(ctx.raw_path), "--no-fail",
+            "--no-color", "-f", "json", *files], 120
+
+
+_WORKFLOW_SUFFIXES = (".yml", ".yaml")
+
+
+def workflow_files_in(root: str, limit: int = 500) -> List[str]:
+    """Every GitHub Actions workflow (`.github/workflows/*.yml` or `.yaml`) and
+    action definition (`action.yml` or `action.yaml`) under `root`, sorted,
+    skipping `.git`, `node_modules` and the directories whose findings would be
+    excluded anyway. A file target is returned as itself when it is YAML.
+
+    zizmor is handed these by name, not the directory: given a directory it
+    leaves out whatever the tree's `.gitignore` lists, so the tree it audits
+    could keep a workflow from it."""
+    if os.path.isfile(root):
+        return [root] if root.lower().endswith(_WORKFLOW_SUFFIXES) else []
+    found: List[str] = []
+    for cur, dirs, files in os.walk(root):
+        rel = os.path.relpath(cur, root)
+        dirs[:] = sorted(d for d in dirs if d not in (".git", "node_modules")
+                         and not is_contaminated(os.path.join(rel, d)))
+        workflows = (os.path.basename(cur) == "workflows"
+                     and os.path.basename(os.path.dirname(cur)) == ".github")
+        for name in sorted(files):
+            low = name.lower()
+            if ((workflows and low.endswith(_WORKFLOW_SUFFIXES))
+                    or low in ("action.yml", "action.yaml")):
+                found.append(os.path.join(cur, name))
+                if len(found) >= limit:
+                    return found
+    return found
+
+
+def stage_zizmor(ctx: RunContext) -> Tuple[List[str], int]:
+    files = [os.path.abspath(f) for f in workflow_files_in(ctx.target)]
+    # zizmor's report lists what it flagged and nothing else. Recorded here,
+    # before the run, so a tree with no workflow is "examined 0" and a gap; its
+    # own log, when it prints one, replaces this count (scanners._cov_zizmor).
+    ctx.handed = Coverage(len(files), "workflow files", 0, 0,
+                          "" if files else "no GitHub Actions workflow in the tree")
+    if not files:
+        return [], 0
+    # --offline: no request to GitHub, so nothing about the repository leaves
+    # the machine and the audits that need the network do not run.
+    # --no-config and --no-ignores: a zizmor.yml or a `# zizmor: ignore[...]`
+    # comment in the tree being audited cannot drop a finding; one it
+    # suppresses is reported, marked as suppressed (zizmor 1.31.1 dropped it
+    # from the JSON otherwise). --persona auditor: every audit, with zizmor's
+    # confidence kept beside each. --no-exit-codes: 0 with findings, so a
+    # nonzero exit is the tool failing.
+    return ["zizmor", "--offline", "--no-config", "--no-ignores", "--persona", "auditor",
+            "--format", "json", "--no-exit-codes", "--no-progress", *files], 300
 
 
 def stage_checkov(ctx: RunContext) -> Tuple[List[str], int]:
@@ -104,8 +262,33 @@ def stage_trivy_fs(ctx: RunContext) -> Tuple[List[str], int]:
     return ["trivy", "fs", "-f", "json", "-q", ctx.target], 900
 
 
+def stage_dockle(ctx: RunContext) -> Tuple[List[str], int]:
+    # --timeout is dockle's wait on the docker daemon, 90 seconds by default;
+    # exporting a large image takes longer than that.
+    return ["dockle", "-f", "json", "--no-color", "--timeout", "10m", ctx.target], 900
+
+
 def stage_trivy_image(ctx: RunContext) -> Tuple[List[str], int]:
     return ["trivy", "image", "-f", "json", "-q", ctx.target], 900
+
+
+def stage_osv_scanner(ctx: RunContext) -> Tuple[List[str], int]:
+    # --no-call-analysis=all: its Rust call analysis runs the target's build
+    # scripts, which is running the target's code. --allow-no-lockfiles: with
+    # none it exits 128 and prints nothing to read; with this it writes an
+    # empty report, which the coverage reads as zero packages and a gap.
+    # --all-packages: the report then lists every package it resolved, which
+    # is the denominator, not only the ones with an advisory.
+    # --offline-vulnerabilities --download-offline-databases: by default it
+    # sends the package list to api.osv.dev to be matched; with these it
+    # downloads each ecosystem's database and matches here, the way trivy
+    # and grype do. Measured on a review target: the same 27 advisories.
+    # Resolving what a manifest pulls in still asks deps.dev about the
+    # manifest's packages; `contributes` says so.
+    return ["osv-scanner", "scan", "source", "-r", "--format", "json",
+            "--all-packages", "--allow-no-lockfiles", "--no-call-analysis=all",
+            "--offline-vulnerabilities", "--download-offline-databases",
+            ctx.target], 600
 
 
 def stage_syft(ctx: RunContext) -> Tuple[List[str], int]:
@@ -160,6 +343,7 @@ STAGE_KNOBS: Dict[str, Tuple[str, ...]] = {
     "cloud-frontdoor": ("cloud_inventory_budget", "cloud_call_timeout"),
     "zap-baseline": ("zap_spider_minutes", "zap_memory_mb"),
     "zap-active": ("zap_active_spider_minutes", "zap_startup_wait", "zap_memory_mb"),
+    "schemathesis": ("schemathesis_examples",),
 }
 
 
@@ -221,6 +405,40 @@ def container_name(stage: str, ctx: RunContext) -> str:
     run_id = os.path.basename(str(getattr(ctx, "run_dir", "") or "").rstrip("/")) or "run"
     safe = "".join(c if c.isalnum() or c in "_.-" else "-" for c in run_id)
     return "squawk-%s-%s" % (stage, safe)
+
+
+#: FastAPI, and most OpenAPI frameworks, serve the schema at this path. A
+#: target that already names a schema file is used as given.
+_SCHEMA_SUFFIXES = (".json", ".yaml", ".yml")
+
+
+def schema_url(target: str) -> str:
+    """The OpenAPI schema URL for a target: the target itself when it already
+    names a schema document, else its `/openapi.json`."""
+    t = (target or "").rstrip("/")
+    low = t.lower().split("?")[0]
+    return t if low.endswith(_SCHEMA_SUFFIXES) else t + "/openapi.json"
+
+
+def stage_schemathesis(ctx: RunContext) -> Tuple[List[str], int]:
+    # Property-based testing of a RUNNING API from its OpenAPI schema. It
+    # generates requests for every operation and checks the responses:
+    # conformance to the schema, unhandled 5xx errors, and the documented status
+    # codes. It sends writes (POST/PUT/DELETE are operations like any other),
+    # so it runs only under the url scope behind dast_target_ok, against a
+    # throwaway target you own.
+    #
+    # It writes a JSON run report (--report json) to the raw file, which the
+    # normalizer reads; --output-sanitize keeps generated secrets out of it.
+    # cwd is the raw dir so the report path in the report's own `command`
+    # field is a bare name, not an absolute path. A non-zero exit means
+    # failures were found, which the runner treats as findings, not an error.
+    n = knob(ctx, "schemathesis", "schemathesis_examples")
+    report = os.path.basename(ctx.raw_path)
+    return (["schemathesis", "run", schema_url(ctx.target),
+             "--checks", "all", "-n", n,
+             "--report", "json", "--report-json-path", report,
+             "--output-sanitize", "true", "--no-color"], 2400)
 
 
 def stage_zap_baseline(ctx: RunContext) -> Tuple[List[str], int]:
@@ -306,25 +524,72 @@ class StageSpec(NamedTuple):
     # An internal stage returns the raw JSON, or (json, status, detail) to
     # declare its own outcome — "I could not look" instead of an empty result.
     internal: Optional[Callable[["RunContext"], "Union[str, Tuple[str, str, str]]"]] = None
+    # A configuration the scanner is pinned to, written by the runner at
+    # `config_path(raw)` just before the scan and sealed with the run. The
+    # builder only names the path: `config show` calls builders to print what
+    # would run, and a builder that wrote files would write them there too.
+    config: str = ""
+    config_suffix: str = ".config.yaml"
+    # Run from the run's own raw directory rather than wherever Squawk was
+    # started, for a scanner that reads a file from its working directory.
+    cwd_raw: bool = False
+    # Files the runner copies into the raw directory before the scan, as
+    # (source, path under raw/), each recorded with its sha256 and sealed
+    # with the run: the rules a finding came from are evidence too.
+    bundle: Optional[Callable[["RunContext"], List[Tuple[str, str]]]] = None
+
+
+def config_path(raw_path: str, suffix: str = ".config.yaml") -> str:
+    """Where a stage's pinned configuration goes: beside its raw report."""
+    return os.path.splitext(raw_path)[0] + suffix
 
 
 def stage_recon(_ctx: RunContext) -> Tuple[List[str], int]:
     return [], 0  # internal stage; the runner calls spec.internal instead
 
 
+def stage_authz(_ctx: RunContext) -> Tuple[List[str], int]:
+    return [], 0  # internal stage; the runner calls spec.internal instead
+
+
+def stage_webauth(_ctx: RunContext) -> Tuple[List[str], int]:
+    return [], 0  # internal stage; the runner calls spec.internal instead
+
+
 STAGES: Dict[str, StageSpec] = {
     "recon": StageSpec("recon", "discover", stage_recon, internal=recon_probe),
+    "authz": StageSpec("authz", "bola", stage_authz, internal=authz_probe),
+    "webauth": StageSpec("webauth", "authdast", stage_webauth, internal=webauth_probe),
+    "ai-garak": StageSpec("garak", "redteam", stage_recon,
+                           internal=ai_garak_probe),
     "skillaudit": StageSpec("skillaudit", "AST10", stage_recon, internal=skill_audit),
     "selfaudit": StageSpec("selfaudit", "host", stage_recon, internal=self_audit),
     "gitleaks": StageSpec("gitleaks", "detect", stage_gitleaks),
-    "semgrep": StageSpec("semgrep", "auto", stage_semgrep),
+    "trufflehog": StageSpec("trufflehog", "filesystem", stage_trufflehog,
+                            config=TRUFFLEHOG_EXCLUDE,
+                            config_suffix=TRUFFLEHOG_EXCLUDE_SUFFIX),
+    # From the raw directory, so the profile's rules copied there are
+    # named `own-rules.<id>` wherever Squawk runs. The registry's rules and
+    # the files scanned were measured the same from either directory.
+    "semgrep": StageSpec("semgrep", "auto", stage_semgrep, cwd_raw=True,
+                         bundle=semgrep_bundle),
     "bandit": StageSpec("bandit", "recursive", stage_bandit),
     "checkov": StageSpec("checkov", "directory", stage_checkov),
+    "hadolint": StageSpec("hadolint", "dockerfile", stage_hadolint,
+                          config=HADOLINT_CONFIG),
+    "zizmor": StageSpec("zizmor", "workflows", stage_zizmor),
     "trivy-config": StageSpec("trivy", "config", stage_trivy_config),
     "trivy-fs": StageSpec("trivy", "fs", stage_trivy_fs),
     "trivy-image": StageSpec("trivy", "image", stage_trivy_image),
+    # dockle reads `.dockleignore` from its working directory: one there
+    # holding CIS-DI-0001 removed the root-user warning from the run and
+    # counted it as passed (0.4.15). The run's raw directory holds none.
+    "dockle": StageSpec("dockle", "image", stage_dockle, cwd_raw=True),
+    "osv-scanner": StageSpec("osv-scanner", "source", stage_osv_scanner),
     "syft": StageSpec("syft", "sbom", stage_syft, produces="sbom"),
     "grype": StageSpec("grype", "cve", stage_grype, requires="sbom"),
+    "schemathesis": StageSpec("schemathesis", "apifuzz", stage_schemathesis,
+                              writes_report=True, cwd_raw=True),
     "zap-baseline": StageSpec("zap", "baseline", stage_zap_baseline,
                               writes_report=True),
     "zap-active": StageSpec("zap", "active", stage_zap_active,
@@ -359,10 +624,17 @@ STAGES: Dict[str, StageSpec] = {
 # --------------------------------------------------------------------------- #
 
 
+#: The target domains a service belongs to. Every service is grouped under one,
+#: so the listing and the report read by domain. `host` is squawk auditing the
+#: machine it runs on; the rest are target types.
+DOMAINS: Tuple[str, ...] = ("web", "code", "cloud", "ai", "host")
+
+
 class Service(NamedTuple):
     key: str
     label: str
-    scope: str                      # repo | dir | image
+    domain: str                     # one of DOMAINS
+    scope: str                      # repo | dir | image | url | host | aws | note
     stages: Tuple[str, ...]
     rough_time: str
     not_covered: str
@@ -379,54 +651,72 @@ class Service(NamedTuple):
 #: enumerates nothing, so it has no denominator, and the absence of other
 #: findings beside it means nothing at all.
 NOTE_SERVICE = Service(
-    "note", "Operator note", "note", (),
+    "note", "Operator note", "host", "note", (),
     "instant",
     "One finding recorded by hand. This is not a scan: nothing was enumerated, "
     "so there is no denominator and no coverage claim. Other findings being "
     "absent here means only that nobody wrote them down.")
 
 
+#: A decision about findings already recorded (core.py, remediation): sealed
+#: the same way, so a risk acceptance has the same standing as the finding.
+DISPOSITION_SERVICE = Service(
+    "disposition", "Decision on findings", "host", "note", (),
+    "instant",
+    "Decisions about findings already recorded: in progress, fixed, risk "
+    "accepted or false positive. This is not a scan: nothing was examined, "
+    "and a decision is only as good as the evidence it names.")
+
+
 SERVICES: Dict[str, Service] = {
     "preflight": Service(
-        "preflight", "Pre-flight check", "repo",
-        ("gitleaks", "semgrep", "bandit", "checkov", "trivy-config"),
+        "preflight", "Pre-flight check", "code", "repo",
+        ("gitleaks", "trufflehog", "semgrep", "bandit", "checkov", "trivy-config",
+         "hadolint", "zizmor"),
         "~60s", "No SBOM/CVE scan, no DAST, no cloud config."),
     "contraband": Service(
-        "contraband", "Contraband sweep", "repo", ("gitleaks",),
-        "~15s", "Secrets only. No code, dependency, or IaC analysis."),
+        "contraband", "Contraband sweep", "code", "repo", ("gitleaks", "trufflehog"),
+        "~15s", "Secrets only. No code, dependency, or IaC analysis. Whether a "
+        "secret still works is not tested: nothing found is sent to its "
+        "provider."),
     "customs": Service(
-        "customs", "Customs manifest", "repo", ("syft", "grype"),
-        "~70s", "Dependencies only. No source, secret, or IaC analysis."),
+        "customs", "Customs manifest", "code", "repo", ("syft", "grype", "osv-scanner"),
+        "~70s", "Dependencies only. No source, secret, or IaC analysis. The "
+        "packages a manifest pulls in are osv-scanner's prediction of what an "
+        "install would get, not what is installed."),
     "compliance": Service(
-        "compliance", "Compliance audit", "repo", ("checkov", "trivy-config"),
+        "compliance", "Compliance audit", "code", "repo",
+        ("checkov", "trivy-config", "hadolint", "zizmor"),
         "~50s", "IaC/config only. No source, secret, or dependency analysis."),
     "baggage": Service(
-        "baggage", "Baggage check", "dir",
-        ("gitleaks", "semgrep", "bandit", "trivy-fs", "syft", "grype"),
+        "baggage", "Baggage check", "code", "dir",
+        ("gitleaks", "trufflehog", "semgrep", "bandit", "trivy-fs", "syft", "grype",
+         "osv-scanner"),
         "~90s", "No git history (dir scope). No IaC policy, no DAST."),
     "cargo": Service(
-        "cargo", "Cargo scan", "image", ("trivy-image", "syft", "grype"),
+        "cargo", "Cargo scan", "code", "image",
+        ("trivy-image", "syft", "grype", "dockle"),
         "~90s", "Image only. No source, secret, or IaC analysis of the build."),
     "skillaudit": Service(
-        "skillaudit", "Skill audit", "dir", ("skillaudit",),
+        "skillaudit", "Skill audit", "ai", "dir", ("skillaudit",),
         "~15s", "Static AST10 checks on agent skills (SKILL.md) and MCP configs "
         "only. Cannot see runtime behaviour — AST01 malicious execution, AST06 "
         "isolation, and AST08/10 are partial. Maps to the OWASP Agentic Skills "
         "Top 10 (v1.0 2026)."),
     "selfaudit": Service(
-        "selfaudit", "Instrument check", "host", ("selfaudit",),
+        "selfaudit", "Instrument check", "host", "host", ("selfaudit",),
         "~5s", "Audits the machine running the scans, not any target: logging, "
         "evidence permissions and free space, clock synchronisation, host audit "
         "trail, privilege, PATH and code integrity, database freshness. It "
         "cannot tell you the host is uncompromised. It checks the conditions "
         "that make a finding trustworthy, not the absence of an intruder."),
     "recon": Service(
-        "recon", "Target recon", "url", ("recon",),
+        "recon", "Target recon", "web", "url", ("recon",),
         "~20s", "Discovery only — finds reachable web apps on the target and "
         "offers each as a DAST target. Sends no attacks; a private target you "
         "own is still required."),
     "liveprobe": Service(
-        "liveprobe", "Live app probe", "url", ("zap-baseline",),
+        "liveprobe", "Live app probe", "web", "url", ("zap-baseline",),
         "~5-10min", "Passive DAST baseline of a RUNNING app: it crawls, with "
         "the AJAX spider so a single-page app is more than its static shell, "
         "and reads the responses for misconfiguration and information "
@@ -434,8 +724,45 @@ SERVICES: Dict[str, Service] = {
         "business logic are not tested — their absence here is a coverage "
         "limit, not a clean result. The URL count on the run says how much of "
         "the app it reached. Point it at a target you own on a private network."),
+    "apiprobe": Service(
+        "apiprobe", "API probe", "web", "url", ("schemathesis",),
+        "~2-15min", "Property-based testing of a RUNNING API from its OpenAPI "
+        "schema (Schemathesis): it generates requests for every operation and "
+        "checks conformance, unhandled 5xx errors and schema validity. It sends "
+        "writes, so point it at a throwaway target you own; it does not send "
+        "attack payloads (that is activeprobe). It cannot test authorization "
+        "or business logic, and an operation missing from the schema is not "
+        "tested — the operation count says how much was covered."),
+    "authprobe": Service(
+        "authprobe", "Object authorization probe", "web", "url", ("authz",),
+        "~10s", "Tests object-level authorization on a RUNNING API (BOLA, OWASP "
+        "API1): it reads the OpenAPI schema, seeds one canary object per request "
+        "identity, and checks whether one identity can read another's object by "
+        "its ID or see it in a listing. It sends writes to seed and then deletes "
+        "its canaries, so point it at a throwaway target you own. The two "
+        "identities come from SQUAWK_AUTHZ_A and SQUAWK_AUTHZ_B (header specs), "
+        "never argv. It does not test function-level authorization (BFLA), "
+        "field-level exposure, or an API with no create-and-read-by-id pair."),
+    "authdast": Service(
+        "authdast", "Authenticated app probe", "web", "url", ("webauth",),
+        "~10s", "Authenticated DAST of a RUNNING web app: it logs in with "
+        "credentials from the environment (SQUAWK_WEBAUTH_A=user:pass, never "
+        "argv) and runs the authenticated checks against the session it gets — "
+        "session cookie flags (HttpOnly / Secure / SameSite), username "
+        "enumeration at the login, a protected path that answers the same with "
+        "no session as with one, a protected path reachable by spoofing a "
+        "client header (X-Forwarded-For and kin), and a session cookie signed "
+        "with a weak or known key (Flask/itsdangerous, forgeable). The login "
+        "path defaults to /login; set SQUAWK_WEBAUTH_PATH, _METHOD and _FIELDS "
+        "to match the app, _EXTRA for hidden form fields (an OAuth client_id, a "
+        "CSRF token), _SECRETS / _SECRET_FILE for candidate signing keys, and "
+        "SQUAWK_WEBAUTH_PATHS for the protected paths to check. It sends login "
+        "traffic to a running app, so it runs only against a private address, "
+        "or a public one you acknowledged with SQUAWK_DAST_ACK. It tests only "
+        "the checks in its registry, not the whole authenticated surface, and "
+        "it cannot tell whether you own the target; nothing can."),
     "activeprobe": Service(
-        "activeprobe", "Active app probe", "url", ("zap-active",),
+        "activeprobe", "Active app probe", "web", "url", ("zap-active",),
         "~20-60min", "Active DAST of a RUNNING app: ZAP's active scanner sends "
         "real attack traffic (injection, traversal, command-execution probes) "
         "to find what a passive baseline cannot — SQLi, XSS and their kin. "
@@ -447,8 +774,21 @@ SERVICES: Dict[str, Service] = {
         "runs only against a private address, or a public one you have "
         "acknowledged with SQUAWK_DAST_ACK. It cannot tell whether you own "
         "the target; nothing can. That part is on you."),
+    "ai-probe": Service(
+        "ai-probe", "AI app probe", "ai", "url", ("ai-garak",), "~15-40min",
+        "Red-teams a RUNNING LLM app by orchestrating garak (NVIDIA's LLM "
+        "vulnerability scanner); squawk never imports it. It runs garak's "
+        "promptinject, latentinjection, dan and sysprompt_extraction probe "
+        "families and reports each probe's attack-success rate. Only those "
+        "four families run, so a weakness outside them is untested, not absent; "
+        "it tests DIRECT injection (the probe is the request), not indirect "
+        "(planted in the app's own data), and it is only as good as garak's "
+        "probes. It sends real attack traffic, so it runs behind the same DAST "
+        "rail as the ZAP probes -- a private target, or a public one "
+        "acknowledged with SQUAWK_DAST_ACK. garak reads REST_API_KEY for the "
+        "endpoint's key; squawk never holds it."),
     "cloudinventory": Service(
-        "cloudinventory", "Cloud inventory (AWS)", "aws",
+        "cloudinventory", "Cloud inventory (AWS)", "cloud", "aws",
         ("cloud-org", "cloud-inventory", "cloud-enablement",
          "cloud-iam", "cloud-edge", "cloud-frontdoor", "cloud-storage",
          "cloud-containers", "cloud-dataservices", "cloud-analyzer"),
@@ -475,7 +815,7 @@ SERVICES: Dict[str, Service] = {
         "and shown beside the policy readers here; where it runs none, those "
         "readers are the only answer and say so."),
     "cloudaws": Service(
-        "cloudaws", "AWS Security Hub", "aws", ("securityhub-findings",),
+        "cloudaws", "AWS Security Hub", "cloud", "aws", ("securityhub-findings",),
         "~1-3min", "Reads the findings the account already holds in Security Hub, "
         "as the read-only identity in your AWS credential chain. Squawk never "
         "stores a credential and never passes one on the command line. It does "
@@ -686,17 +1026,25 @@ def dast_target_live(url: str, timeout: float = 4.0) -> Tuple[bool, str]:
 
 
 __all__ = [
+    'DISPOSITION_SERVICE',
+    'DOMAINS',
+    'HADOLINT_CONFIG',
     'NOTE_SERVICE',
     'READ_ONLY_POLICIES',
     'SERVICES',
     'STAGES',
     'STAGE_KNOBS',
+    'TRUFFLEHOG_EXCLUDE',
+    'TRUFFLEHOG_EXCLUDE_SUFFIX',
     'WRITE_CAPABLE',
     'ZAP_ACTIVE_SPIDER_MINS',
     'ZAP_IMAGE',
     'ZAP_JVM_PROPS',
     'ZAP_SPIDER_MINS',
     'ZAP_STARTUP_WAIT',
+    '_NOT_A_DOCKERFILE',
+    '_SCHEMA_SUFFIXES',
+    '_WORKFLOW_SUFFIXES',
     'Service',
     'StageSpec',
     '_attached_policies',
@@ -705,23 +1053,37 @@ __all__ = [
     'aws_identity',
     'aws_identity_readonly',
     'cloud_target_ok',
+    'config_path',
     'container_name',
     'dast_target_live',
     'dast_target_ok',
+    'dockerfiles_in',
+    'is_dockerfile',
     'knob',
     'memory_args',
     'probes_a_named_port',
+    'schema_url',
+    'semgrep_bundle',
+    'stage_authz',
     'stage_bandit',
     'stage_checkov',
+    'stage_dockle',
     'stage_gitleaks',
     'stage_grype',
+    'stage_hadolint',
+    'stage_osv_scanner',
     'stage_recon',
+    'stage_schemathesis',
     'stage_securityhub',
     'stage_semgrep',
     'stage_syft',
     'stage_trivy_config',
     'stage_trivy_fs',
     'stage_trivy_image',
+    'stage_trufflehog',
+    'stage_webauth',
     'stage_zap_active',
     'stage_zap_baseline',
+    'stage_zizmor',
+    'workflow_files_in',
 ]

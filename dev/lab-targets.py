@@ -447,15 +447,19 @@ TARGETS: List[dict] = [
     {"name": "Dockerfile, built badly", "corpus": "dockerfiles/bad",
      "service": "compliance", "flag": "--repo",
      "must": {"checkov": ["CKV_DOCKER_3", "CKV_DOCKER_2", "CKV_DOCKER_7"],
-              "trivy": ["DS-0002", "DS-0001", "DS-0026", "DS002", "DS001", "DS026"]},
+              "trivy": ["DS-0002", "DS-0001", "DS-0026", "DS002", "DS001", "DS026"],
+              # :latest and ADD; measured 6 with hadolint 2.15.1 (2026-10-22)
+              "hadolint": ["DL3007", "DL3020"]},
      "must_not": {}, "min_findings": 3,
      "why": "root, :latest, curl | sh, ADD, port 22, no HEALTHCHECK — both IaC scanners "
-            "name them"},
+            "name them, and hadolint names :latest and ADD"},
     {"name": "Dockerfile, built carefully", "corpus": "dockerfiles/good",
      "service": "compliance", "flag": "--repo",
      "must": {},
      "must_not": {"checkov": ["CKV_DOCKER_3", "CKV_DOCKER_2", "CKV_DOCKER_7"],
-                  "trivy": ["DS-0002", "DS-0001", "DS-0026", "DS002", "DS001", "DS026"]},
+                  "trivy": ["DS-0002", "DS-0001", "DS-0026", "DS002", "DS001", "DS026"],
+                  # measured 1, DL3066 (a user named, not numbered)
+                  "hadolint": ["DL3007", "DL3020", "DL3008", "DL4006"]},
      "min_findings": 0,
      "why": "pinned base, USER, COPY, HEALTHCHECK — none of the bad one's ids appear"},
     {"name": "k8s pod, built badly", "corpus": "k8s/bad",
@@ -481,16 +485,22 @@ TARGETS: List[dict] = [
               # 35jh = CVE-2021-23337, 29mw = CVE-2020-28500 (lodash)
               "grype": ["CVE-2018-1000656", "CVE-2019-1010083", "CVE-2020-8203",
                         "CVE-2021-23337", "GHSA-562c-5r94-xh97", "GHSA-5wv5-4vpf-pj6m",
-                        "GHSA-35jh-r3h4-6jhm", "GHSA-29mw-wpgm-hmr9"]},
+                        "GHSA-35jh-r3h4-6jhm", "GHSA-29mw-wpgm-hmr9"],
+              # by CVE when the advisory group has one (osv-scanner 2.7.0)
+              "osv-scanner": ["CVE-2018-1000656", "CVE-2019-1010083", "CVE-2020-8203",
+                              "CVE-2021-23337"]},
      "must_not": {}, "min_findings": 2,
      "why": "flask 0.12.2 and lodash 4.17.15 — both CVE scanners find them; the differential "
             "stays silent"},
     {"name": "a vulnerable image", "corpus": None, "target": "bkimminich/juice-shop:latest",
      "service": "cargo", "flag": "--target",
-     "must": {"trivy": ["CVE-"], "grype": ["CVE-", "GHSA-"]},
-     "must_not": {}, "min_findings": 5,
+     "must": {"trivy": ["CVE-"], "grype": ["CVE-", "GHSA-"],
+              # the :latest tag and no HEALTHCHECK (dockle 0.4.15, 2026-10-23)
+              "dockle": ["DKL-DI-0006", "CIS-DI-0006"]},
+     # it runs as a numbered non-root user, so dockle must not say root
+     "must_not": {"dockle": ["CIS-DI-0001"]}, "min_findings": 5,
      "why": "the Juice Shop image carries known npm CVEs; both CVE scanners find them; the "
-            "differential stays silent"},
+            "differential stays silent; dockle names the :latest tag and not a root user"},
     {"name": "Juice Shop, discovered", "corpus": None, "target": "http://127.0.0.1:3000",
      "service": "recon", "flag": "--target", "needs_port": 3000,
      "must": {"recon": ["3000:/", "3000:catch-all"]},
@@ -757,6 +767,28 @@ def aws_account_of(profile: str) -> Tuple[Optional[str], str]:
         return None, "an answer with no account in it"
 
 
+def aws_endpoint_of(profile: str) -> str:
+    """Where the CLI sends this profile's calls when that is not AWS -- an
+    emulator such as dev/moto-lab -- or "" when it is AWS. Read from the
+    environment and the profile's configuration; no request is made, and the
+    CLI reads the file, not this.
+
+    A `validated` row is what a release ships on, and an emulator answering
+    in AWS's shape is not AWS. So a run with an override says so in every
+    row. Not read: a `services` section in the config file. A run sent
+    elsewhere that way is still called AWS here."""
+    for k in sorted(os.environ):
+        if k == "AWS_ENDPOINT_URL" or k.startswith("AWS_ENDPOINT_URL_"):
+            if os.environ[k].strip():
+                return os.environ[k].strip()
+    try:
+        res = subprocess.run(["aws", "configure", "get", "endpoint_url", "--profile", profile],
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
 def cloud_env(profile: str) -> Dict[str, str]:
     """The run's environment: this profile and nothing that could override it.
     Keys in the environment outrank a profile in the CLI's chain, so a
@@ -840,16 +872,25 @@ def check_cloud_target(t: dict, ev: str, aws: Optional[Dict[str, str]]) -> None:
             CLOUD_RESULTS.append((tool, "failed", "named %s" % ", ".join(hits)))
     for tool in t["stages"]:
         if tool in usable:
-            CLOUD_RESULTS.append((tool, "validated", "read the lab and named what it planted"))
+            CLOUD_RESULTS.append((tool, "validated off AWS" if aws.get("endpoint") else
+                                  "validated", "read the lab and named what it planted"))
 
 
-def write_cloud_report(path: str, account: str) -> None:
-    """The record a release reads to decide what it may ship."""
-    lines = ["# Cloud validation", "",
-             "Run %s against test account %s." % (time.strftime("%Y-%m-%d %H:%M"),
-                                                  masked(account)),
-             "A stage ships only if it is `validated` here.", "",
-             "| stage | result | detail |", "|---|---|---|"]
+def write_cloud_report(path: str, account: str, endpoint: str = "") -> None:
+    """The record a release reads to decide what it may ship. A run against
+    an endpoint that is not AWS says so at the top and in every row."""
+    when = time.strftime("%Y-%m-%d %H:%M")
+    if endpoint:
+        head = ["Run %s against %s, which is not AWS, as account %s."
+                % (when, endpoint, masked(account)),
+                "`validated off AWS` means the stage read AWS-shaped answers from that "
+                "endpoint and named what the lab planted. Nothing ships on this report: "
+                "a stage ships only when a run against a real test account says `validated`."]
+    else:
+        head = ["Run %s against test account %s." % (when, masked(account)),
+                "A stage ships only if it is `validated` here."]
+    lines = ["# Cloud validation", "", *head, "", "| stage | result | detail |",
+             "|---|---|---|"]
     for tool, result, detail in CLOUD_RESULTS:
         lines.append("| %s | %s | %s |" % (tool, result, detail.replace("|", "/")))
     with open(path, "w", encoding="utf-8") as fh:
@@ -876,7 +917,11 @@ def cmd_check(args: argparse.Namespace) -> int:
                   "account %s. Nothing was run." % (args.aws_profile, masked(got),
                                                      masked(args.aws_account)))
             return 2
-        aws = {"profile": args.aws_profile, "account": args.aws_account, "lab": args.aws_lab}
+        aws = {"profile": args.aws_profile, "account": args.aws_account, "lab": args.aws_lab,
+               "endpoint": aws_endpoint_of(args.aws_profile)}
+        if aws["endpoint"]:
+            print("cloud: the profile calls %s, not AWS — no row below can say `validated`"
+                  % aws["endpoint"])
         print("cloud: profile %s · account %s · lab %s"
               % (args.aws_profile, masked(args.aws_account), args.aws_lab))
     ev = args.evidence or tempfile.mkdtemp(prefix="squawk-lab-ev-")
@@ -889,7 +934,8 @@ def cmd_check(args: argparse.Namespace) -> int:
         else:
             check_target(t, args.lab, ev, args.host)
     if args.report:
-        write_cloud_report(args.report, args.aws_account or "")
+        write_cloud_report(args.report, args.aws_account or "",
+                           (aws or {}).get("endpoint", ""))
         print("cloud validation written to %s" % args.report)
     section("Result")
     print("  %d passed, %d failed, %d skipped" % (PASS, FAIL, SKIP))

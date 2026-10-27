@@ -233,11 +233,23 @@ if [ "$MODE" = detect ]; then
       printf '  %-9s install   vendor installer over https (needs curl)\n' "$logical"
     fi
   done
-  for logical in semgrep bandit checkov; do
+  for logical in semgrep bandit checkov zizmor schemathesis; do
     if have "$logical"; then
       printf '  %-9s present   %s\n' "$logical" "$(ver "$logical")"
     else
       printf '  %-9s install   pipx, into $HOME, no privilege needed\n' "$logical"
+    fi
+  done
+  if have trufflehog; then
+    printf '  %-9s present   %s\n' trufflehog "$(ver trufflehog)"
+  else
+    printf '  %-9s install   vendor installer over https (needs curl)\n' trufflehog
+  fi
+  for logical in hadolint dockle osv-scanner; do
+    if have "$logical"; then
+      printf '  %-9s present   %s\n' "$logical" "$(ver "$logical")"
+    else
+      printf '  %-9s install   release binary over https, checked against its checksum file\n' "$logical"
     fi
   done
   echo
@@ -394,7 +406,7 @@ fi
 # --- Python scanners via pipx ----------------------------------------------
 if [ "$MODE" = update ]; then
   if have pipx; then
-    add "pipx: upgrading semgrep, bandit, checkov"
+    add "pipx: upgrading semgrep, bandit, checkov, zizmor, schemathesis"
     # Output kept. "ok pipx tools" was true whether three tools upgraded or
     # none did, which makes it not worth printing.
     if PIPX_OUT="$(pipx upgrade-all 2>&1)"; then
@@ -404,10 +416,10 @@ if [ "$MODE" = update ]; then
       printf '%s\n' "$PIPX_OUT" | sed 's/^/       /'
       bad "pipx upgrade-all reported a problem"
     fi
-    for t in semgrep bandit checkov; do have "$t" && okv "$t"; done
+    for t in semgrep bandit checkov zizmor schemathesis; do have "$t" && okv "$t"; done
   fi
 else
-  for tool in semgrep bandit checkov; do
+  for tool in semgrep bandit checkov zizmor schemathesis; do
     if have "$tool"; then okv "$tool"; else
       add "pipx: $tool"
       if pipx install "$tool" >/dev/null 2>&1; then okv "$tool"; else
@@ -451,12 +463,123 @@ install_bin() { # name  url
 }
 install_bin syft  https://raw.githubusercontent.com/anchore/syft/main/install.sh version
 install_bin grype https://raw.githubusercontent.com/anchore/grype/main/install.sh version
+# trufflehog's script checks the release checksum itself before it installs.
+install_bin trufflehog \
+  https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh
 if [ "$MODE" = update ] && ! have trivy; then :; else
   if [ "$MODE" = install ] && have trivy; then okv trivy; else
     add "installer: trivy"
     run_vendor_installer trivy \
       https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
       && okv trivy
+  fi
+fi
+
+# --- Single-binary scanners from their GitHub releases ----------------------
+# These publish no install script, only the binary and a checksum file in the
+# same release. Both are fetched, the binary is checked against the checksum
+# file and refused on a mismatch, and only then installed: into /usr/local/bin
+# with privilege, into ~/.local/bin without (already on PATH above). A
+# checksum from the same server proves the download is the file the release
+# published, not that the release is trustworthy; the sha256 is recorded so a
+# change between two installs is visible.
+REL_OS=""; REL_ARCH=""
+case "$(uname -s)" in Linux) REL_OS=linux ;; Darwin) REL_OS=macos ;; esac
+case "$(uname -m)" in x86_64|amd64) REL_ARCH=x86_64 ;; aarch64|arm64) REL_ARCH=arm64 ;; esac
+if [ "$PRIV" = none ]; then REL_DIR="$HOME/.local/bin"; else REL_DIR=/usr/local/bin; fi
+
+sha256_of() {
+  if have sha256sum; then sha256sum "$1" | awk '{print $1}'
+  elif have shasum; then shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+install_release() { # name  binary-or-archive-url  checksums-url  [member-in-tar.gz]
+  local tmp sums asset want got bytes xdir src
+  if [ "$MODE" = install ] && have "$1"; then okv "$1"; return; fi
+  [ "$MODE" = update ] && ! have "$1" && return   # update does not add new tools
+  if [ -z "$REL_OS" ] || [ -z "$REL_ARCH" ] || [ -z "$2" ]; then
+    add "$1: no release binary for $(uname -s) $(uname -m) — install it by hand"
+    return
+  fi
+  add "release: $1"
+  tmp="$(mktemp)" || { bad "$1 — could not create a temp file"; return 1; }
+  sums="$(mktemp)" || { bad "$1 — could not create a temp file"; rm -f "$tmp"; return 1; }
+  if ! curl -sSfL "$2" -o "$tmp" || ! curl -sSfL "$3" -o "$sums"; then
+    bad "$1 — download failed from $2"
+    fact "{\"kind\":\"download\",\"tool\":\"$1\",\"url\":\"$2\",\"ok\":false}"
+    rm -f "$tmp" "$sums"; return 1
+  fi
+  asset="${2##*/}"
+  # `<sum>  <asset>` or `<sum> *<asset>`; the asset is matched whole.
+  want="$(awk -v a="$asset" '$2 == a || $2 == "*" a {print $1; exit}' "$sums")"
+  got="$(sha256_of "$tmp")"
+  bytes="$(wc -c < "$tmp" | tr -d ' ')"
+  if [ -z "$want" ] || [ "$want" != "$got" ]; then
+    bad "$1 — checksum ${got:-unknown} is not the release's ${want:-(no entry for $asset)}; not installed"
+    fact "{\"kind\":\"download\",\"tool\":\"$1\",\"url\":\"$2\",\"sha256\":\"${got:-unknown}\",\"ok\":false}"
+    rm -f "$tmp" "$sums"; return 1
+  fi
+  fact "{\"kind\":\"download\",\"tool\":\"$1\",\"url\":\"$2\",\"sha256\":\"$got\",\"bytes\":${bytes:-0},\"ok\":true}"
+  add "$1: fetched $bytes bytes, sha256 ${got:0:16}... matches the release"
+  src="$tmp"; xdir=""
+  if [ -n "${4:-}" ]; then
+    # The checksum covers the archive; the binary is taken out of it after.
+    xdir="$(mktemp -d)" || { bad "$1 — could not create a temp directory"; rm -f "$tmp" "$sums"; return 1; }
+    if ! tar -xzf "$tmp" -C "$xdir" "$4"; then
+      bad "$1 — $4 is not in the archive"
+      rm -rf "$tmp" "$sums" "$xdir"; return 1
+    fi
+    src="$xdir/$4"
+  fi
+  if [ "$PRIV" = none ]; then mkdir -p "$REL_DIR"; fi
+  if $SUDO install -m 0755 "$src" "$REL_DIR/$1"; then
+    rm -rf "$tmp" "$sums" ${xdir:+"$xdir"}; okv "$1"; return 0
+  fi
+  bad "$1 — could not install into $REL_DIR"
+  rm -rf "$tmp" "$sums" ${xdir:+"$xdir"}; return 1
+}
+
+# The tag GitHub's `latest` redirect lands on, for a release whose asset names
+# carry the version. Empty when it cannot be read.
+latest_tag() { # owner/repo
+  curl -sSfLI -o /dev/null -w '%{url_effective}' "https://github.com/$1/releases/latest" \
+    2>/dev/null | sed -n 's#.*/releases/tag/##p'
+}
+
+HADOLINT_REL=https://github.com/hadolint/hadolint/releases/latest/download
+install_release hadolint "$HADOLINT_REL/hadolint-$REL_OS-$REL_ARCH" \
+  "$HADOLINT_REL/checksums.sha256"
+
+# osv-scanner names its platforms the Go way: darwin, amd64.
+OSV_REL=https://github.com/google/osv-scanner/releases/latest/download
+OSV_PLAT=""
+case "$REL_OS-$REL_ARCH" in
+  linux-x86_64) OSV_PLAT=linux_amd64 ;;  linux-arm64) OSV_PLAT=linux_arm64 ;;
+  macos-x86_64) OSV_PLAT=darwin_amd64 ;; macos-arm64) OSV_PLAT=darwin_arm64 ;;
+esac
+install_release osv-scanner "${OSV_PLAT:+$OSV_REL/osv-scanner_$OSV_PLAT}" \
+  "$OSV_REL/osv-scanner_SHA256SUMS"
+
+# dockle's asset names carry the version, so the tag is read first, and only
+# when there is something to fetch.
+if { [ "$MODE" = install ] && have dockle; } || { [ "$MODE" = update ] && ! have dockle; }; then
+  install_release dockle "" ""     # present, or not installed on update: no fetch
+else
+  DOCKLE_PLAT=""
+  case "$REL_OS-$REL_ARCH" in
+    linux-x86_64) DOCKLE_PLAT=Linux-64bit ;;  linux-arm64) DOCKLE_PLAT=Linux-ARM64 ;;
+    macos-x86_64) DOCKLE_PLAT=macOS-64bit ;;  macos-arm64) DOCKLE_PLAT=macOS-ARM64 ;;
+  esac
+  DOCKLE_TAG="$(latest_tag goodwithtech/dockle)"
+  if [ -z "$DOCKLE_TAG" ]; then
+    bad "dockle — could not read the latest release tag from github.com"
+  else
+    DOCKLE_REL="https://github.com/goodwithtech/dockle/releases/download/$DOCKLE_TAG"
+    DOCKLE_V="${DOCKLE_TAG#v}"
+    install_release dockle \
+      "${DOCKLE_PLAT:+$DOCKLE_REL/dockle_${DOCKLE_V}_$DOCKLE_PLAT.tar.gz}" \
+      "$DOCKLE_REL/dockle_${DOCKLE_V}_checksums.txt" dockle
   fi
 fi
 

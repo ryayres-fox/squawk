@@ -5,12 +5,14 @@ import datetime
 import html
 import json
 import os
+import shutil
 import socket
 import sys
+import tempfile
 import time
 from http.server import BaseHTTPRequestHandler
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 from squawk.analysis import (
     CLOUD_DRILL,
@@ -68,6 +70,13 @@ from squawk.baselines import (
     resolve_gh_repo,
     sync_baselines,
 )
+from squawk.checklist import (
+    checklist_items,
+    current_checks,
+    load_checklist,
+    record_check,
+    signoff_state,
+)
 from squawk.core import (
     BASE_TITLE,
     LOG,
@@ -90,6 +99,17 @@ from squawk.core import (
     tool_path,
 )
 from squawk.decisions import current_decisions, record_decision, summarize
+from squawk.engagements import (
+    engagement_for,
+    engagement_names,
+    group_by_engagement,
+    hidden_reports,
+    hide_report,
+    load_engagements,
+    remove_engagement,
+    resolve_engagement,
+    unhide_report,
+)
 from squawk.engine import profile_for
 from squawk.evidence import (
     count_runs,
@@ -119,6 +139,16 @@ from squawk.feeds import (
     load_feeds,
     load_intel,
     rank_run,
+)
+from squawk.report import (
+    AUDIENCES,
+    html_to_pdf,
+    pdf_browser,
+    sessions_of,
+    share_csv,
+    share_file_name,
+    share_html,
+    share_model,
 )
 from squawk.retention import prune_record
 from squawk.runtime import (
@@ -164,6 +194,7 @@ ICONS = {
     "triage": "<path d='M9 11l3 3 8-8M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5"
               "a2 2 0 0 1 2-2h11'/>",
     "baselines": "<path d='M12 3v18M3 12h18M7.5 7.5l9 9M16.5 7.5l-9 9'/>",
+    "reports": "<path d='M6 2h9l5 5v15H6z'/><path d='M14 2v6h6M9 13h8M9 17h8'/>",
     "rescan": ("<path d='M3 12a9 9 0 0 1 15-6.7L21 8M21 3v5h-5'/>"
                "<path d='M21 12a9 9 0 0 1-15 6.7L3 16M3 21v-5h5'/>"),
     "compare": ("<path d='M12 3v18'/><path d='M7 8l-4 4 4 4'/>"
@@ -673,6 +704,8 @@ def page(title: str, body: str, active: str = "",
                  ("estate", "findings", "Estate"),
                  ("priority", "priority", "Priority"),
                  ("intel", "priority", "Intel"), ("triage", "triage", "Triage"),
+                 ("checklist", "triage", "Checklist"),
+                 ("reports", "reports", "Reports"),
                  ("history", "history", "History"),
                  ("cloud", "cloud", "Cloud"),
                  ("baselines", "baselines", "Baselines")]
@@ -1051,8 +1084,10 @@ def _fmt_verify_time(stamp: str) -> str:
     return time.strftime("%d %b %Y %H:%M UTC", t)
 
 
-def view_overview(root: str) -> str:
-    """The landing page: estate posture at a glance — the summary before the detail."""
+def view_overview(root: str, engagement: Optional[str] = None) -> str:
+    """The landing page: estate posture at a glance — the summary before the
+    detail. With an `engagement` it scopes the whole page to that engagement's
+    targets; without one it groups the targets by engagement."""
     runs = list_runs(root)
     if not runs:
         return (
@@ -1064,6 +1099,19 @@ def view_overview(root: str) -> str:
     # The split lives in evidence.estate_runs so every page that answers "what
     # do I look after" answers it the same way.
     live, vanished, by_target = estate_runs(root)
+
+    # Engagements: a target's engagement is the mapping assignment, else its run
+    # tag, else Unassigned. Options come from the FULL estate (so the dropdown can
+    # switch away from the current scope); then `live` is narrowed to the pick.
+    eng_map = load_engagements(root)
+    eng_options = engagement_names(live.values(), eng_map)
+    engagement = resolve_engagement(engagement, live.values(), eng_map)
+    if engagement is not None:
+        live = {k: m for k, m in live.items()
+                if engagement_for(m, eng_map) == engagement}
+        # Scope the whole page, not just the targets table: the activity strip
+        # and recent-runs list narrow to this engagement too.
+        runs = [m for m in runs if engagement_for(m, eng_map) == engagement]
 
     sev_totals: Dict[str, int] = {s: 0 for s in SEVERITY_ORDER}
     for m in live.values():
@@ -1094,8 +1142,7 @@ def view_overview(root: str) -> str:
                 "scan — this is a gap, not a clean result'>"
                 "<span class='mark' style='background:var(--gap)'>&#9650;</span>"
                 "gap</span>")
-    target_rows = []
-    for m in sorted(live.values(), key=risk, reverse=True):
+    def target_row(m: dict) -> str:
         sv = m.get("severities", {})
         incomplete = _run_incomplete(m)
         links = " ".join(
@@ -1116,7 +1163,7 @@ def view_overview(root: str) -> str:
         else:
             chips = sev_pill("low", 0).replace("low 0", "clean")
         ago, stale = rel_time(m["run_id"])
-        target_rows.append(
+        return (
             "<tr><td><b>%s</b><div class='mono muted' style='font-size:.72rem'>%s</div>"
             "<div class='muted' style='font-size:.7rem'>%s</div></td>"
             "<td>%s</td><td class='sparkcell'>%s</td>"
@@ -1132,6 +1179,58 @@ def view_overview(root: str) -> str:
                " <span class='stale'>stale</span>" if stale else "",
                rescan_form(m.get("service", ""), m.get("target", ""), "Rescan"),
                E(m["run_id"])))
+
+    ordered = sorted(live.values(), key=risk, reverse=True)
+    thead = ("<thead><tr><th>Target</th><th>Open findings</th><th>Trend</th>"
+             "<th>Last scan</th><th></th></tr></thead>")
+
+    def rows_table(members: list) -> str:
+        return "<table>%s<tbody>%s</tbody></table>" % (
+            thead, "".join(target_row(m) for m in members))
+
+    engagement_view = engagement is None and len(eng_options) > 1
+    if engagement_view:
+        # The top level is an engagement overview: one row per engagement with its
+        # aggregate risk and last scan. No targets are listed here — you drill into
+        # them by opening the engagement.
+        mapped = {str(a.get("engagement") or "").strip()
+                  for a in eng_map.get("assignments", [])}
+        erows = []
+        for name, members in group_by_engagement(ordered, eng_map).items():
+            if not members:
+                continue
+            tot = {s: sum(m.get("severities", {}).get(s, 0) for m in members)
+                   for s in SEVERITY_ORDER}
+            pills = (" ".join(sev_pill(s, tot[s]) for s in SEVERITY_ORDER if tot[s])
+                     or "<span class='muted'>clean</span>")
+            if any(_run_incomplete(m) for m in members):
+                pills += " " + gap_pill
+            newest = max(members, key=lambda m: m["run_id"])
+            ago, stale = rel_time(newest["run_id"])
+            # A mapping-defined engagement can be unmapped from here; one defined
+            # only by its run tags has no mapping to remove, so no control.
+            remove = ("" if name not in mapped else
+                      "<form method='post' action='/engagement/remove' "
+                      "style='display:inline;margin-left:.6rem' onsubmit=\"return "
+                      "confirm('Unmap %s? Its targets fall back to Unassigned; no "
+                      "runs are deleted.')\"><input type='hidden' name='engagement' "
+                      "value='%s'><button class='btn ghost' style='padding:.05rem "
+                      ".45rem;font-size:.72rem'>remove</button></form>"
+                      % (E(name), E(name)))
+            erows.append(
+                "<tr><td><a href='/overview?engagement=%s' style='text-decoration:"
+                "none'><b>%s</b></a><div class='muted' style='font-size:.72rem'>%d "
+                "target%s</div></td><td>%s</td>"
+                "<td class='muted' title='%s'>%s%s</td>"
+                "<td><a href='/overview?engagement=%s'>view targets &rarr;</a>%s</td></tr>"
+                % (E(name), E(name), len(members), "" if len(members) == 1 else "s",
+                   pills, E(_fmt_run_time(newest["run_id"])), E(ago),
+                   " <span class='stale'>stale</span>" if stale else "", E(name), remove))
+        targets_html = ("<table><thead><tr><th>Engagement</th><th>Open findings</th>"
+                        "<th>Last scan</th><th></th></tr></thead><tbody>%s</tbody>"
+                        "</table>" % "".join(erows))
+    else:
+        targets_html = rows_table(ordered)
 
     recent = "".join(
         "<tr><td class='muted' style='white-space:nowrap'>%s</td>"
@@ -1204,9 +1303,26 @@ def view_overview(root: str) -> str:
             "Not counted above; kept as evidence.</summary><table style='margin-top:"
             ".5rem'><tbody>%s</tbody></table></details>"
             % (len(vanished), "" if len(vanished) == 1 else "s", vrows))
+    eng_filter = ""
+    if len(eng_options) > 1:
+        opts = ("<option value=''%s>All engagements</option>"
+                % (" selected" if engagement is None else ""))
+        opts += "".join(
+            "<option value='%s'%s>%s</option>"
+            % (E(name), " selected" if name == engagement else "", E(name))
+            for name in eng_options)
+        eng_filter = (
+            "<form method='get' action='/overview' style='margin:0'>"
+            "<select name='engagement' onchange='this.form.submit()' "
+            "style='font-size:.8rem'>%s</select></form>" % opts)
+
+    scope_note = ("" if engagement is None else
+                  " <span class='muted'>&mdash; scoped to <b>%s</b> "
+                  "(<a href='/overview'>all engagements</a>)</span>" % E(engagement))
+    heading = "Engagements" if engagement_view else "Targets by risk"
     return (
         "<h1>Overview</h1><p class='sub'>Newest run of every target — the estate "
-        "as it stands. A week with no scan is a gap, not clean.</p>"
+        "as it stands. A week with no scan is a gap, not clean.%s</p>"
 
         "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(170px,1fr))'>"
         "<a class='card tight stat' href='/estate?sev=critical,high' "
@@ -1222,9 +1338,9 @@ def view_overview(root: str) -> str:
         "<span class='k'>targets tracked &rarr;</span></a>%s</div>%s"
 
         "<div class='grid cols-2' style='margin-top:1rem'>"
-        "<div class='card' id='targets'><h3>Targets by risk</h3>"
-        "<table><thead><tr><th>Target</th><th>Open findings</th><th>Trend</th>"
-        "<th>Last scan</th><th></th></tr></thead><tbody>%s</tbody></table>%s</div>"
+        "<div class='card' id='targets'><div style='display:flex;justify-content:"
+        "space-between;align-items:center;gap:1rem'><h3 style='margin:0'>%s</h3>%s"
+        "</div>%s%s</div>"
         "<div class='card' style='display:flex;gap:1.2rem;align-items:center'>"
         "%s<div style='flex:1'>%s"
         "<p class='muted' style='font-size:.75rem;margin:.6rem 0 0'>%d finding(s) "
@@ -1233,11 +1349,16 @@ def view_overview(root: str) -> str:
         "<h2>Scan activity — last 12 weeks</h2>"
         "<div class='card tight'>%s</div>"
 
-        "<h2>Recent runs</h2>"
-        "<div class='card tight'><table><tbody>%s</tbody></table></div>%s"
-        % (SEV_COLORS["critical"] if crit_high else SEV_COLORS["low"], crit_high,
-           open_total, len(live), exploited_tile, attn, "".join(target_rows),
-           vanished_block,
+        "<details style='margin-top:1rem'><summary style='cursor:pointer'>"
+        "<b style='font-size:1.05rem'>Recent runs</b> <span class='muted' "
+        "style='font-size:.8rem'>&mdash; the latest scans across all engagements"
+        "</span></summary>"
+        "<div class='card tight' style='margin-top:.5rem'><table><tbody>%s</tbody>"
+        "</table></div></details>%s"
+        % (scope_note,
+           SEV_COLORS["critical"] if crit_high else SEV_COLORS["low"], crit_high,
+           open_total, len(live), exploited_tile, attn, heading, eng_filter,
+           targets_html, vanished_block,
            sev_donut(sev_totals), sev_breakdown(sev_totals), excluded,
            "".join(strip), recent, integrity_card))
 
@@ -1989,7 +2110,9 @@ def resolved_block(timeline: Dict[Tuple[str, str], dict], persisted: bool) -> st
 def view_findings(root: str, run_id: Optional[str],
                   sev_filter: Optional[str] = None,
                   scanner_filter: Optional[str] = None,
-                  where: Optional[str] = None) -> str:
+                  where: Optional[str] = None,
+                  engagement: Optional[str] = None,
+                  target: Optional[str] = None) -> str:
     runs = list_runs(root)
     if not runs:
         return ("<h1>Findings</h1><p class='sub'>What a run found, grouped so one "
@@ -1997,9 +2120,16 @@ def view_findings(root: str, run_id: Optional[str],
                 + empty_state("findings", "No runs yet",
                               "Run a scan and its findings land here.",
                               "<a class='btn' href='/scan'>Run a scan</a>"))
-    # An unknown run id is a bad request, not a reason to show a different run.
-    # Silently substituting one made the header assert a run nobody asked for.
-    man = next((m for m in runs if m["run_id"] == run_id), None) if run_id else runs[0]
+    # Narrow the runs on offer by engagement then target before picking one.
+    all_runs = runs
+    runs, engagement, target, scope_controls = engagement_scope(
+        root, runs, engagement, target)
+    # An unknown run id is a bad request; a valid run pushed out of scope by an
+    # engagement/target switch falls back to the newest in scope.
+    man = next((m for m in runs if m["run_id"] == run_id), None) if run_id else (
+        runs[0] if runs else None)
+    if man is None and run_id and any(m["run_id"] == run_id for m in all_runs):
+        man = runs[0] if runs else None
     if man is None:
         return ("<h1>No such run</h1>" + empty_state(
             "findings", "That run id is not on record",
@@ -2043,10 +2173,11 @@ def view_findings(root: str, run_id: Optional[str],
         "<form method='get' action='/findings' class='card tight' "
         "style='display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;"
         "margin-bottom:1rem'>"
-        "<select name='run' onchange='this.form.submit()'>%s</select>%s%s"
+        "%s<select name='run' onchange='this.form.submit()'>%s</select>%s%s"
         "<span class='muted' style='margin-left:auto;font-size:.82rem'>"
         "%s%d shown%s &middot; %d excluded as contamination</span></form>"
-        % ("".join("<option value='%s'%s>%s &middot; %s &middot; %s</option>"
+        % (scope_controls,
+           "".join("<option value='%s'%s>%s &middot; %s &middot; %s</option>"
                    % (E(m["run_id"]),
                       " selected" if m["run_id"] == man["run_id"] else "",
                       E(_short_target(m.get("target", ""))),
@@ -2291,7 +2422,8 @@ def view_findings(root: str, run_id: Optional[str],
     return head + controls + elsewhere + summary + "".join(blocks) + fixed + ran
 
 
-def view_history(root: str) -> str:
+def view_history(root: str, engagement: Optional[str] = None,
+                 target: Optional[str] = None) -> str:
     runs = list_runs(root)
     if not runs:
         return ("<h1>History</h1><p class='sub'>Run cadence and identity-level "
@@ -2300,12 +2432,16 @@ def view_history(root: str) -> str:
                               "Each run is kept as immutable evidence; once a "
                               "target has two runs, the drift between them shows here.",
                               "<a class='btn' href='/scan'>Run a scan</a>"))
+    runs, engagement, target, controls = engagement_scope(root, runs, engagement, target)
+    bar = ("<form method='get' action='/history' class='card tight' style='display:"
+           "flex;gap:.6rem;align-items:center;margin-bottom:1rem'>%s</form>"
+           % controls) if controls else ""
     groups: Dict[str, List[dict]] = {}
     for m in runs:
         groups.setdefault(target_key(m), []).append(m)
     blocks = ["<h1>History</h1><p class='sub'>Diffs only compare runs of the "
               "same target. A scanner that did not run in both is <i>silent</i>, "
-              "never <i>resolved</i>.</p><div class='grid cols-auto'>"]
+              "never <i>resolved</i>.</p>" + bar + "<div class='grid cols-auto'>"]
     for group in groups.values():
         group_sorted = sorted(group, key=lambda m: m["run_id"], reverse=True)
         newest = group_sorted[0]
@@ -2616,6 +2752,43 @@ def view_compare(root: str, run_id: Optional[str]) -> str:
     return head + span + chips + trend_card + "".join(sections)
 
 
+def engagement_scope(root: str, runs: List[dict], requested: Optional[str],
+                     target: Optional[str] = None):
+    """For a run-based view: narrow the runs by engagement THEN target, and build
+    the two dropdowns to switch (meant to sit in the run picker's form, so the
+    scope persists when you change runs). Returns (scoped_runs, engagement,
+    target, controls_html). An unknown or empty value at either level is "all"."""
+    data = load_engagements(root)
+    eng_options = engagement_names(runs, data)
+    engagement = resolve_engagement(requested, runs, data)
+    in_eng = ([m for m in runs if engagement_for(m, data) == engagement]
+              if engagement is not None else runs)
+    tgt_options = sorted({(m.get("target") or "") for m in in_eng})
+    target = (target or "").strip()
+    if target not in tgt_options:
+        target = ""                        # unknown / out-of-scope target -> all
+    scoped = ([m for m in in_eng if (m.get("target") or "") == target]
+              if target else in_eng)
+
+    def sel(field: str, label: str, current: str, options: list, short: bool = False) -> str:
+        opts = "<option value=''%s>%s</option>" % (" selected" if not current else "", label)
+        for o in options:
+            opts += ("<option value='%s'%s>%s</option>"
+                     % (E(o), " selected" if o == current else "",
+                        E(_short_target(o) if short else o)))
+        return ("<span class='mono muted' style='font-size:.72rem;letter-spacing:"
+                ".09em;text-transform:uppercase'>%s</span>"
+                "<select name='%s' onchange='this.form.submit()'>%s</select>"
+                % (field, field, opts))
+
+    controls = ""
+    if len(eng_options) > 1:
+        controls += sel("engagement", "All engagements", engagement or "", eng_options)
+    if len(tgt_options) > 1:
+        controls += sel("target", "All targets", target, tgt_options, short=True)
+    return scoped, engagement, target, controls
+
+
 def run_picker(runs: List[dict], man: dict, action: str, extra: str = "") -> str:
     """The dropdown that says which run you are looking at and lets you change
     it. Reported from the field as "where is this priority list coming from?" —
@@ -2641,7 +2814,9 @@ def run_picker(runs: List[dict], man: dict, action: str, extra: str = "") -> str
                E(man["run_id"])))
 
 
-def view_priority(root: str, run_id: Optional[str]) -> str:
+def view_priority(root: str, run_id: Optional[str],
+                  engagement: Optional[str] = None,
+                  target: Optional[str] = None) -> str:
     """The shortlist: what to act on first, and why each item is there. A run
     with four hundred findings should leave an operator with an hour a list
     they can finish. The feed status is stated up front, every item carries
@@ -2652,8 +2827,15 @@ def view_priority(root: str, run_id: Optional[str]) -> str:
                 + empty_state("priority", "No runs yet",
                               "Run a scan and its shortlist lands here.",
                               "<a class='btn' href='/scan'>Run a scan</a>"))
-    man = (next((m for m in runs if m["run_id"] == run_id), None)
-           if run_id else runs[0])
+    all_runs = runs
+    runs, engagement, target, scope_controls = engagement_scope(
+        root, runs, engagement, target)
+    # Unknown run id is an error; a valid run pushed out of scope by an
+    # engagement/target switch falls back to the newest in scope, not a dead end.
+    man = next((m for m in runs if m["run_id"] == run_id), None) if run_id else (
+        runs[0] if runs else None)
+    if man is None and run_id and any(m["run_id"] == run_id for m in all_runs):
+        man = runs[0] if runs else None
     if man is None:
         return ("<h1>No such run</h1>" + empty_state(
             "priority", "That run id is not on record",
@@ -2666,7 +2848,7 @@ def view_priority(root: str, run_id: Optional[str]) -> str:
             "and why each item is on the list. This is one run's shortlist; "
             "<a href='/intel'>Intel</a> is the same question across every "
             "target.</p>%s"
-            % run_picker(runs, man, "/priority"))
+            % run_picker(runs, man, "/priority", extra=scope_controls))
     ages = dict((n, (a, d)) for n, a, d in feed_ages(root))
     if not ranked["feeds_present"]:
         feed_line = ("<div class='card tight' style='border-left:4px solid "
@@ -2806,7 +2988,8 @@ def _cve_rows(cves: Dict[str, List[dict]], keep, feeds: dict, root: str,
             % "".join(rows), len(rows))
 
 
-def view_intel(root: str, cve: Optional[str] = None) -> str:
+def view_intel(root: str, cve: Optional[str] = None,
+               engagement: Optional[str] = None, target: Optional[str] = None) -> str:
     """Exploited now, likely soon, and what any one of them actually is.
 
     Every list on this page states what it is out of, every source states when
@@ -2818,6 +3001,12 @@ def view_intel(root: str, cve: Optional[str] = None) -> str:
     strip = "<div class='attn'>%s</div>" % "".join(_intel_chip(r) for r in prov)
 
     live, vanished, _by_target = estate_runs(root)
+    scoped, engagement, target, controls = engagement_scope(
+        root, list(live.values()), engagement, target)
+    live = {target_key(m): m for m in scoped}
+    intel_bar = ("<form method='get' action='/intel' class='card tight' style='display:"
+                 "flex;gap:.6rem;align-items:center;margin:.6rem 0'>%s</form>"
+                 % controls) if controls else ""
     cves = estate_cves(list(live.values()), load_findings) if live else {}
     # A CVE lookup does not depend on having scanned anything. Bailing out here
     # meant a link to /intel?cve=X on a fresh evidence root answered "no live
@@ -2845,6 +3034,7 @@ def view_intel(root: str, cve: Optional[str] = None) -> str:
             % (n_targets, "" if n_targets == 1 else "s",
                "; %d vanished target(s) are not counted" % len(vanished)
                if vanished else "", len(cves), cached, strip))
+    head += intel_bar
 
     if not feeds.get("present"):
         return head + empty_state(
@@ -3227,9 +3417,19 @@ def view_estate(root: str, params: Dict[str, str]) -> str:
                               "everything else you have scanned.",
                               "<a class='btn' href='/scan'>Run a scan</a>"))
 
+    # Engagement scope: narrow the live estate before rows are built, so every
+    # count, group and target below reflects the chosen engagement.
+    eng_map = load_engagements(root)
+    eng_options = engagement_names(live.values(), eng_map)
+    engagement = resolve_engagement(params.get("engagement"), live.values(), eng_map)
+    if engagement is not None:
+        live = {k: m for k, m in live.items()
+                if engagement_for(m, eng_map) == engagement}
+
     rows = estate_rows(root, live)
     q = {k: str(params.get(k, "") or "").strip() for k in
          ("sev", "scanner", "target", "status", "q", "sort")}
+    q["engagement"] = engagement or ""     # normalized, so chips/links carry it
     try:
         page_no = int(params.get("page", "1") or 1)
     except ValueError:
@@ -3260,17 +3460,19 @@ def view_estate(root: str, params: Dict[str, str]) -> str:
         return ("<select name='%s' onchange='this.form.submit()'>%s</select>"
                 % (name, opts))
 
+    eng_select = (sel("engagement", q["engagement"], eng_options, "All engagements")
+                  if len(eng_options) > 1 else "")
     controls = (
         "<form method='get' action='/estate' class='card tight' "
         "style='display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;"
         "margin-bottom:.6rem'>"
         "<input type='search' name='q' value='%s' placeholder='search title, "
-        "rule, identity or path' style='min-width:260px'>%s%s%s%s%s"
+        "rule, identity or path' style='min-width:260px'>%s%s%s%s%s%s"
         "<button class='btn ghost' type='submit'>Search</button>"
         "<span class='muted' style='margin-left:auto;font-size:.82rem'>"
         "%d row(s) &middot; %d instance(s) &middot; %d target(s)</span></form>"
-        % (E(q["q"]), sel("sev", q["sev"], [*SEVERITY_ORDER, "critical,high"],
-                          "All severities"),
+        % (E(q["q"]), eng_select,
+           sel("sev", q["sev"], [*SEVERITY_ORDER, "critical,high"], "All severities"),
            sel("scanner", q["scanner"], scanners, "All scanners"),
            sel("target", q["target"], targets, "All targets"),
            sel("status", q["status"], ESTATE_STATUSES, "Any status"),
@@ -4957,7 +5159,125 @@ def view_cloud(root: str) -> str:
            inventory_panel, history))
 
 
-def view_triage(root: str, run_id: Optional[str]) -> str:
+_CHECK_PILL = {
+    "pass": ("&#10003; pass", "var(--ok)"),
+    "na": ("N/A", "var(--muted)"),
+    "fail": ("&#10007; fail", None),            # None -> critical colour, resolved below
+    "open": ("open", "var(--gap)"),
+}
+
+
+def view_checklist(root: str, engagement: Optional[str] = None, msg: str = "") -> str:
+    """The pre-handover signoff: a manual-review checklist, per engagement, each
+    tick a sealed ledger line. "Ready to hand over" means every item is `pass`
+    or `N/A`, none `open` or `fail` — the gate a reviewer clears before results
+    go into a report. The list is a general default; a `checklist.md` in the
+    evidence root replaces it."""
+    live, _van, _bt = estate_runs(root)
+    eng_map = load_engagements(root)
+    options = engagement_names(live.values(), eng_map)
+    engagement = resolve_engagement(engagement, live.values(), eng_map)
+    if engagement is None:
+        engagement = options[0] if options else "Unassigned"
+    if engagement not in options:
+        options = [engagement, *options]
+
+    items = checklist_items(root)
+    current = current_checks(root, engagement)
+    state = signoff_state(root, engagement, items)
+    custom = bool(load_checklist(root)) and os.path.isfile(
+        os.path.join(root, "checklist.md"))
+
+    opts = "".join(
+        "<option value='%s'%s>%s</option>"
+        % (E(n), " selected" if n == engagement else "", E(n)) for n in options)
+    picker = ("<form method='get' action='/checklist' style='margin:0'>"
+              "<span class='mono muted' style='font-size:.72rem;letter-spacing:.09em;"
+              "text-transform:uppercase'>Engagement</span> "
+              "<select name='engagement' onchange='this.form.submit()'>%s</select>"
+              "</form>" % opts)
+
+    if state["ready"]:
+        sign = (" &middot; signed off by <b>%s</b> at %s" % (E(state["who"]),
+                E(_fmt_run_time(state["at"]))) if state["who"] else "")
+        banner = ("<div class='card tight' style='border-left:4px solid var(--ok)'>"
+                  "<b style='color:var(--ok)'>&#10003; Ready to hand over.</b> "
+                  "All %d item(s) are pass or N/A%s.</div>"
+                  % (state["total"], sign))
+    else:
+        bits = []
+        if state["open"]:
+            bits.append("%d not reviewed" % state["open"])
+        if state["failed"]:
+            bits.append("%d failed" % state["failed"])
+        banner = ("<div class='card tight' style='border-left:4px solid var(--gap)'>"
+                  "<b>Not ready to hand over.</b> <span class='muted'>%s of %d item(s) "
+                  "— %s. Clear every item (pass or N/A) before the report goes out."
+                  "</span></div>"
+                  % (state["passed"] + state["na"], state["total"],
+                     ", ".join(bits) or "in progress"))
+
+    crit = SEV_COLORS["critical"]
+
+    def status_pill(st: str) -> str:
+        label, colour = _CHECK_PILL[st]
+        colour = colour or crit
+        return ("<span class='pill' style='color:%s;border-color:color-mix(in srgb,"
+                "%s 42%%,transparent);background:color-mix(in srgb,%s 12%%,transparent)'>"
+                "%s</span>" % (colour, colour, colour, label))
+
+    def item_form(item: dict) -> str:
+        ev = current.get(item["id"])
+        st = ev["status"] if ev else "open"
+        note_val = ev.get("note", "") if ev else ""
+        buttons = "".join(
+            "<button name='status' value='%s' class='btn%s' style='padding:.12rem "
+            ".5rem;font-size:.78rem'>%s</button>"
+            % (val, "" if st == val else " ghost", lbl)
+            for val, lbl in (("pass", "&#10003;"), ("na", "N/A"), ("fail", "&#10007;")))
+        return (
+            "<form method='post' action='/check' style='display:flex;gap:.3rem;"
+            "align-items:center;margin:0'>"
+            "<input type='hidden' name='engagement' value='%s'>"
+            "<input type='hidden' name='item' value='%s'>"
+            "<input name='note' value='%s' placeholder='note (optional)' "
+            "style='flex:1;min-width:120px;font-size:.8rem'>%s</form>"
+            % (E(engagement), E(item["id"]), E(note_val), buttons))
+
+    by_section: Dict[str, List[dict]] = {}
+    for item in items:
+        by_section.setdefault(item["section"], []).append(item)
+    blocks = []
+    for section, its in by_section.items():
+        rows = "".join(
+            "<tr><td style='width:46%%'>%s</td><td>%s</td><td style='width:38%%'>%s</td></tr>"
+            % (E(it["text"]), status_pill(current.get(it["id"], {}).get("status", "open")),
+               item_form(it))
+            for it in its)
+        blocks.append(
+            "<div class='card tight' style='margin-bottom:.6rem'><h3 style='margin:"
+            ".2rem 0 .5rem'>%s</h3><table><tbody>%s</tbody></table></div>"
+            % (E(section), rows))
+
+    source = ("<span class='muted'>Using your <span class='mono'>checklist.md</span>."
+              "</span>" if custom else
+              "<span class='muted'>Built-in default. Drop a <span class='mono'>"
+              "checklist.md</span> in the evidence root to use your own.</span>")
+    note = ("<div class='banner'>%s</div>" % E(msg)) if msg else ""
+    return (
+        "<h1>Checklist</h1><p class='sub'>A manual-review signoff before results "
+        "go into a report. Per engagement; every tick is a sealed ledger line. "
+        "%s<br><span class='muted'>Backup sweep: <span class='mono'>squawk greps "
+        "&lt;app-dir&gt;</span> greps the coverage areas beside the scanners &mdash; "
+        "a hit is a place to look.</span></p>%s"
+        "<div class='card tight' style='display:flex;gap:1rem;align-items:center;"
+        "justify-content:space-between;margin-bottom:.6rem'>%s</div>%s%s"
+        % (source, note, picker, banner, "".join(blocks)))
+
+
+def view_triage(root: str, run_id: Optional[str],
+                engagement: Optional[str] = None,
+                target: Optional[str] = None) -> str:
     """Group findings by DECISION, not by row: one advisory affecting four
     packages is one decision showing '4 items'. Anything matching a posted
     baseline is hidden as already filed, with a count and a way to show it."""
@@ -4968,9 +5288,17 @@ def view_triage(root: str, run_id: Optional[str]) -> str:
                 + empty_state("triage", "Nothing to triage",
                               "Run a scan first — its findings queue up here.",
                               "<a class='btn' href='/scan'>Run a scan</a>"))
+    all_runs = runs
+    runs, engagement, target, scope_controls = engagement_scope(
+        root, runs, engagement, target)
     # An unknown run id is a bad request, not a reason to show a different run.
     # Silently substituting one made the header assert a run nobody asked for.
-    man = next((m for m in runs if m["run_id"] == run_id), None) if run_id else runs[0]
+    # A valid run pushed out of scope by an engagement switch is the exception:
+    # show the newest in scope rather than a dead end.
+    man = next((m for m in runs if m["run_id"] == run_id), None) if run_id else (
+        runs[0] if runs else None)
+    if man is None and run_id and any(m["run_id"] == run_id for m in all_runs):
+        man = runs[0] if runs else None
     if man is None:
         return ("<h1>No such run</h1>" + empty_state(
             "findings", "That run id is not on record",
@@ -5046,7 +5374,7 @@ def view_triage(root: str, run_id: Optional[str]) -> str:
         "target. The markdown is an export of that record.</p>"
         "<form method='get' action='/triage' class='card tight' "
         "style='margin-bottom:1rem'>"
-        "<select name='run' onchange='this.form.submit()'>%s</select> "
+        "%s<select name='run' onchange='this.form.submit()'>%s</select> "
         "<button type='button' class='btn ghost' id='finish'>Finish → markdown"
         "</button></form>%s"
         "<div class='banner' id='dmsg' style='display:none'></div>"
@@ -5178,8 +5506,85 @@ def view_triage(root: str, run_id: Optional[str]) -> str:
         "render();\n</script>"
         % (E(_short_target(man.get("target", ""))),
            E(man.get("service_label", "")), E(_fmt_run_time(man["run_id"])),
-           picker, filed_banner, payload, sev_json, marks_json,
+           scope_controls, picker, filed_banner, payload, sev_json, marks_json,
            json.dumps(man["run_id"])))
+
+
+def view_reports(root: str) -> str:
+    """Every session, with its executive summary, its engineering report and
+    its findings table. Each is made when it is asked for, redacted the way
+    `report --share` is, and nothing is written into the evidence."""
+    hidden = hidden_reports(root)
+    sessions = [s for s in sessions_of(root) if s["session"] not in hidden]
+    browser = pdf_browser()
+    head = ("<h1>Reports</h1><p class='sub'>One report per session: the tag a run "
+            "or a note carries with <span class='mono'>--session</span>. Local "
+            "paths, the user and host names and email addresses are removed; the "
+            "sealed runs keep the originals. Each file is made when you ask for "
+            "it, and nothing is written into the evidence.</p>")
+    hidden_block = ""
+    if hidden:
+        items = "".join(
+            "<li class='mono' style='margin:.2rem 0'>%s <form method='post' "
+            "action='/report/unhide' style='display:inline'><input type='hidden' "
+            "name='session' value='%s'><button class='btn ghost' style='padding:"
+            ".05rem .45rem;font-size:.72rem'>unhide</button></form></li>"
+            % (E(h), E(h)) for h in sorted(hidden))
+        hidden_block = ("<details style='margin-top:.6rem'><summary class='muted' "
+                        "style='cursor:pointer'>%d hidden report(s)</summary>"
+                        "<ul style='list-style:none;padding:.4rem 0'>%s</ul></details>"
+                        % (len(hidden), items))
+    if not sessions:
+        return head + hidden_block + (
+            "<div class='card empty'><h3>No session yet</h3><p>Tag runs and notes "
+            "as you go: <span class='mono'>squawk run preflight --repo DIR "
+            "--session NAME</span>. A report is the runs one session carries."
+            "</p></div>")
+    banner = "" if browser else (
+        "<div class='banner'>PDF needs headless Chromium or Chrome, and none was "
+        "found on this machine. Open a report with <b>View</b> and print it to "
+        "PDF from the browser: the page is laid out for paper.</div>")
+
+    def link(route: str, label: str, **q: str) -> str:
+        return "<a class='btn ghost' href='%s?%s'>%s</a>" % (
+            route, E(urlencode(q)), label)
+
+    rows = []
+    for s in sessions:
+        name = s["session"]
+        cells = []
+        for aud in ("executive", "engineer"):
+            pdf = (link("/report.pdf", "PDF", session=name, audience=aud) if browser
+                   else "<span class='muted'>PDF needs Chromium</span>")
+            cells.append("<td>%s %s</td>"
+                         % (link("/report", "View", session=name, audience=aud), pdf))
+        hide = ("<form method='post' action='/report/hide' style='display:inline' "
+                "onsubmit=\"return confirm('Hide %s from Reports? Its runs are "
+                "untouched and you can unhide it.')\"><input type='hidden' "
+                "name='session' value='%s'><button class='btn ghost' style='padding:"
+                ".05rem .45rem;font-size:.72rem'>hide</button></form>"
+                % (E(name), E(name)))
+        rows.append("<tr><td class='mono'>%s</td><td>%d</td><td>%d</td>"
+                    "<td class='muted'>%s &ndash; %s</td>%s<td>%s</td><td>%s</td></tr>"
+                    % (E(name), s["runs"], s["notes"], E(s["first"]), E(s["last"]),
+                       "".join(cells), link("/report.csv", "CSV", session=name), hide))
+    table = ("<div class='card tight'><table><thead><tr><th>Session</th><th>Runs</th>"
+             "<th>Notes</th><th>When</th><th>Executive summary</th>"
+             "<th>Engineering report</th><th>Findings</th><th></th></tr></thead><tbody>%s"
+             "</tbody></table></div>%s" % ("".join(rows), hidden_block))
+    holds = (
+        "<div class='card'><h3>What each holds</h3><ul>"
+        "<li><b>Executive summary</b>: what an attacker can do, the reviewer's "
+        "findings with their control mapping, the image's known-exploited CVEs, "
+        "what was not covered, and whether the evidence is intact. No file paths "
+        "or rule ids.</li>"
+        "<li><b>Engineering report</b>: every finding once, with where it is, the "
+        "rule, the evidence and the fix, and every run with what each tool "
+        "examined.</li>"
+        "<li><b>Findings</b>: the same findings as CSV rows for a tracker or a "
+        "spreadsheet, the image's advisories once per package. A cell that a "
+        "spreadsheet would run as a formula is stored as text.</li></ul></div>")
+    return head + banner + table + holds
 
 
 def view_baselines(root: str, repo: Optional[str], gh_repo: Optional[str],
@@ -5300,12 +5705,60 @@ def make_handler(evidence_root: str, repo: Optional[str]):
                 sys.stderr.write("squawk: request log failed: %s\n" % exc)
 
         def _send(self, body: bytes, code: int = 200,
-                  ctype: str = "text/html; charset=utf-8") -> None:
+                  ctype: str = "text/html; charset=utf-8",
+                  headers: Optional[Dict[str, str]] = None) -> None:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
+            for key, value in (headers or {}).items():
+                self.send_header(key, value)
             self.end_headers()
             self.wfile.write(body)
+
+        def _report(self, path: str, qs: Dict[str, List[str]], ctx: str) -> None:
+            """/report (the page), /report.csv and /report.pdf for one session.
+            The session must be one the evidence carries, so the name in the
+            query is never a path or anything but a tag Squawk wrote."""
+            session = qs.get("session", [""])[0]
+            audience = qs.get("audience", ["engineer"])[0]
+            if (session not in {s["session"] for s in sessions_of(evidence_root)}
+                    or audience not in AUDIENCES):
+                self._send(page("Reports", "<h1>No such report</h1><p class='sub'>"
+                                "Pick a session on <a href='/reports'>Reports</a>."
+                                "</p>", "reports", ctx), 404)
+                return
+
+            def attachment(ext: str) -> Dict[str, str]:
+                return {"Content-Disposition": 'attachment; filename="%s"'
+                        % share_file_name(session, audience, ext)}
+            if path == "/report.csv":
+                self._send(share_csv(evidence_root, session).encode("utf-8"), 200,
+                           "text/csv; charset=utf-8", attachment("csv"))
+                return
+            doc = share_html(share_model(evidence_root, session),
+                             verify_state(evidence_root), audience)
+            if path == "/report":
+                self._send(doc.encode("utf-8"))
+                return
+            work = tempfile.mkdtemp(prefix="squawk-pdf-out-")
+            try:
+                out = os.path.join(work, "report.pdf")
+                ok, detail = html_to_pdf(doc, out)
+                data = b""
+                if ok:
+                    with open(out, "rb") as fh:
+                        data = fh.read()
+            finally:
+                shutil.rmtree(work, ignore_errors=True)
+            if not ok:
+                self._send(page("Reports", "<h1>No PDF</h1><p class='sub'>%s.</p>"
+                                "<p><a href='/report?%s'>Open the page</a> and print "
+                                "it to PDF from the browser.</p>"
+                                % (E(detail), E(urlencode({"session": session,
+                                                           "audience": audience}))),
+                                "reports", ctx), 503)
+                return
+            self._send(data, 200, "application/pdf", attachment("pdf"))
 
         def _ctx(self) -> str:
             n = count_runs(evidence_root)
@@ -5372,8 +5825,8 @@ def make_handler(evidence_root: str, repo: Optional[str]):
             qs = parse_qs(parsed.query)
             ctx = self._ctx()
             if path in ("/", "/overview"):
-                self._send(page("Overview", view_overview(evidence_root),
-                                "overview", ctx))
+                self._send(page("Overview", view_overview(
+                    evidence_root, qs.get("engagement", [None])[0]), "overview", ctx))
             elif path in ("/scan", "/kiosk"):
                 self._send(page("Run a scan",
                                 view_scan(evidence_root, repo,
@@ -5390,7 +5843,9 @@ def make_handler(evidence_root: str, repo: Optional[str]):
                                               qs.get("run", [None])[0],
                                               qs.get("sev", [None])[0],
                                               qs.get("scanner", [None])[0],
-                                              qs.get("where", [None])[0]),
+                                              qs.get("where", [None])[0],
+                                              qs.get("engagement", [None])[0],
+                                              qs.get("target", [None])[0]),
                                 "findings", ctx))
             elif path == "/cloud/detail":
                 self._send(page("Cloud detail",
@@ -5398,8 +5853,9 @@ def make_handler(evidence_root: str, repo: Optional[str]):
                                                   qs.get("what", [""])[0]),
                                 "cloud", ctx))
             elif path == "/history":
-                self._send(page("History", view_history(evidence_root),
-                                "history", ctx))
+                self._send(page("History", view_history(
+                    evidence_root, qs.get("engagement", [None])[0],
+                    qs.get("target", [None])[0]), "history", ctx))
             elif path == "/compare":
                 self._send(page("What changed",
                                 view_compare(evidence_root,
@@ -5408,7 +5864,9 @@ def make_handler(evidence_root: str, repo: Optional[str]):
             elif path == "/priority":
                 self._send(page("Priority",
                                 view_priority(evidence_root,
-                                              qs.get("run", [None])[0]),
+                                              qs.get("run", [None])[0],
+                                              qs.get("engagement", [None])[0],
+                                              qs.get("target", [None])[0]),
                                 "priority", ctx))
             elif path == "/intel":
                 if qs.get("scope", [""])[0] == "feed":
@@ -5418,15 +5876,25 @@ def make_handler(evidence_root: str, repo: Optional[str]):
                 else:
                     self._send(page("Threat intel",
                                     view_intel(evidence_root,
-                                               qs.get("cve", [None])[0]),
+                                               qs.get("cve", [None])[0],
+                                               qs.get("engagement", [None])[0],
+                                               qs.get("target", [None])[0]),
                                     "intel", ctx))
             elif path == "/cloud":
                 self._send(page("Cloud", view_cloud(evidence_root), "cloud", ctx))
             elif path == "/triage":
                 self._send(page("Triage",
                                 view_triage(evidence_root,
-                                            qs.get("run", [None])[0]),
+                                            qs.get("run", [None])[0],
+                                            qs.get("engagement", [None])[0],
+                                            qs.get("target", [None])[0]),
                                 "triage", ctx))
+            elif path == "/checklist":
+                self._send(page("Checklist",
+                                view_checklist(evidence_root,
+                                               qs.get("engagement", [None])[0],
+                                               qs.get("msg", [""])[0]),
+                                "checklist", ctx))
             elif path == "/baselines":
                 gh_repo = resolve_gh_repo(None, repo)
                 self._send(page("Baselines",
@@ -5449,6 +5917,10 @@ def make_handler(evidence_root: str, repo: Optional[str]):
                            if job.status == "running" else "")
                 self._send(page("Scan", view_job(job, evidence_root), "scan", ctx,
                                 head_extra=refresh))
+            elif path == "/reports":
+                self._send(page("Reports", view_reports(evidence_root), "reports", ctx))
+            elif path in ("/report", "/report.csv", "/report.pdf"):
+                self._report(path, qs, ctx)
             elif path == "/healthz":
                 rec = read_pid_file(evidence_root) or {}
                 ver = verify_state(evidence_root)
@@ -5563,6 +6035,43 @@ def make_handler(evidence_root: str, repo: Optional[str]):
                 return
             if post_path == "/decide":
                 self._decide(form)
+                return
+            if post_path == "/check":
+                engagement = (form.get("engagement", [""])[0] or "").strip()
+                msg = ""
+                try:
+                    record_check(evidence_root, engagement,
+                                 (form.get("item", [""])[0] or "").strip(),
+                                 (form.get("status", [""])[0] or "").strip(),
+                                 note=(form.get("note", [""])[0] or "").strip())
+                except ValueError as exc:
+                    msg = str(exc)
+                self.send_response(303)
+                self.send_header("Location", "/checklist?engagement=%s%s"
+                                 % (quote(engagement),
+                                    "&msg=" + quote(msg[:180]) if msg else ""))
+                self.end_headers()
+                return
+            if post_path == "/engagement/remove":
+                name = (form.get("engagement", [""])[0] or "").strip()
+                if name:
+                    remove_engagement(evidence_root, name)
+                self.send_response(303)
+                self.send_header("Location", "/overview")
+                self.end_headers()
+                return
+            if post_path in ("/report/hide", "/report/unhide"):
+                name = (form.get("session", [""])[0] or "").strip()
+                if name and post_path == "/report/hide":
+                    try:
+                        hide_report(evidence_root, name)
+                    except ValueError:
+                        pass
+                elif name:
+                    unhide_report(evidence_root, name)
+                self.send_response(303)
+                self.send_header("Location", "/reports")
+                self.end_headers()
                 return
             if post_path != "/run":
                 self._send(page("Not found", "<h1>Not found</h1>", ""), 404)
@@ -5680,6 +6189,7 @@ __all__ = [
     'STATE_COLOURS',
     'UTC_ALIASES',
     'WORLD_ZONES',
+    '_CHECK_PILL',
     '_ROLE_CARDS',
     '_SKIP_DIRS',
     '_STATUS_DOT',
@@ -5753,6 +6263,7 @@ __all__ = [
     'discover_repos',
     'drill_link',
     'empty_state',
+    'engagement_scope',
     'human_hours',
     'icon',
     'integrity_block',
@@ -5774,6 +6285,7 @@ __all__ = [
     'sparkline',
     'squawk_banner',
     'view_baselines',
+    'view_checklist',
     'view_cloud',
     'view_cloud_detail',
     'view_compare',
@@ -5785,6 +6297,7 @@ __all__ = [
     'view_job',
     'view_overview',
     'view_priority',
+    'view_reports',
     'view_scan',
     'view_triage',
 ]

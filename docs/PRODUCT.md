@@ -148,7 +148,7 @@ prerequisite, not a delay.
 | Cloud inventory + toxic combinations: AWS networking, compute, attached roles | read-only cloud identity + `SQUAWK_CLOUD_ACK=1` | available; **validation on a dedicated test account pending**; works whether or not Security Hub is on |
 | Cloud native findings ingest: Defender for Cloud | read-only cloud identity | waits |
 | Prowler fallback posture | read-only cloud identity | waits |
-| Authenticated DAST | app credential / session | waits |
+| Authenticated DAST | app credential / session | available; credentials from `SQUAWK_WEBAUTH_*` (env, never argv), session held in memory for the run only; login flow configured per target, including a scraped per-request CSRF token; validated on loopback lab targets (DVWA and an OAuth authorization-code login) |
 | Private registry images | registry credential | waits |
 
 The practical consequence: **if a build can be produced locally, Squawk can assess
@@ -182,8 +182,11 @@ added from here on.
    finds are stored redacted wherever the scanner supports it.
 6. **No credential reaches a log, a report, or an identity key.** Identity keys
    are built from resource and check ids — never from a token or session value.
-7. **Authenticated DAST config is generated per run and removed after.** The ZAP
-   context holding a session exists for the run, not on disk afterwards.
+7. **Authenticated DAST config is generated per run and removed after.** A
+   session — the `webauth` probe's cookie jar, or a ZAP context — exists in
+   memory for the run, not on disk afterwards. The login credentials come from
+   `SQUAWK_WEBAUTH_*` in the environment (never argv, never a profile); the
+   probe captures the session itself and holds it only while it runs.
 8. **An explicit acknowledgement before any live estate is queried**, the same
    rail as the DAST private-target check. `SQUAWK_CLOUD_ACK=1` covers the
    estate the credential chain resolves to. Reading the machine's *other* AWS
@@ -194,6 +197,12 @@ added from here on.
    profiles were not asked, which is a different answer from none reaching
    anything. `cloud_max_profiles` bounds how many are asked, and the evidence
    records their names, so a run says which estates it touched.
+9. **The machine's own cloud role is never picked up by default.** With no
+   credentials elsewhere, the AWS CLI asks the instance-metadata address,
+   169.254.169.254, and on a cloud VM that hands the run the VM's role without
+   anyone choosing it. Every `aws` child Squawk starts carries
+   `AWS_EC2_METADATA_DISABLED=true`. On a VM whose role is the identity you
+   mean, `SQUAWK_AWS_IMDS=1` leaves the lookup on (rule 3 still names it).
 
 ## Built to the review standard
 

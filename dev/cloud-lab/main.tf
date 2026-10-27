@@ -27,8 +27,11 @@ resource "aws_iam_role" "auditor" {
   })
 }
 
+# ViewOnlyAccess is a job-function policy, and its ARN carries that path:
+# arn:aws:iam::aws:policy/job-function/ViewOnlyAccess. The bare name is no
+# policy at all, and apply stopped on it the first time the lab ran (in Moto).
 resource "aws_iam_role_policy_attachment" "auditor" {
-  for_each   = toset(["SecurityAudit", "ViewOnlyAccess"])
+  for_each   = toset(["SecurityAudit", "job-function/ViewOnlyAccess"])
   role       = aws_iam_role.auditor.name
   policy_arn = "arn:aws:iam::aws:policy/${each.value}"
 }

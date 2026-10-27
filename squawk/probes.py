@@ -1,8 +1,11 @@
 """Squawk's own probes that run in-process: target recon, the skill audit, the host self-audit."""
 
+import base64
 import configparser
 import fnmatch
 import hashlib
+import hmac
+import http.cookiejar
 import io
 import json
 import logging
@@ -35,6 +38,7 @@ from squawk.core import (
     _report,
     _rows,
     app_sources,
+    aws_child_env,
     env,
     evidence_writable,
     is_contaminated,
@@ -204,6 +208,187 @@ AST10 = {
     "AST09": ("No Governance", "medium"),
     "AST10": ("Cross-Platform Reuse", "medium"),
 }
+
+
+# ---- the AI domain: garak orchestration ------------------------------------
+# garak (NVIDIA's LLM vulnerability scanner) is the AI domain's dynamic scanner,
+# the way ZAP is the web domain's. squawk ORCHESTRATES it -- writes a REST
+# config, runs it, reads its report -- and never imports it: garak pulls in
+# gigabytes of ML dependencies, and squawk is stdlib-only on Python 3.9.
+
+AI_GARAK_PROBES = ("promptinject", "latentinjection", "dan", "sysprompt_extraction")
+
+
+def _garak_bin() -> str:
+    """The garak executable, or "" when there is none. garak is an external
+    tool, so it is found on PATH or named by SQUAWK_GARAK_BIN (a venv install)."""
+    return env("GARAK_BIN") or (tool_path("garak") or "")
+
+
+def _garak_timeout() -> int:
+    """How long garak may run, in seconds. The default (90 min) suits a hosted
+    endpoint; a slow local model that answers one request at a time can take
+    hours for the full probe set, so SQUAWK_AI_GARAK_TIMEOUT raises the budget
+    for a deliberate long run. A non-positive or unparsable value falls back to
+    the default rather than meaning "no limit" by accident."""
+    raw = env("AI_GARAK_TIMEOUT")
+    if raw:
+        try:
+            val = int(raw)
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+    return 5400
+
+
+def _garak_request_timeout() -> int:
+    """How long garak waits on a single HTTP response, in seconds. garak aborts
+    the whole run on one read timeout, so against a slow local model that can
+    take a minute to answer, the 60s default ends the scan after the first slow
+    reply. SQUAWK_AI_GARAK_REQUEST_TIMEOUT raises the per-request wait; a
+    non-positive or unparsable value falls back to the default."""
+    raw = env("AI_GARAK_REQUEST_TIMEOUT")
+    if raw:
+        try:
+            val = int(raw)
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+    return 60
+
+
+def _garak_probes() -> Tuple[str, ...]:
+    """The probe families (or specific probes) garak runs. The default is the
+    four LLM01/LLM07 families; SQUAWK_AI_GARAK_PROBES overrides it with a
+    comma-separated list, so a probe that overwhelms a given target can be left
+    out (a single heavy probe like dan.DanInTheWild can 502 a small local model
+    and abort the run) without dropping the rest. An empty or whitespace-only
+    value falls back to the default."""
+    raw = env("AI_GARAK_PROBES")
+    if raw:
+        items = tuple(p.strip() for p in raw.split(",") if p.strip())
+        if items:
+            return items
+    return AI_GARAK_PROBES
+
+
+def ai_garak_rest_config(target: str, has_key: bool) -> Dict[str, object]:
+    """A garak REST generator config for a JSON-over-HTTP LLM app. The request
+    and response field names default to the common shape and are overridable
+    (SQUAWK_AI_INPUT_FIELD / SQUAWK_AI_ANSWER_FIELD), so one endpoint can be
+    described without hand-writing a garak config. `$KEY` is garak's own
+    placeholder, filled from REST_API_KEY by garak -- squawk never holds the key,
+    and asks for the bearer header only when a key is present, so an open
+    endpoint is scannable too."""
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    if has_key:
+        headers["Authorization"] = "Bearer $KEY"
+    return {"rest": {"RestGenerator": {
+        "name": "squawk-ai-probe",
+        "uri": target,
+        "method": "post",
+        "headers": headers,
+        "req_template_json_object": {env("AI_INPUT_FIELD") or "prompt": "$INPUT"},
+        "response_json": True,
+        "response_json_field": env("AI_ANSWER_FIELD") or "answer",
+        "request_timeout": _garak_request_timeout(),
+    }}}
+
+
+def ai_garak_probe(ctx: "RunContext") -> "Union[str, Tuple[str, str, str]]":
+    """Red-team an LLM app with garak, as an external tool. squawk writes a REST
+    config, runs garak's default probe set against the target, reads garak's
+    JSONL report, and returns a per-probe summary. Returns (json, status, detail)
+    so a missing garak or a run that wrote no report is `error`, never a clean
+    empty result.
+
+    Coverage before conclusion: garak runs the four families alphabetically and
+    can die partway through (a slow target, a dropped connection), leaving a
+    report with only the families it reached. A run that produced no eval
+    records for every requested family, or that garak exited non-zero on, is a
+    `gap`, not a clean `ok` -- otherwise a cut-off scan reads as a completed one.
+    The payload names which families ran and which did not, for the coverage
+    line and for a reader."""
+    empty = json.dumps({"target": ctx.target, "probes": []}, indent=2)
+    garak = _garak_bin()
+    if not garak:
+        return (empty, "error",
+                "garak not installed -- put it on PATH or set SQUAWK_GARAK_BIN "
+                "(it is an external scanner; squawk does not ship it)")
+
+    run_dir = os.path.dirname(ctx.raw_path) or "."
+    cfg_path = os.path.join(run_dir, "garak-rest.json")
+    raw_cfg = env("AI_GARAK_CONFIG")        # a raw garak config overrides the generated one
+    try:
+        if raw_cfg:
+            shutil.copyfile(raw_cfg, cfg_path)
+        else:
+            with open(cfg_path, "w", encoding="utf-8") as fh:
+                json.dump(ai_garak_rest_config(ctx.target,
+                                               bool(os.environ.get("REST_API_KEY"))), fh)
+    except OSError as exc:
+        return (empty, "error", "could not write the garak config: %s" % exc)
+
+    requested = _garak_probes()
+    prefix = os.path.join(run_dir, "garak")
+    code, _out, err = run_cmd(
+        [garak, "--model_type", "rest", "-G", cfg_path, "--probes",
+         ",".join(requested), "--generations", "1",
+         "--report_prefix", prefix], run_dir, _garak_timeout())
+    report = prefix + ".report.jsonl"
+    if not os.path.isfile(report):
+        lines = (err or "no report written").strip().splitlines()
+        return (empty, "error", "garak wrote no report (rc=%d): %s"
+                % (code, redact_identifiers(lines[-1] if lines else "")[:200]))
+
+    probes_out: List[dict] = []
+    with open(report, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(d, dict) or d.get("entry_type") != "eval":
+                continue
+            total = int(d.get("total_evaluated") or 0)
+            fails = int(d.get("fails") or 0)          # attacks that got through
+            score = (d.get("hit_at_k") or {}).get("1", {}).get("score")
+            rate = float(score) if isinstance(score, (int, float)) else (
+                fails / total if total else 0.0)
+            probes_out.append({
+                "probe": str(d.get("probe", "")), "detector": str(d.get("detector", "")),
+                "total": total, "succeeded": fails, "resisted": int(d.get("passed") or 0),
+                "rate": rate, "ci_low": d.get("confidence_lower"),
+                "ci_high": d.get("confidence_upper")})
+
+    requested_families = sorted({p.split(".")[0] for p in requested})
+    families_ran = sorted({p["probe"].split(".")[0]
+                           for p in probes_out if p.get("probe")})
+    missing = [f for f in requested_families if f not in families_ran]
+    payload = json.dumps({
+        "target": ctx.target, "probes": probes_out,
+        "requested": list(requested), "families_ran": families_ran,
+        "families_missing": missing, "garak_rc": code,
+        "report": os.path.basename(report)}, indent=2)
+    if not probes_out:
+        return (payload, "gap",
+                "garak ran but its report held no eval records (rc=%d)" % code)
+    if missing or code != 0:
+        why = []
+        if missing:
+            why.append("%d of %d probe families produced no results (%s)"
+                       % (len(missing), len(requested_families), ", ".join(missing)))
+        if code != 0:
+            tail = (err or "").strip().splitlines()
+            why.append("garak exited rc=%d%s" % (code, (": "
+                       + redact_identifiers(tail[-1])[:160]) if tail else ""))
+        return (payload, "gap", "coverage is partial -- " + "; ".join(why))
+    return payload
 
 
 def _read_text(path: str) -> str:
@@ -2833,15 +3018,18 @@ def _lambda_functions(region: str, limit: int,
 
 
 def _function_url(region: str, name: str, timeout: int) -> Optional[dict]:
-    """A function's URL configuration, or None when it has none.
+    """A function's URL configuration, or None when it has none: an empty
+    list, or AWS's ResourceNotFoundException for a function gone since it was
+    listed. Any other failure is a URL whose auth is unknown.
 
-    "No URL" is the common case and comes back as an error, so the error text
-    is the answer -- distinguished from a permissions failure, which is not."""
+    The test is AWS's error code, not the words "not found". Those are also
+    what an endpoint says about a call it does not implement -- an emulator's
+    404 page -- and reading that as "no URL" made a failed read look like a
+    clean one (found in Moto, 2026-10-16)."""
     data, why = _aws_json(["lambda", "list-function-url-configs",
                            "--function-name", name, "--region", region], timeout)
     if data is None:
-        low = why.lower()
-        if "resourcenotfound" in low or "not found" in low:
+        if "resourcenotfound" in why.lower():
             return None
         return {"auth": "unknown", "url": "", "why": why, "cors": []}
     configs = _rows(data.get("FunctionUrlConfigs"))
@@ -2932,9 +3120,8 @@ def aws_edge(ctx: "RunContext") -> "Union[str, Tuple[str, str, str]]":
             conf = _function_url(region, fn["name"], call_timeout)
             if conf:
                 urls.append(dict(fn, **conf))
-                # "No URL" is an answer and comes back as an error, so
-                # `_function_url` reads the error text to tell the two apart.
-                # A refusal takes the other branch and lands here with
+                # "No URL" is an answer, and `_function_url` tells it from a
+                # failure by AWS's error code. A refusal lands here with
                 # auth "unknown" — a URL whose authentication nobody could
                 # read, which is exactly the row that must not sit under a
                 # green stage (denial sweep, 2026-09-12).
@@ -3017,7 +3204,14 @@ def _bucket_facts(name: str, region: str, timeout: int) -> dict:
         else:
             unreadable.append("policy status (%s)" % why)
     else:
-        row["public"] = bool((status.get("PolicyStatus") or {}).get("IsPublic"))
+        # An answer with no IsPublic says nothing either way. Read as False, it
+        # was a private bucket; an emulator that does not evaluate policies
+        # answers exactly this (found in Moto, 2026-10-16).
+        is_public = (status.get("PolicyStatus") or {}).get("IsPublic")
+        if isinstance(is_public, bool):
+            row["public"] = is_public
+        else:
+            unreadable.append("policy status (the answer has no IsPublic)")
 
     block, why = _aws_json(["s3api", "get-public-access-block",
                             "--bucket", name, *args], timeout)
@@ -3438,7 +3632,7 @@ def _aws_json_env(argv: List[str], timeout: int,
     resolves the profile itself, exactly as it does for the run's own identity
     (credential rules 1 and 3)."""
     _CALLS["n"] += 1
-    child = dict(os.environ)
+    child = aws_child_env()
     child.update(env)
     child.pop("AWS_ACCESS_KEY_ID", None)
     child.pop("AWS_SECRET_ACCESS_KEY", None)
@@ -4438,20 +4632,26 @@ def _eks_clusters(region: str, timeout: int) -> Tuple[List[dict], List[str]]:
 
 
 def _ecs_services(region: str, timeout: int, deadline: float,
-                  limit: int) -> Tuple[List[dict], List[str], bool]:
-    """(services, why any read failed, whether a list was longer than the cap).
+                  limit: int) -> Tuple[List[dict], List[str], List[str], bool]:
+    """(services, the clusters read, why any read failed, whether a list was
+    longer than the cap).
 
-    The third value is new. Both slices below were silent caps: an account with
+    The last value is new. Both slices below were silent caps: an account with
     more clusters or more services than the limit reported the first N and said
-    nothing, which is the truncation I12 forbids."""
+    nothing, which is the truncation I12 forbids.
+
+    The clusters are kept by name. Only their services were, so a cluster with
+    none left no trace: the evidence could not show it had been read, and the
+    lab's empty cluster was missing from it (found in Moto, 2026-10-16)."""
     data, why = _aws_json(["ecs", "list-clusters", "--region", region], timeout)
     if data is None:
-        return [], ["ECS clusters (%s)" % why], False
+        return [], [], ["ECS clusters (%s)" % why], False
     out: List[dict] = []
     unreadable: List[str] = []
     truncated = False
     all_clusters = [str(a) for a in (data.get("clusterArns") or [])]
     truncated = truncated or len(all_clusters) > limit
+    names = [a.rsplit("/", 1)[-1] for a in all_clusters[:limit]]
     for arn in all_clusters[:limit]:
         if time.monotonic() >= deadline:
             unreadable.append("ECS services in %s (the budget ran out)" % region)
@@ -4486,7 +4686,7 @@ def _ecs_services(region: str, timeout: int, deadline: float,
                     "subnets": [str(s) for s in (net.get("subnets") or [])],
                     "groups": [str(g) for g in (net.get("securityGroups") or [])],
                     "running": svc.get("runningCount") or 0})
-    return out, unreadable, truncated
+    return out, names, unreadable, truncated
 
 
 def aws_containers(ctx: "RunContext") -> "Union[str, Tuple[str, str, str]]":
@@ -4522,10 +4722,11 @@ def aws_containers(ctx: "RunContext") -> "Union[str, Tuple[str, str, str]]":
             unread.append(region)
             continue
         clusters, eks_bad = _eks_clusters(region, call_timeout)
-        services, ecs_bad, more = _ecs_services(region, call_timeout, deadline,
-                                                limit)
+        services, ecs_clusters, ecs_bad, more = _ecs_services(
+            region, call_timeout, deadline, limit)
         truncated = truncated or more
         regional[region] = {"eks": clusters, "ecs": services,
+                            "ecs_clusters": ecs_clusters,
                             "unreadable": eks_bad + ecs_bad}
 
     payload = {
@@ -4744,11 +4945,644 @@ def aws_dataservices(ctx: "RunContext") -> "Union[str, Tuple[str, str, str]]":
                     "data-service read(s)")
 
 
+
+
+#: Two request identities for the object-authorization probe, from the
+#: environment so a token never reaches argv or a profile (PRODUCT rule 1). Each
+#: value is a header spec, `Name: value`, comma-separated for more than one
+#: header. Unset, the probe uses two distinct tenant headers and says so: a
+#: cross-read then means "readable with no scoping credential", which is still
+#: the finding on an API that enforces none.
+AUTHZ_ENV = ("SQUAWK_AUTHZ_A", "SQUAWK_AUTHZ_B")
+AUTHZ_DEFAULT = ({"X-Tenant-Id": "squawk-authz-a"}, {"X-Tenant-Id": "squawk-authz-b"})
+_AUTHZ_MARKER = "squawk-authz-"
+
+
+def _authz_headers() -> Tuple[List[Tuple[str, Dict[str, str]]], bool]:
+    """(identities, configured): [("A", headers), ("B", headers)] and whether
+    they came from the environment rather than the default."""
+    out, configured = [], False
+    for name, var in (("A", AUTHZ_ENV[0]), ("B", AUTHZ_ENV[1])):
+        spec = (os.environ.get(var) or "").strip()
+        headers: Dict[str, str] = {}
+        if spec:
+            configured = True
+            for pair in spec.split(","):
+                if ":" in pair:
+                    k, _, v = pair.partition(":")
+                    headers[k.strip()] = v.strip()
+        out.append((name, headers))
+    if not configured:
+        out = [("A", dict(AUTHZ_DEFAULT[0])), ("B", dict(AUTHZ_DEFAULT[1]))]
+    return out, configured
+
+
+def _authz_req(method: str, url: str, headers: Optional[dict] = None,
+               body: Optional[dict] = None, timeout: float = 8.0
+               ) -> Tuple[Optional[int], str]:
+    data = json.dumps(body).encode() if body is not None else None
+    h = {"Accept": "application/json", "User-Agent": "Squawk-authz"}
+    if data is not None:
+        h["Content-Type"] = "application/json"
+    h.update(headers or {})
+    req = urllib.request.Request(url, data=data, method=method, headers=h)
+    ctx = ssl._create_unverified_context()
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout, context=ctx)
+        return resp.getcode(), resp.read(8192).decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return exc.code, (exc.read(2048).decode("utf-8", "replace") if exc.fp else "")
+    except (urllib.error.URLError, OSError, ValueError):
+        return None, ""
+
+
+def _authz_resolve(schema: dict, root: dict) -> dict:
+    """Follow one $ref into the document's components; return {} on a miss."""
+    if isinstance(schema, dict) and "$ref" in schema:
+        node: object = root
+        for part in str(schema["$ref"]).lstrip("#/").split("/"):
+            node = node.get(part, {}) if isinstance(node, dict) else {}
+        return node if isinstance(node, dict) else {}
+    return schema if isinstance(schema, dict) else {}
+
+
+def _authz_dummy(prop: dict, root: dict, marker: str) -> object:
+    """A minimal value for a property by type; a string carries the marker."""
+    prop = _authz_resolve(prop, root)
+    kind = prop.get("type")
+    if isinstance(prop.get("anyOf"), list):          # pydantic Optional -> anyOf
+        kind = next((_authz_resolve(x, root).get("type") for x in prop["anyOf"]
+                     if _authz_resolve(x, root).get("type") not in (None, "null")), "string")
+    return {"string": marker, "integer": 1, "number": 1, "boolean": True,
+            "array": [], "object": {}}.get(str(kind), marker)
+
+
+def _authz_body(op: dict, root: dict, marker: str) -> dict:
+    content = (op.get("requestBody") or {}).get("content", {})
+    schema = _authz_resolve((content.get("application/json") or {}).get("schema", {}), root)
+    props = schema.get("properties") or {}
+    required = schema.get("required") or list(props.keys())
+    return {name: _authz_dummy(props.get(name, {}), root, marker) for name in required}
+
+
+def _authz_resources(doc: dict) -> List[dict]:
+    """Collections with both a create (POST) and a read-by-id (GET /{param})."""
+    paths = doc.get("paths") or {}
+    out = []
+    for item_path, item_ops in paths.items():
+        if not (isinstance(item_path, str) and item_path.endswith("}") and "/{" in item_path):
+            continue
+        collection = item_path[:item_path.rindex("/{")]
+        id_param = item_path[item_path.rindex("{") + 1:-1]
+        coll_ops = paths.get(collection) or {}
+        item_ops = item_ops or {}
+        # presence, not truthiness: an operation defined as an empty object
+        # still exists (OpenAPI allows it), so `in`, never `.get()` as a bool.
+        if "get" in item_ops and isinstance(coll_ops, dict) and "post" in coll_ops:
+            out.append({"collection": collection, "item": item_path, "id_param": id_param,
+                        "create": coll_ops["post"], "list": "get" in coll_ops,
+                        "delete": "delete" in item_ops})
+    return out
+
+
+def authz_probe(ctx: "RunContext") -> "Union[str, Tuple[str, str, str]]":
+    """Test whether an object created under one request identity is readable
+    under another: OWASP API1 (BOLA). Reads the OpenAPI schema, seeds a canary
+    per identity, replays each read under the other identity, and reports the
+    cross-identity reads. Read-only after seeding; deletes its canaries.
+
+    Returns JSON {schema, identities, configured, objects, tested, findings} or,
+    with nothing to test, (json, "gap", reason)."""
+    base = (ctx.target or "").rstrip("/")
+    low = base.lower().split("?")[0]
+    schema_url = base if low.endswith((".json", ".yaml", ".yml")) else base + "/openapi.json"
+    code, text = _authz_req("GET", schema_url)
+    empty = json.dumps({"schema": schema_url})
+    if code != 200 or not text.strip():
+        return (empty, "gap", "no OpenAPI schema at %s (HTTP %s)" % (schema_url, code))
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return (empty, "error", "the schema at %s is not JSON" % schema_url)
+    origin = schema_url[:schema_url.rindex("/")] if schema_url.endswith(("openapi.json",)) \
+        else "%s://%s" % (urllib.parse.urlparse(base).scheme or "http",
+                          urllib.parse.urlparse(base).netloc)
+    resources = _authz_resources(doc)
+    if not resources:
+        return (json.dumps({"schema": schema_url, "resources": []}), "gap",
+                "no create + read-by-id pair in the schema to test object authorization")
+
+    identities, configured = _authz_headers()
+    findings: List[dict] = []
+    objects: List[dict] = []
+    tested = 0
+    cleanup: List[Tuple[str, dict]] = []
+    for res in resources[:10]:
+        item_tmpl = origin + res["item"]
+        coll_url = origin + res["collection"]
+        seeded: Dict[str, dict] = {}
+        for name, hdrs in identities:
+            marker = _AUTHZ_MARKER + secrets.token_hex(6)
+            code, text = _authz_req("POST", coll_url, hdrs, _authz_body(res["create"], doc, marker))
+            if code in (200, 201):
+                try:
+                    data = json.loads(text)
+                    data = data if isinstance(data, dict) else {}
+                    oid = data.get(res["id_param"])
+                    oid = oid if oid is not None else data.get("id")
+                except ValueError:
+                    oid = None
+                if oid is not None:
+                    seeded[name] = {"id": oid, "marker": marker}
+                    objects.append({"owner": name, "id": str(oid)})
+                    if res.get("delete"):
+                        cleanup.append(
+                            (item_tmpl.replace("{%s}" % res["id_param"], str(oid)), hdrs))
+        for reader, hdrs in identities:
+            for owner, obj in seeded.items():
+                if owner == reader:
+                    continue
+                url = item_tmpl.replace("{%s}" % res["id_param"], str(obj["id"]))
+                code, text = _authz_req("GET", url, hdrs)
+                tested += 1
+                if code == 200 and obj["marker"] in text:
+                    findings.append({
+                        "kind": "cross-object-read", "endpoint": "GET " + res["item"],
+                        "reader": reader, "owner": owner, "status": code})
+        if res.get("list") and len(seeded) >= 2:
+            for reader, hdrs in identities:
+                code, text = _authz_req("GET", coll_url, hdrs)
+                tested += 1
+                exposed = [n for n, o in seeded.items() if n != reader and o["marker"] in text]
+                if code == 200 and exposed:
+                    findings.append({
+                        "kind": "cross-object-list", "endpoint": "GET " + res["collection"],
+                        "reader": reader, "exposed": len(exposed), "status": code})
+    for url, hdrs in cleanup:
+        _authz_req("DELETE", url, hdrs)
+    return json.dumps({"schema": schema_url, "resources": [r["item"] for r in resources],
+                       "identities": [n for n, _ in identities], "configured": configured,
+                       "objects": objects, "tested": tested, "findings": findings})
+
+
+#: Authenticated web probe config, all from the environment so no credential
+#: reaches argv or a profile (PRODUCT rule 1). The login flow is configurable
+#: because every app's is different: the probe is general, the target's specifics
+#: are supplied per engagement.
+#:   SQUAWK_WEBAUTH_PATH    the login path on the target (default /login)
+#:   SQUAWK_WEBAUTH_LOGIN   a full login URL; it MUST be the same host as --target
+#:                          (the probe refuses otherwise), so the private-target
+#:                          rail that cleared --target still covers where it connects
+#:   SQUAWK_WEBAUTH_METHOD  POST (default) or GET
+#:   SQUAWK_WEBAUTH_FIELDS  the username,password field names (default username,password)
+#:   SQUAWK_WEBAUTH_A/_B    an identity as user:pass (A required; B reserved for cross-user tests)
+#:   SQUAWK_WEBAUTH_PATHS   relative paths reachable only when authenticated; an
+#:                          absolute URL is refused (it would escape the gated host)
+#:   SQUAWK_WEBAUTH_EXTRA   extra static login-form fields as k=v,k=v — the hidden
+#:                          fields a login needs (an OAuth client_id/redirect_uri,
+#:                          a CSRF token); the credential fields still win
+#:   SQUAWK_WEBAUTH_SECRETS candidate session-signing keys as k1,k2 for the
+#:                          weak-session-key check (an engagement's suspected key,
+#:                          e.g. one a SAST run found in source)
+#:   SQUAWK_WEBAUTH_SECRET_FILE  a wordlist file of candidate keys, one per line
+#:   SQUAWK_WEBAUTH_CHECKS  limit to these checks by name (default: all)
+WEBAUTH_ENV = "SQUAWK_WEBAUTH_"
+
+
+def _webauth_host(url: str) -> str:
+    """The lowercased hostname of a URL, '' if none."""
+    return (urllib.parse.urlparse(url).hostname or "").lower()
+
+
+def _webauth_config(base: str = "") -> dict:
+    g = lambda k, d="": (os.environ.get(WEBAUTH_ENV + k) or d).strip()  # noqa: E731
+    fields = [f.strip() for f in (g("FIELDS", "username,password")).split(",")][:2]
+    ids = {}
+    for name in ("A", "B"):
+        spec = g(name)
+        if spec and ":" in spec:
+            u, _, p = spec.partition(":")
+            ids[name] = (u.strip(), p)
+    base = (base or "").rstrip("/")
+    login = g("LOGIN") or (base + (g("PATH", "/login") or "/login") if base else "")
+    paths: List[str] = []
+    dropped: List[str] = []
+    for raw in g("PATHS").split(","):
+        p = raw.strip()
+        if not p:
+            continue
+        parsed = urllib.parse.urlparse(p)
+        if parsed.scheme or parsed.netloc:    # an absolute URL escapes the gated host
+            dropped.append(p)
+        else:
+            paths.append(p)
+    if dropped:
+        LOG.warning("webauth REFUSED off-target path(s) (not relative to --target): %s",
+                    ", ".join(dropped))
+    extra: Dict[str, str] = {}
+    for pair in g("EXTRA").split(","):
+        pair = pair.strip()
+        if "=" in pair:
+            k, _, v = pair.partition("=")
+            extra[k.strip()] = v.strip()
+    operator_secrets = [s.strip() for s in g("SECRETS").split(",") if s.strip()]
+    secret_file = g("SECRET_FILE")
+    if secret_file:
+        try:
+            with open(secret_file, encoding="utf-8", errors="replace") as fh:
+                operator_secrets += [ln.strip() for ln in fh if ln.strip()]
+        except OSError as exc:
+            LOG.warning("webauth could not read SQUAWK_WEBAUTH_SECRET_FILE %s: %s",
+                        secret_file, exc)
+    # operator candidates first (an engagement's suspected key is the point), then
+    # the common defaults; de-duplicated, order preserved.
+    secrets_list: List[str] = []
+    for s in operator_secrets + list(_WEBAUTH_COMMON_SECRETS):
+        if s not in secrets_list:
+            secrets_list.append(s)
+    return {
+        "base": base,
+        "login": login,
+        "method": (g("METHOD", "POST") or "POST").upper(),
+        "user_field": fields[0] if fields else "username",
+        "pass_field": fields[1] if len(fields) > 1 else "password",
+        "identities": ids,
+        "paths": paths,
+        "dropped_paths": dropped,
+        "extra": extra,
+        "secrets": secrets_list,
+        "operator_secrets": operator_secrets,
+        "only": [c.strip() for c in g("CHECKS").split(",") if c.strip()],
+    }
+
+
+def _webauth_opener():
+    """A urllib opener with its own cookie jar, no cert check (test targets)."""
+    jar = http.cookiejar.CookieJar()
+    handler = urllib.request.HTTPCookieProcessor(jar)
+    https = urllib.request.HTTPSHandler(context=ssl._create_unverified_context())
+    return urllib.request.build_opener(handler, https), jar
+
+
+def _webauth_send(opener, url, method="GET", data=None, timeout=8.0, limit=8192):
+    """One request through the opener (carrying its cookies). Returns
+    (status, body, set_cookie_headers). `limit` caps the body read — a content
+    comparison reads more than a login, so a large page is not truncated to a
+    prefix two different pages happen to share."""
+    body = None
+    if data is not None:
+        body = urllib.parse.urlencode(data).encode()
+    req = urllib.request.Request(url, data=body, method=method,
+                                 headers={"User-Agent": "Squawk-webauth"})
+    try:
+        resp = opener.open(req, timeout=timeout)
+        return resp.getcode(), resp.read(limit).decode("utf-8", "replace"), \
+            resp.headers.get_all("Set-Cookie") or []
+    except urllib.error.HTTPError as exc:
+        return exc.code, (exc.read(limit).decode("utf-8", "replace") if exc.fp else ""), \
+            exc.headers.get_all("Set-Cookie") or []
+    except (urllib.error.URLError, OSError, ValueError):
+        return None, "", []
+
+
+#: One hidden form <input>, and the name / value out of such a tag. Attribute
+#: order varies, quotes may be single, double or absent, so each is read on its
+#: own rather than with one positional pattern.
+_WEBAUTH_HIDDEN_INPUT = re.compile(
+    r"<input\b[^>]*\btype\s*=\s*[\"']?hidden[\"']?[^>]*>", re.IGNORECASE)
+_WEBAUTH_INPUT_NAME = re.compile(r"\bname\s*=\s*[\"']?([^\"'\s>]+)", re.IGNORECASE)
+_WEBAUTH_INPUT_VALUE = re.compile(r"\bvalue\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]*))",
+                                  re.IGNORECASE)
+
+
+def _webauth_form_hidden(opener, url: str) -> "Dict[str, str]":
+    """GET the login page through the opener and return its hidden form fields
+    {name: value}. This carries a per-request anti-CSRF token — DVWA's
+    `user_token`, Rails' `authenticity_token`, a Flask-WTF `csrf_token` — into
+    the login POST. The token is bound to the session the GET established, so the
+    same opener MUST make both requests (its jar already holds that cookie).
+    Operator SQUAWK_WEBAUTH_EXTRA overrides these, and the credentials override
+    all; a GET that returns no form just yields {}."""
+    _status, body, _setc = _webauth_send(opener, url, "GET", None, limit=131072)
+    hidden: Dict[str, str] = {}
+    if not body:
+        return hidden
+    for tag in _WEBAUTH_HIDDEN_INPUT.findall(body):
+        name = _WEBAUTH_INPUT_NAME.search(tag)
+        if not name:
+            continue
+        value = _WEBAUTH_INPUT_VALUE.search(tag)
+        groups = [g for g in value.groups() if g is not None] if value else []
+        hidden[name.group(1)] = groups[0] if groups else ""
+    return hidden
+
+
+def _webauth_login(cfg, user, pw):
+    """Log one identity in. The opener follows the login redirect, so the
+    session cookie lands in the jar (not in the final response's headers).
+    Returns (opener, jar, status, body) — the body is the final (followed) page,
+    used to tell a credentialed login from a bad-credential one."""
+    opener, jar = _webauth_opener()
+    data: Dict[str, str] = {}
+    if cfg["method"] == "POST":
+        # Pick up a per-request CSRF token from the form itself; without this the
+        # probe cannot log in to any app whose login carries one (DVWA et al.),
+        # and valid credentials look the same as a bad-credential control.
+        data.update(_webauth_form_hidden(opener, cfg["login"]))
+    data.update(cfg.get("extra") or {})     # operator hidden fields override the scraped ones
+    data[cfg["user_field"]] = user          # the credentials win over everything
+    data[cfg["pass_field"]] = pw
+    status, body, _setc = _webauth_send(opener, cfg["login"], cfg["method"], data)
+    return opener, jar, status, body
+
+
+def _webauth_cookie_names(jar) -> "frozenset":
+    return frozenset(c.name for c in jar)
+
+
+def _webauth_cookie_sent(jar, url: str) -> bool:
+    """True if the jar would send at least one cookie to `url`, honouring the
+    Secure flag against the url's scheme. A Secure cookie is not sent over plain
+    http, so an http probe of a correctly-hardened app carries no session — and
+    then an authed request equals an anonymous one for a reason that is not a
+    finding, so the caller skips rather than reports it."""
+    parsed = urllib.parse.urlparse(url)
+    https = parsed.scheme == "https"
+    host = (parsed.hostname or "").lower()
+    for c in jar:
+        if c.secure and not https:
+            continue
+        dom = (c.domain or "").lstrip(".").lower()
+        if not dom or host == dom or host.endswith("." + dom):
+            return True
+    return False
+
+
+#: Client-settable headers an app must never trust for authorization. Each is
+#: replayed with an internal/loopback value to see if a protected path opens up.
+_WEBAUTH_SPOOF_HEADERS = (
+    "X-Forwarded-For", "X-Real-IP", "X-Originating-IP", "X-Client-IP",
+    "X-Forwarded-Host", "X-Remote-Addr", "X-Remote-IP",
+)
+#: Genuinely common placeholder / default Flask session keys. Short on purpose:
+#: a weak-key check is only as good as its list, and the operator adds the ones
+#: an engagement suspects via SQUAWK_WEBAUTH_SECRETS / _SECRET_FILE. Not a
+#: brute-force — a confirmation that the live session validates under a key.
+_WEBAUTH_COMMON_SECRETS = (
+    "secret", "secret-key", "secret_key", "secretkey", "dev", "development",
+    "dev-secret-key", "changeme", "change-me", "changemeplease", "your-secret-key",
+    "please-change-me", "flask-secret-key", "flask", "supersecret", "supersecretkey",
+    "mysecret", "key", "password", "test", "changethis", "notsecret",
+)
+
+
+def _flask_session_key_matches(cookie: str, secret, salt: bytes = b"cookie-session") -> bool:
+    """True if `cookie` (a Flask / itsdangerous session value) is signed with
+    `secret`. Verify-only, offline: no forging and no requests. It covers
+    Flask's default — SHA1 HMAC, 'hmac' key derivation, salt 'cookie-session' —
+    and handles a zlib-compressed payload (a leading '.'), so a match means the
+    signing key is known and the session is forgeable."""
+    idx = cookie.rfind(".")                         # the signature is the final dot-field
+    if idx <= 0 or "." not in cookie[:idx]:         # need payload.timestamp before it
+        return False
+    key = secret.encode() if isinstance(secret, str) else secret
+    derived = hmac.new(key, salt, hashlib.sha1).digest()
+    expected = hmac.new(derived, cookie[:idx].encode(), hashlib.sha1).digest()
+    try:
+        given = base64.urlsafe_b64decode(cookie[idx + 1:] + "=" * (-len(cookie[idx + 1:]) % 4))
+    except Exception:
+        return False
+    return hmac.compare_digest(expected, given)
+
+
+# -- the checks. Each takes (sessions, cfg) and returns a list of finding dicts.
+#    Add a test by writing a function and registering it in _WEBAUTH_CHECKS. ----
+
+def _check_session_cookie_flags(sessions, cfg):
+    """Session cookies set at login that lack HttpOnly / Secure / SameSite. Read
+    from the cookie jar (the opener follows the login redirect, so the raw
+    Set-Cookie header is gone by the final response, but the jar holds it)."""
+    out = []
+    for s in sessions.values():
+        for c in s["jar"]:
+            missing = []
+            if not c.secure:
+                missing.append("Secure")
+            if not c.has_nonstandard_attr("HttpOnly"):
+                missing.append("HttpOnly")
+            if not (c.has_nonstandard_attr("SameSite") or c.has_nonstandard_attr("samesite")):
+                missing.append("SameSite")
+            if missing:
+                out.append({"check": "session-cookie-flags",
+                            "detail": "cookie %s set at login is missing %s"
+                                      % (c.name, ", ".join(missing)),
+                            "severity": "medium", "where": "login"})
+        break  # one identity's login cookie is representative
+    return out
+
+
+def _check_login_user_enumeration(sessions, cfg):
+    """A valid username and an unknown username give different login responses
+    (status or body length) on a wrong password -> username enumeration."""
+    anyid = next(iter(cfg["identities"].values()), None)
+    if not anyid:
+        return []
+    opener, _ = _webauth_opener()
+    good_u = anyid[0]
+    s1, b1, _ = _webauth_send(opener, cfg["login"], cfg["method"],
+                              {cfg["user_field"]: good_u, cfg["pass_field"]: "squawk-wrong-x9"})
+    opener2, _ = _webauth_opener()
+    s2, b2, _ = _webauth_send(opener2, cfg["login"], cfg["method"],
+                              {cfg["user_field"]: "squawk-nouser-x9",
+                               cfg["pass_field"]: "squawk-wrong-x9"})
+    if s1 is None or s2 is None:
+        return []
+    if s1 != s2 or abs(len(b1) - len(b2)) > 16:
+        return [{"check": "login-user-enumeration",
+                 "detail": "a known and an unknown username give different login "
+                           "responses (status %s/%s, length %d/%d)" % (s1, s2, len(b1), len(b2)),
+                 "severity": "low", "where": "login"}]
+    return []
+
+
+def _check_unauthenticated_access(sessions, cfg):
+    """Configured paths that return the same content to an anonymous client as to
+    the authenticated one -> missing authentication enforcement (broken access
+    control). A path the authenticated session is not actually carried to (a
+    Secure cookie over plain http) is skipped, not reported — otherwise a
+    correctly-hardened app that simply never received the cookie reads as a
+    false finding."""
+    out = []
+    authed = next(iter(sessions.values()), None)
+    if not authed or not cfg["paths"]:
+        return []
+    origin = cfg["base"] or cfg["login"]
+    origin_host = _webauth_host(origin)
+    for path in cfg["paths"]:
+        url = urllib.parse.urljoin(origin + "/", path.lstrip("/"))
+        if _webauth_host(url) != origin_host:         # defence in depth vs a path escape
+            continue
+        if not _webauth_cookie_sent(authed["jar"], url):
+            continue                                  # session not carried here; cannot judge
+        a_status, a_body, _ = _webauth_send(authed["opener"], url, limit=131072)
+        anon, _ = _webauth_opener()
+        u_status, u_body, _ = _webauth_send(anon, url, limit=131072)
+        if a_status == 200 and u_status == 200 and abs(len(a_body) - len(u_body)) <= 16:
+            out.append({"check": "unauthenticated-access",
+                        "detail": "%s returns the same content with no session as "
+                                  "with one (both 200)" % path,
+                        "severity": "high", "where": path})
+    return out
+
+
+def _check_header_trust_authz(sessions, cfg):
+    """A configured path that an anonymous client is DENIED, but is served when
+    the same client sets a spoofed internal-origin header (X-Forwarded-For and
+    kin) -> authorization decided by a client-settable header (broken access
+    control). Needs SQUAWK_WEBAUTH_PATHS; names the exact header that opened it."""
+    out = []
+    if not cfg["paths"]:
+        return []
+    origin = cfg["base"] or cfg["login"]
+    origin_host = _webauth_host(origin)
+    for path in cfg["paths"]:
+        url = urllib.parse.urljoin(origin + "/", path.lstrip("/"))
+        if _webauth_host(url) != origin_host:
+            continue
+        base_status, _b, _ = _webauth_send(_webauth_opener()[0], url)
+        if base_status not in (401, 403, 302, 303):      # only a DENIED baseline can be bypassed
+            continue
+        for header in _WEBAUTH_SPOOF_HEADERS:
+            opener, _ = _webauth_opener()
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "Squawk-webauth", header: "127.0.0.1"})
+            try:
+                status = opener.open(req, timeout=8.0).getcode()
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+            except (urllib.error.URLError, OSError, ValueError):
+                status = None
+            if status == 200:
+                out.append({"check": "header-trust-authz",
+                            "detail": "%s is denied (HTTP %s) to an anonymous client but served "
+                                      "(HTTP 200) when it sets %s — authorization trusts a "
+                                      "client-settable header" % (path, base_status, header),
+                            "severity": "high", "where": path})
+                break                                    # one header named is enough per path
+    return out
+
+
+def _check_weak_session_key(sessions, cfg):
+    """A session cookie signed with a weak or known key (so it can be forged).
+    The live cookie captured at login is verified offline against a short list
+    of common keys plus any the operator supplies (SQUAWK_WEBAUTH_SECRETS /
+    _SECRET_FILE); a match means the session is forgeable. Flask/itsdangerous
+    session cookies only; the key value is never written to the report."""
+    out = []
+    secrets_list = cfg.get("secrets") or []
+    if not secrets_list:
+        return []
+    operator = cfg.get("operator_secrets") or []
+    for s in sessions.values():
+        for c in s["jar"]:
+            val = getattr(c, "value", "") or ""
+            for i, secret in enumerate(secrets_list):
+                if _flask_session_key_matches(val, secret):
+                    src = ("an operator-supplied candidate" if secret in operator
+                           else "a common default key (candidate %d of %d)"
+                           % (i + 1, len(secrets_list)))
+                    out.append({"check": "weak-session-key",
+                                "detail": "the session cookie %r validates under %s — the "
+                                          "signing key is known, so a session (any user, any "
+                                          "role) can be forged" % (c.name, src),
+                                "severity": "critical", "where": "login"})
+                    return out           # one confirmed forgeable cookie is the finding
+        break                            # one identity's session is representative
+    return out
+
+
+#: The check registry. Add a test by registering it here; `SQUAWK_WEBAUTH_CHECKS`
+#: can limit a run to a subset. This is where new tests land as more targets come.
+_WEBAUTH_CHECKS = {
+    "session-cookie-flags": _check_session_cookie_flags,
+    "login-user-enumeration": _check_login_user_enumeration,
+    "unauthenticated-access": _check_unauthenticated_access,
+    "header-trust-authz": _check_header_trust_authz,
+    "weak-session-key": _check_weak_session_key,
+}
+
+
+def webauth_probe(ctx: "RunContext") -> "Union[str, Tuple[str, str, str]]":
+    """Authenticated DAST: log in to a RUNNING web app with configured
+    credentials, then run the authenticated checks. The login flow and the
+    credentials come from the environment (SQUAWK_WEBAUTH_*), never argv or a
+    profile. Returns JSON {login, identities, checks, tested, findings} or, with
+    no login configured, (json, "gap", reason)."""
+    cfg = _webauth_config(ctx.target or "")
+    if not cfg["login"]:
+        return (json.dumps({"login": ""}), "gap",
+                "no login URL — pass --target <url> (login path defaults to /login, "
+                "set SQUAWK_WEBAUTH_PATH to change it) and SQUAWK_WEBAUTH_A=user:pass")
+    if not cfg["identities"]:
+        return (json.dumps({"login": cfg["login"]}), "gap",
+                "no SQUAWK_WEBAUTH_A=user:pass set — nothing to authenticate as")
+    # The CLI's private-target rail gated --target, but the probe connects to the
+    # login URL; refuse a login URL on a different host so the rail still covers
+    # where it actually connects (a SQUAWK_WEBAUTH_LOGIN pointing off-target would
+    # otherwise reach a host nothing cleared).
+    if cfg["base"] and _webauth_host(cfg["login"]) != _webauth_host(cfg["base"]):
+        return (json.dumps({"login": cfg["login"], "base": cfg["base"]}), "error",
+                "SQUAWK_WEBAUTH_LOGIN host (%s) is not the --target host (%s); the "
+                "private-target rail only cleared the target, so the probe refuses to "
+                "connect elsewhere" % (_webauth_host(cfg["login"]), _webauth_host(cfg["base"])))
+    # A cookie set regardless of credentials (a CSRF or anonymous session cookie)
+    # is not proof of authentication, so a login "takes" only when valid creds are
+    # DISTINGUISHABLE from a bad-credential control (status, cookie names, or body).
+    _, ctrl_jar, ctrl_status, ctrl_body = _webauth_login(
+        cfg, "squawk-nouser-x9", "squawk-wrong-x9")
+    ctrl = (ctrl_status, _webauth_cookie_names(ctrl_jar), len(ctrl_body))
+    sessions, logins = {}, []
+    for name, (user, pw) in cfg["identities"].items():
+        opener, jar, status, body = _webauth_login(cfg, user, pw)
+        names = _webauth_cookie_names(jar)
+        distinct = (status != ctrl[0] or names != ctrl[1] or abs(len(body) - ctrl[2]) > 16)
+        ok = bool(names) and distinct
+        sessions[name] = {"opener": opener, "jar": jar, "status": status,
+                          "user": user, "ok": ok}
+        logins.append({"identity": name, "user": user, "status": status, "ok": ok})
+    live = {n: s for n, s in sessions.items() if s["ok"]}
+    if not live:
+        return (json.dumps({"login": cfg["login"], "logins": logins}), "error",
+                "could not confirm authentication for any identity: a cookie did not "
+                "land, or the login looked the same with valid and invalid credentials "
+                "(check SQUAWK_WEBAUTH_METHOD / _FIELDS)")
+    findings: List[dict] = []
+    ran: List[str] = []
+    errors: List[str] = []
+    for check_name, fn in _WEBAUTH_CHECKS.items():
+        if cfg["only"] and check_name not in cfg["only"]:
+            continue
+        try:
+            result = fn(live, cfg) or []
+        except Exception as exc:            # a failed check is surfaced, never a clean zero
+            LOG.warning("webauth check %s could not run: %s", check_name, exc)
+            errors.append(check_name)
+            continue
+        ran.append(check_name)
+        findings.extend(result)
+    return json.dumps({"login": cfg["login"], "logins": logins,
+                       "identities": list(live), "checks": ran, "errors": errors,
+                       "tested": len(ran), "findings": findings})
+
+
 __all__ = [
     'ACCOUNT_KEYS',
     'ADMIN_MARKERS',
+    'AI_GARAK_PROBES',
     'ANALYZER_KINDS',
     'AST10',
+    'AUTHZ_DEFAULT',
+    'AUTHZ_ENV',
     'AWS_MANAGED',
     'BLOCK_SETTINGS',
     'BROAD_POLICIES',
@@ -4784,9 +5618,17 @@ __all__ = [
     'SET_OPERATOR_PREFIXES',
     'SOURCE_ARN_KEY',
     'UNSETTLED_MARKER',
+    'WEBAUTH_ENV',
     '_ACCOUNT_IN_ARN',
+    '_AUTHZ_MARKER',
     '_CALLS',
     '_KNOWN_APPS',
+    '_WEBAUTH_CHECKS',
+    '_WEBAUTH_COMMON_SECRETS',
+    '_WEBAUTH_HIDDEN_INPUT',
+    '_WEBAUTH_INPUT_NAME',
+    '_WEBAUTH_INPUT_VALUE',
+    '_WEBAUTH_SPOOF_HEADERS',
     'PolicyRead',
     '_CallCounter',
     '_access_analyzer',
@@ -4804,12 +5646,23 @@ __all__ = [
     '_audit_skill_md',
     '_audit_time',
     '_audit_trail',
+    '_authz_body',
+    '_authz_dummy',
+    '_authz_headers',
+    '_authz_req',
+    '_authz_resolve',
+    '_authz_resources',
     '_aws_json',
     '_aws_json_env',
     '_brief',
     '_broad_reasons',
     '_bucket_facts',
     '_budget',
+    '_check_header_trust_authz',
+    '_check_login_user_enumeration',
+    '_check_session_cookie_flags',
+    '_check_unauthenticated_access',
+    '_check_weak_session_key',
     '_chk',
     '_cloudtrail',
     '_cognito_reach',
@@ -4829,8 +5682,13 @@ __all__ = [
     '_federated_reach',
     '_federation_kind',
     '_federation_scope',
+    '_flask_session_key_matches',
     '_frontmatter',
     '_function_url',
+    '_garak_bin',
+    '_garak_probes',
+    '_garak_request_timeout',
+    '_garak_timeout',
     '_github_sub_scope',
     '_guardduty',
     '_hit',
@@ -4876,7 +5734,18 @@ __all__ = [
     '_string_values',
     '_unique',
     '_user_credentials',
+    '_webauth_config',
+    '_webauth_cookie_names',
+    '_webauth_cookie_sent',
+    '_webauth_form_hidden',
+    '_webauth_host',
+    '_webauth_login',
+    '_webauth_opener',
+    '_webauth_send',
     '_who_a_condition_names',
+    'ai_garak_probe',
+    'ai_garak_rest_config',
+    'authz_probe',
     'aws_analyzer',
     'aws_containers',
     'aws_dataservices',
@@ -4900,6 +5769,7 @@ __all__ = [
     'self_audit',
     'self_audit_checks',
     'skill_audit',
+    'webauth_probe',
     'who_can_assume',
     'widest_reach',
 ]

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "squawk"
-version = "0.9.1"
+version = "0.10.0"
 description = "A local, single-user, read-only orchestrator for open-source security scanners: evidence-first, loopback-only."
 requires-python = ">=3.9"
 license = {text = "Apache-2.0"}
