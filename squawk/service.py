@@ -10,11 +10,13 @@ import time
 import urllib.error
 import urllib.request
 import webbrowser
+import zipfile
 from http.server import ThreadingHTTPServer
 from typing import Optional, Tuple
 
 from squawk.core import (
     ABORT_SWEEP_AGE,
+    APP_DIR,
     DEFAULT_EVIDENCE,
     ENTRY_PATH,
     LOG,
@@ -49,6 +51,17 @@ def _systemd_present() -> bool:
 def unit_path() -> str:
     return os.path.join(os.path.expanduser("~"), ".config", "systemd", "user",
                         "squawk.service")
+
+
+def unit_entry() -> str:
+    """The file a unit's ExecStart runs: `squawk.py` in a checkout, the
+    archive itself in a zipapp. From a zipapp, APP_DIR is the `.pyz` and
+    ENTRY_PATH names a member inside it (`…/squawk.pyz/squawk.py`), which no
+    interpreter can open: a unit written from the release restarted on that
+    path every 3 s until stopped by hand (Kali, 2026-10-13, restart 7,281)."""
+    if os.path.isfile(APP_DIR) and zipfile.is_zipfile(APP_DIR):
+        return APP_DIR
+    return ENTRY_PATH
 
 
 def _service_state() -> Optional[str]:
@@ -303,11 +316,21 @@ def cmd_install_service(args: argparse.Namespace, root: str) -> int:
         print("This needs systemd (Kali has it). Here, run it in the background with "
               "--daemon; a launchd plist is not generated.")
         return 2
+    script = unit_entry()
+    if not os.path.isfile(script):
+        # A unit whose ExecStart cannot run is a restart loop, not a service.
+        print("Not writing a unit: its ExecStart would run %s, which is not a "
+              "file. Run install-service from the squawk.py or squawk.pyz the "
+              "unit should start." % script)
+        return 2
     unit = unit_path()
     os.makedirs(os.path.dirname(unit), exist_ok=True)
-    script = ENTRY_PATH
+    # systemd's default limit is 5 starts in 10 s, which RestartSec=3 never
+    # reaches, so a unit that fails at once restarts for ever. 5 in 60 s does
+    # stop it: failed, NRestarts=5 (systemd 255 and 262, 2026-10-14).
     body = ("[Unit]\nDescription=Squawk, a loopback-only security instrument\n"
-            "After=network.target\n\n"
+            "After=network.target\n"
+            "StartLimitIntervalSec=60\nStartLimitBurst=5\n\n"
             "[Service]\nType=simple\n"
             "ExecStart=%s %s --host %s --port %d --evidence %s\n"
             "Restart=on-failure\nRestartSec=3\nEnvironment=PYTHONUNBUFFERED=1\n\n"
@@ -448,5 +471,6 @@ __all__ = [
     'report_no_start',
     'serve_web',
     'start_daemon',
+    'unit_entry',
     'unit_path',
 ]

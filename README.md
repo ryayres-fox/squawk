@@ -20,15 +20,37 @@ python3 squawk.py --install               # provision the scanner toolbench (Uni
 python3 squawk.py --update                 # OS, scanners, vuln DBs, ZAP image, and record what moved
 python3 squawk.py --doctor                 # what's installed, what's missing, and the instrument check
 python3 squawk.py --run selfaudit          # audit this machine, not a target
-python3 squawk.py --list-services          # the thirteen services
+python3 squawk.py --list-services          # the seventeen services
 python3 squawk.py --run compliance --repo /path/to/checkout
 python3 squawk.py sarif > squawk.sarif        # the last run, as SARIF 2.1.0
 
 # an engagement: tag the runs, record what you find by hand, compile it
 python3 squawk.py --run recon --target http://10.10.1.5 --session thm-blue
 python3 squawk.py note --target 10.10.1.5 --session thm-blue --attach shot.png
+python3 squawk.py note --from review.md --target 10.10.1.5 --session thm-blue   # every note in a file
 python3 squawk.py report thm-blue > engagement.md
+python3 squawk.py report thm-blue --share --out ~/reports   # the copy you hand over
+python3 squawk.py report thm-blue --share --audience executive --format pdf --out ~/reports
+python3 squawk.py report thm-blue --share --format csv --out ~/reports   # every finding, a row
+python3 squawk.py disposition thm-blue --from decisions.txt   # fixed, risk accepted, ...
 ```
+
+Every report carries **remediation deadlines**: each finding is due a set
+number of days after the first run that reported it (`[remediation]` in
+`squawk.toml`, [`SETUP.md`](docs/SETUP.md)), and stays open until a re-run
+no longer reports it or a sealed decision closes it. `squawk disposition`
+records one decision per finding: in progress, fixed (with the retest's
+evidence), risk accepted (by a role, with the reason, compensating controls
+and an expiry), or false positive (with the reason). A decision is keyed to
+the finding's target and identity, so it follows the finding into the next
+engagement on that target. With no `--from` it lists the decisions in force
+and prints the template.
+
+The same three are on the web UI's **Reports** page, per session: the executive
+summary and the engineering report (view, or download as PDF) and the findings
+as CSV. They are made when asked for and nothing is written into the evidence.
+A PDF is printed by headless Chromium or Chrome when one is installed; without
+one the page says so, and the report's page prints to PDF from any browser.
 
 `--doctor` exits non-zero on exactly two conditions: no scanner at all, or an
 unwritable evidence root. Every other absence prints as a gap with a reason and
@@ -62,9 +84,13 @@ found; almost none reports what it *looked at*, and a zero over nothing examined
 prints the same as a zero over a real tree. Squawk reads the coverage each
 scanner already emits: semgrep's `paths.scanned`, bandit's per-file `metrics`,
 checkov's `resource_count`, trivy's `Results` targets, syft's `artifacts`, and
-gitleaks' `scanned ~N bytes` — which it writes to stderr rather than into its
-report. grype publishes none, and is lent the package count from the SBOM it
-was handed, which the run says out loud: `from the SBOM this stage read`. It
+gitleaks' `scanned ~N bytes` and trufflehog's `finished scanning` line — which
+both write to stderr rather than into their reports. grype publishes none, and is lent the package count from the SBOM it
+was handed, which the run says out loud: `from the SBOM this stage read`.
+hadolint's report lists only what it flagged, so its denominator is the
+Dockerfiles Squawk found and put on its command line. zizmor's report is the
+same, but its log names each workflow file it completed and each it could not
+parse, and that is its denominator. It
 shows the number inline. `0 findings across 214 files` is a clean scan; `0
 findings, but examined 0 files` is a **gap**, not a pass, and it raises squawk
 code 7600. A tool that publishes no coverage and has none to borrow is reported
@@ -135,10 +161,11 @@ scanner that reported last time and not this time raises 7600 rather than
 letting the smaller number read as progress.
 
 The rest of the vocabulary is the same airport. **Scan** is where a run starts,
-and the thirteen services are **pre-flight check**, **customs manifest**,
+and the seventeen services are **pre-flight check**, **customs manifest**,
 **baggage check**, **contraband sweep**, **cargo scan**, **recon**, **live
-probe**, **active probe**, **compliance**, **cloud (AWS)**, **self-audit** and
-**skill audit**. Every one of them declares what it does *not* cover before you
+probe**, **active probe**, **authenticated app probe**, **API probe**, **object
+authorization probe**, **compliance**, **cloud (AWS)**, **self-audit**, **skill
+audit** and **AI probe**. Every one of them declares what it does *not* cover before you
 read its result. (The Scan page was called the Kiosk until each service tile
 became its own target picker; `squawk services` lists them.)
 
@@ -269,8 +296,8 @@ them live. The full plan — scopes, safety rails, and setup notes — is in
 ## Requirements and portability
 
 Python 3.9+ (and 3.9-safe, no `X | Y` annotations). Scanners are optional and
-discovered at runtime: `gitleaks`, `semgrep`, `bandit`, `checkov`, `trivy`,
-`syft`, `grype`. Supporting: `git`, `docker`, `gh`. [`SETUP.md`](docs/SETUP.md) is
+discovered at runtime: `gitleaks`, `semgrep`, `bandit`, `checkov`, `trivy`, `schemathesis`,
+`syft`, `grype`, `hadolint`, `zizmor`, `trufflehog`, `dockle`, `osv-scanner`. Supporting: `git`, `docker`, `gh`. [`SETUP.md`](docs/SETUP.md) is
 the install and first run, [`CLOUD-SETUP.md`](docs/CLOUD-SETUP.md) the AWS side, and
 [`DESIGN.md`](docs/DESIGN.md) the reasoning behind each design choice.
 
@@ -291,9 +318,10 @@ script serves **apt** (Debian, Kali, Ubuntu), **dnf** and **yum** (Fedora, RHEL,
 Rocky, Alma), **apk** (Alpine), **pacman** (Arch), **zypper** (openSUSE) and
 **brew** (macOS). Distribution knowledge is confined to one table and one
 dispatch; everything after it is shared. The heavy tools need no package manager
-at all — syft, grype and trivy come from vendor installers, and semgrep, bandit
-and checkov from pipx — so most of the toolbench lands even on a system it does
-not recognise.
+at all — syft, grype, trivy and trufflehog come from vendor installers, semgrep, bandit,
+checkov and zizmor from pipx, and hadolint and dockle as release downloads checked
+against the checksum file each release publishes — so most of the toolbench
+lands even on a system it does not recognise.
 
 `./install-tools.sh --detect` reports what it would do on the current machine
 and changes nothing. The answer to "what will this do to my system" should not
@@ -410,6 +438,7 @@ each imports only from the ones above it:
 | `retention` | what evidence is kept, what is let go, and what is said about it |
 | `runtime` | jobs in flight; the server's pid file |
 | `report` | an engagement as markdown: the findings, how each was found, the evidence attached to it, and — before any of them — what each service did not cover |
+| `report --share` | the copy somebody else can be handed, as Markdown and one self-contained page: local paths, the user and host names and identifiers removed at render time (the evidence stays sealed), each finding once per identity across the session, the reviewer's findings first with their control mapping and the attacker abilities their notes record, and a container image summarised by distinct CVEs and what is known to be exploited. For an engineer, each finding with its fix, the command that retests it, its due date and where it stands, and its reference; a reviewer's note carries its own `## retest` and `## references`. Both audiences get the remediation deadlines, with where each window comes from. Refused inside the evidence root |
 | `sarif` | one run as SARIF 2.1.0: a stage that read nothing is an unsuccessful invocation carrying its denominator, and a correlation that could not be evaluated is a `notApplicable` result |
 | `web` | every page, and the request handler |
 | `service` | serve, daemonize, status, stop, the systemd unit |

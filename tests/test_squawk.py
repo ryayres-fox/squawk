@@ -395,6 +395,38 @@ class TestRegistryWiring:
                 assert stage in squawk.STAGES, \
                     "service %s names a stage that does not exist: %s" % (svc.key, stage)
 
+    def test_every_service_has_a_known_domain(self):
+        """A service added without a domain (or with a typo) has nowhere to be
+        listed. The empty-string default makes an untagged service fail here."""
+        for svc in squawk.SERVICES.values():
+            assert svc.domain in squawk.stages.DOMAINS, \
+                "service %s has domain %r, not one of %s" % (
+                    svc.key, svc.domain, squawk.stages.DOMAINS)
+
+    def test_the_listing_groups_every_service_under_its_domain(self, capsys):
+        """`squawk services` lists every service once, with its key appearing in
+        domain order -- web services before code, code before cloud, and so on."""
+        from squawk.cli import list_services
+        list_services()
+        out = capsys.readouterr().out
+        for svc in squawk.SERVICES.values():
+            assert out.count("  %s " % svc.key) == 1, "%s listed %d times" % (
+                svc.key, out.count("  %s " % svc.key))
+        # keys appear grouped: all of one domain's keys before the next domain's
+        order = [k for d in squawk.stages.DOMAINS
+                 for k in squawk.SERVICES if squawk.SERVICES[k].domain == d]
+        positions = [out.index("  %s " % k) for k in order]
+        assert positions == sorted(positions), "services are not grouped by domain"
+
+    def test_web_and_cloud_and_ai_domains_hold_the_expected_services(self):
+        by_domain = {}
+        for svc in squawk.SERVICES.values():
+            by_domain.setdefault(svc.domain, set()).add(svc.key)
+        assert {"recon", "liveprobe", "activeprobe"} <= by_domain["web"]
+        assert {"cloudinventory", "cloudaws"} <= by_domain["cloud"]
+        assert "skillaudit" in by_domain["ai"]            # the AI domain's static half
+        assert "selfaudit" in by_domain["host"]
+
 
 class TestEvidencePermissions:
     """Regression. The host audit's first run found that Squawk created its own
@@ -705,6 +737,9 @@ CLEAN_REPORTS = [
     ("grype", '{"matches":[],"source":{"type":"dir"}}'),
     ("bandit", '{"results":[],"metrics":{}}'),
     ("checkov", '[{"check_type":"terraform","results":{"failed_checks":[]}}]'),
+    # A tree with nothing checkov parses: the summary IS the document.
+    ("checkov", '{"passed":0,"failed":0,"skipped":0,"parsing_errors":0,'
+                '"resource_count":0,"checkov_version":"3.3.26"}'),
     ("zap", '{"@version":"2.14","site":[]}'),
     ("syft", '{"artifacts":[],"descriptor":{"name":"syft"}}'),
 ]
@@ -1809,7 +1844,7 @@ class TestWebErrorSurfacing:
         root = str(tmp_path / "ev")
         os.makedirs(root)
 
-        def boom(_root):
+        def boom(_root, _engagement=None):
             raise RuntimeError("deliberate crash for the test")
         _patch_all(monkeypatch, "view_overview", boom)
         with _serve(root, str(tmp_path)) as base:
@@ -3151,6 +3186,267 @@ class TestLifecycle:
         assert oct(unit.stat().st_mode & 0o777) == "0o600"
 
 
+class TestTheSuiteNeverRunsTheRealAws:
+    """conftest.py puts a fake `aws` first on PATH before any test runs. The
+    real CLI ran 15 times per suite run until 2026-10-14, through
+    `stages.aws_identity`, which the cloud tests' fakes did not cover, and
+    with no credentials each run asked the instance-metadata address. These
+    hold the guard in place: if the fake ever stops being the `aws` that
+    squawk's code finds, they fail rather than the suite quietly reaching an
+    account again."""
+
+    @staticmethod
+    def _calls():
+        log = os.environ["SQUAWK_TEST_AWS_LOG"]
+        if not os.path.exists(log):
+            return []
+        with open(log, encoding="utf-8") as fh:
+            return fh.read().splitlines()
+
+    def test_aws_on_path_is_the_fake(self):
+        found = shutil.which("aws")
+        assert found, "no aws on PATH under test"
+        assert os.path.dirname(found) == os.path.dirname(
+            os.environ["SQUAWK_TEST_AWS_LOG"]), found
+
+    def test_the_identity_check_that_leaked_lands_on_the_fake(self):
+        before = self._calls()
+        ident, why = squawk.stages.aws_identity(timeout=10)
+        assert ident is None
+        assert "Unable to locate credentials" in why, why
+        assert self._calls()[len(before):] == ["sts get-caller-identity --output json"]
+
+    def test_a_subprocess_finds_the_fake_too(self):
+        """The zipapp tests run squawk as a child process, so PATH has to
+        carry the fake into it, not only into this interpreter."""
+        import subprocess
+        res = subprocess.run([sys.executable, "-c",
+                              "import shutil; print(shutil.which('aws'))"],
+                             capture_output=True, text=True, timeout=30)
+        assert os.path.dirname(res.stdout.strip()) == os.path.dirname(
+            os.environ["SQUAWK_TEST_AWS_LOG"]), res.stdout + res.stderr
+
+
+class TestAwsNeverAsksTheMetadataAddress:
+    """With no credentials, the AWS CLI asks the instance-metadata address,
+    169.254.169.254, before anything else. On 2026-10-16 an eBPF probe on the
+    lab's Kali box caught `--doctor`'s `aws sts get-caller-identity` doing
+    it; on a cloud VM the same lookup would hand the run the machine's role
+    without anyone choosing it. Every `aws` child now gets
+    AWS_EC2_METADATA_DISABLED=true unless SQUAWK_AWS_IMDS=1.
+
+    conftest sets that variable for the whole session, so each test removes
+    it first. Otherwise they would pass on conftest's value, not squawk's."""
+
+    @staticmethod
+    def _seen(monkeypatch, call):
+        """What the fake aws saw for AWS_EC2_METADATA_DISABLED, per call."""
+        monkeypatch.delenv("AWS_EC2_METADATA_DISABLED", raising=False)
+        log = os.environ["SQUAWK_TEST_AWS_ENV_LOG"]
+
+        def lines():
+            if not os.path.exists(log):
+                return []
+            with open(log, encoding="utf-8") as fh:
+                return fh.read().splitlines()
+
+        before = lines()
+        call()
+        return lines()[len(before):]
+
+    @staticmethod
+    def _no_opt_in(monkeypatch):
+        monkeypatch.delenv("SQUAWK_AWS_IMDS", raising=False)
+        monkeypatch.delenv("TOWER_AWS_IMDS", raising=False)
+
+    def test_the_identity_check_turns_it_off(self, monkeypatch):
+        self._no_opt_in(monkeypatch)
+        seen = self._seen(monkeypatch,
+                          lambda: squawk.stages.aws_identity(timeout=10))
+        assert seen == ["true"], seen
+
+    def test_a_cloud_read_turns_it_off(self, monkeypatch):
+        self._no_opt_in(monkeypatch)
+        seen = self._seen(monkeypatch, lambda: squawk.probes._aws_json(
+            ["s3api", "list-buckets"], 10))
+        assert seen == ["true"], seen
+
+    def test_a_call_under_another_profile_turns_it_off(self, monkeypatch):
+        self._no_opt_in(monkeypatch)
+        seen = self._seen(monkeypatch, lambda: squawk.probes._aws_json_env(
+            ["sts", "get-caller-identity"], 10, {"AWS_PROFILE": "other"}))
+        assert seen == ["true"], seen
+
+    def test_opting_in_leaves_the_lookup_alone(self, monkeypatch):
+        monkeypatch.setenv("SQUAWK_AWS_IMDS", "1")
+        seen = self._seen(monkeypatch,
+                          lambda: squawk.stages.aws_identity(timeout=10))
+        assert seen == ["<unset>"], seen
+
+    def test_any_other_value_is_not_an_opt_in(self, monkeypatch):
+        monkeypatch.setenv("SQUAWK_AWS_IMDS", "0")
+        seen = self._seen(monkeypatch,
+                          lambda: squawk.stages.aws_identity(timeout=10))
+        assert seen == ["true"], seen
+
+    def test_no_other_child_is_changed(self, monkeypatch):
+        monkeypatch.delenv("AWS_EC2_METADATA_DISABLED", raising=False)
+        self._no_opt_in(monkeypatch)
+        code, out, _err = squawk.core.run_cmd(
+            ["sh", "-c", 'printf %s "${AWS_EC2_METADATA_DISABLED-unset}"'], None, 10)
+        assert (code, out) == (0, "unset")
+
+
+class TestTheGeneratedUnitCanStart:
+    """A unit written from the release could never start. From the zipapp,
+    ENTRY_PATH is a member inside the archive (`…/squawk.pyz/squawk.py`), and
+    that is what ExecStart named. With Restart=on-failure and RestartSec=3 it
+    never reached systemd's default limit of 5 starts in 10 s either, so on
+    Kali (2026-10-13) it restarted 7,281 times before it was stopped by hand.
+
+    Each test reads ExecStart back out of the unit that was written and runs
+    it, because the old test checked that ExecStart= was present, which a path
+    nothing can open passes."""
+
+    @staticmethod
+    def _unit(path):
+        import configparser
+        cp = configparser.ConfigParser(interpolation=None, strict=False)
+        cp.optionxform = str  # systemd keys are case-sensitive
+        cp.read_string(pathlib.Path(path).read_text(encoding="utf-8"))
+        return cp
+
+    @staticmethod
+    def _run_exec_start(cp):
+        """ExecStart with its flags swapped for --version: the interpreter and
+        the file it names, run as systemd would run them."""
+        import shlex
+        import subprocess
+        argv = shlex.split(cp["Service"]["ExecStart"])
+        assert os.path.isfile(argv[1]), "ExecStart runs %s, not a file" % argv[1]
+        res = subprocess.run([argv[0], argv[1], "--version"],
+                             capture_output=True, text=True, timeout=60)
+        assert res.returncode == 0, res.stdout + res.stderr
+        assert res.stdout.strip() == "squawk %s" % squawk.__version__
+        return argv
+
+    def test_a_checkout_unit_runs_the_checkouts_entry(self, tmp_path, monkeypatch):
+        args = argparse.Namespace(host="127.0.0.1", port=8790)
+        _patch_all(monkeypatch, "_systemd_present", lambda: True)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert squawk.cmd_install_service(args, str(tmp_path / "ev")) == 0
+        cp = self._unit(tmp_path / ".config" / "systemd" / "user" / "squawk.service")
+        argv = self._run_exec_start(cp)
+        assert os.path.samefile(argv[1], ENTRY)
+
+    def test_a_zipapp_unit_runs_the_archive(self, tmp_path):
+        """The release case, end to end: build the zipapp, run its own
+        install-service, and run what the unit it wrote would run."""
+        import subprocess
+        if not os.path.isdir("/run/systemd/system"):
+            pytest.skip("install-service needs systemd running here")
+        pyz = TestTheZipappTellsTheTruthAboutExitCodes._build(tmp_path)
+        home = tmp_path / "home"
+        home.mkdir()
+        env = dict(os.environ, HOME=str(home))
+        res = subprocess.run([sys.executable, pyz, "install-service",
+                              "--evidence", str(tmp_path / "ev")],
+                             capture_output=True, text=True, timeout=60, env=env)
+        assert res.returncode == 0, res.stdout + res.stderr
+        cp = self._unit(home / ".config" / "systemd" / "user" / "squawk.service")
+        argv = self._run_exec_start(cp)
+        assert os.path.samefile(argv[1], pyz), (
+            "the zipapp's unit runs %s, not the archive" % argv[1])
+
+    def test_no_unit_for_an_entry_that_is_not_there(self, tmp_path, monkeypatch,
+                                                    capsys):
+        gone = tmp_path / "gone"
+        _patch_all(monkeypatch, "_systemd_present", lambda: True)
+        monkeypatch.setattr(squawk.service, "APP_DIR", str(gone))
+        monkeypatch.setattr(squawk.service, "ENTRY_PATH", str(gone / "squawk.py"))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        args = argparse.Namespace(host="127.0.0.1", port=8790)
+        assert squawk.cmd_install_service(args, str(tmp_path / "ev")) == 2
+        assert not (tmp_path / ".config" / "systemd" / "user" / "squawk.service").exists()
+        assert str(gone / "squawk.py") in capsys.readouterr().out
+
+    def test_the_start_limit_is_one_restarts_can_reach(self, tmp_path, monkeypatch):
+        args = argparse.Namespace(host="127.0.0.1", port=8790)
+        _patch_all(monkeypatch, "_systemd_present", lambda: True)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert squawk.cmd_install_service(args, str(tmp_path / "ev")) == 0
+        cp = self._unit(tmp_path / ".config" / "systemd" / "user" / "squawk.service")
+        interval = int(cp["Unit"]["StartLimitIntervalSec"])
+        burst = int(cp["Unit"]["StartLimitBurst"])
+        restart_sec = int(cp["Service"]["RestartSec"])
+        assert burst * restart_sec < interval, (
+            "%d restarts %d s apart take %d s, past the %d s window: the limit "
+            "never trips" % (burst, restart_sec, burst * restart_sec, interval))
+
+    def test_systemd_stops_a_unit_that_fails_at_once(self, tmp_path, monkeypatch):
+        """The limit as systemd applies it: a transient user unit with the
+        generated unit's restart and limit settings and an ExecStart that fails
+        the way the release's did, a script that is not there. Needs a user
+        manager; skips where there is none.
+
+        Stopped means `failed` after exactly StartLimitBurst restarts. Result
+        is not the test: systemd 262 (Kali) records `start-limit-hit` and 255
+        (Ubuntu CI) records `exit-code` for the same stop, both measured
+        2026-10-14. Under the old limit, 5 starts in 10 s, the same unit was
+        still `activating`/`auto-restart` at 45 s with NRestarts=13, so this
+        tells the two apart."""
+        import shutil
+        import subprocess
+        if not shutil.which("systemd-run") or subprocess.run(
+                ["systemctl", "--user", "show-environment"],
+                capture_output=True, timeout=10).returncode != 0:
+            pytest.skip("no systemd user manager here")
+        args = argparse.Namespace(host="127.0.0.1", port=8790)
+        _patch_all(monkeypatch, "_systemd_present", lambda: True)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert squawk.cmd_install_service(args, str(tmp_path / "ev")) == 0
+        cp = self._unit(tmp_path / ".config" / "systemd" / "user" / "squawk.service")
+        name = "squawk-limit-test-%d" % os.getpid()
+        props = ["Restart=" + cp["Service"]["Restart"],
+                 "RestartSec=" + cp["Service"]["RestartSec"],
+                 "StartLimitIntervalSec=" + cp["Unit"]["StartLimitIntervalSec"],
+                 "StartLimitBurst=" + cp["Unit"]["StartLimitBurst"]]
+        cmd = ["systemd-run", "--user", "--unit=" + name]
+        for p in props:
+            cmd += ["-p", p]
+        cmd += [sys.executable, str(tmp_path / "not-there" / "squawk.py")]
+        try:
+            assert subprocess.run(cmd, capture_output=True, timeout=30).returncode == 0
+            def shown():
+                out = subprocess.run(
+                    ["systemctl", "--user", "show", name + ".service",
+                     "--property=ActiveState,SubState,Result,NRestarts,Restart,"
+                     "RestartUSec,StartLimitBurst,StartLimitIntervalUSec"],
+                    capture_output=True, text=True, timeout=10).stdout
+                return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+
+            deadline = time.time() + 90
+            props = shown()
+            while time.time() < deadline and props.get("ActiveState") != "failed":
+                time.sleep(2)
+                props = shown()
+            version = subprocess.run(["systemctl", "--version"], capture_output=True,
+                                     text=True, timeout=10).stdout.splitlines()[:1]
+            # What systemd applied, so a failure names the setting that did not
+            # take on this systemd rather than only that the unit kept going.
+            why = "%s; %s" % (" ".join("%s=%s" % kv for kv in sorted(props.items())),
+                              " ".join(version))
+            assert props.get("StartLimitBurst") == cp["Unit"]["StartLimitBurst"], why
+            assert props.get("ActiveState") == "failed", "still restarting at 90 s: " + why
+            assert props.get("NRestarts") == cp["Unit"]["StartLimitBurst"], why
+            assert props.get("Result") in ("start-limit-hit", "exit-code"), why
+        finally:
+            subprocess.run(["systemctl", "--user", "stop", name + ".service"],
+                           capture_output=True, timeout=30)
+            subprocess.run(["systemctl", "--user", "reset-failed", name + ".service"],
+                           capture_output=True, timeout=30)
+
+
 class TestCliRunProgress:
     """A headless run must not crash on the progress event that reports the run
     directory. That event carries no stage status; the CLI printer assumed one
@@ -3170,14 +3466,382 @@ class TestCliRunProgress:
         assert runs and runs[0].get("ledger"), "the run wrote a ledger, not an abort"
 
 
+class TestEngagements:
+    """An engagement groups targets. A target's engagement is the first mapping
+    assignment that matches it, else its run's `session` tag, else Unassigned —
+    the mapping wins so a target can be reassigned without re-scanning, and each
+    target lands in exactly one engagement."""
+
+    E = squawk.engagements
+    DATA: ClassVar[dict] = {"version": 1, "assignments": [
+        {"engagement": "Acme", "match": ["acme-*", "*/acme-vuln"]},
+        {"engagement": "Beacon", "match": ["beacon-*"]},
+    ]}
+
+    def _m(self, target, session=""):
+        return {"target": target, "session": session, "service": "x", "scope": "y"}
+
+    def test_mapping_matches_by_name_and_basename(self):
+        assert self.E.engagement_for(self._m("acme-notes"), self.DATA) == "Acme"
+        # a glob on the basename catches a full path, so /srv/acme-vuln maps too
+        assert self.E.engagement_for(self._m("/srv/acme-vuln"), self.DATA) == "Acme"
+        assert self.E.engagement_for(self._m("beacon-rehearsal:local"), self.DATA) == "Beacon"
+
+    def test_mapping_wins_over_the_session_tag(self):
+        # a run tagged for one engagement is shown under the mapping's, by design
+        assert self.E.engagement_for(self._m("acme-notes", "Other"), self.DATA) == "Acme"
+
+    def test_session_tag_is_the_fallback_then_unassigned(self):
+        assert self.E.engagement_for(self._m("mystery", "Beacon"), self.DATA) == "Beacon"
+        assert self.E.engagement_for(self._m("mystery"), self.DATA) == self.E.UNASSIGNED
+
+    def test_first_matching_assignment_wins_so_membership_is_exactly_one(self):
+        data = {"assignments": [
+            {"engagement": "First", "match": ["acme-*"]},
+            {"engagement": "Second", "match": ["acme-notes"]},
+        ]}
+        assert self.E.engagement_for(self._m("acme-notes"), data) == "First"
+
+    def test_names_are_sorted_with_unassigned_last(self):
+        mans = [self._m("beacon-x"), self._m("acme-notes"), self._m("nobody")]
+        assert self.E.engagement_names(mans, self.DATA) == ["Acme", "Beacon", "Unassigned"]
+
+    def test_group_by_engagement_buckets_and_keeps_order(self):
+        mans = [self._m("acme-notes"), self._m("nobody"), self._m("acme-fixed")]
+        groups = self.E.group_by_engagement(mans, self.DATA)
+        assert list(groups) == ["Acme", "Unassigned"]
+        assert [m["target"] for m in groups["Acme"]] == ["acme-notes", "acme-fixed"]
+        assert [m["target"] for m in groups["Unassigned"]] == ["nobody"]
+
+    def test_resolve_filter_is_case_insensitive_and_unknown_is_all(self):
+        mans = [self._m("acme-notes")]
+        assert self.E.resolve_engagement("acme", mans, self.DATA) == "Acme"
+        assert self.E.resolve_engagement("", mans, self.DATA) is None
+        assert self.E.resolve_engagement("ghost", mans, self.DATA) is None
+
+    def test_missing_file_is_an_empty_mapping(self, tmp_path):
+        data = self.E.load_engagements(str(tmp_path))
+        assert data["assignments"] == []
+        assert self.E.engagement_for(self._m("acme-notes"), data) == self.E.UNASSIGNED
+
+    def test_assign_and_unassign_round_trip(self, tmp_path):
+        root = str(tmp_path)
+        self.E.assign(root, "Acme", ["acme-*", "acme-*"])   # dedups
+        data = self.E.load_engagements(root)
+        assert data["assignments"] == [{"engagement": "Acme", "match": ["acme-*"]}]
+        assert self.E.engagement_for(self._m("acme-notes"), data) == "Acme"
+        self.E.assign(root, "Acme", ["*/acme-vuln"])          # extends the same one
+        assert self.E.load_engagements(root)["assignments"][0]["match"] == \
+            ["acme-*", "*/acme-vuln"]
+        self.E.unassign(root, ["acme-*", "*/acme-vuln"])      # empties -> dropped
+        assert self.E.load_engagements(root)["assignments"] == []
+
+    def test_assign_rejects_an_empty_name_or_no_patterns(self, tmp_path):
+        import pytest
+        with pytest.raises(ValueError):
+            self.E.assign(str(tmp_path), "", ["x"])
+        with pytest.raises(ValueError):
+            self.E.assign(str(tmp_path), "Acme", [])
+
+    def test_remove_engagement_unmaps_without_deleting_runs(self, tmp_path):
+        root = str(tmp_path)
+        self.E.assign(root, "Acme", ["acme-*"])
+        self.E.assign(root, "Beacon", ["beacon-*"])
+        self.E.remove_engagement(root, "Acme")
+        names = [a["engagement"] for a in self.E.load_engagements(root)["assignments"]]
+        assert names == ["Beacon"]            # only the target app's mapping is gone
+        # a target that was mapped now falls back to Unassigned, nothing deleted
+        m = {"target": "acme-notes", "session": "", "service": "x", "scope": "y"}
+        assert self.E.engagement_for(m, self.E.load_engagements(root)) == self.E.UNASSIGNED
+
+    def test_hide_and_unhide_a_report(self, tmp_path):
+        root = str(tmp_path)
+        assert self.E.hidden_reports(root) == set()
+        self.E.hide_report(root, "old-session")
+        assert self.E.hidden_reports(root) == {"old-session"}
+        self.E.unhide_report(root, "old-session")
+        assert self.E.hidden_reports(root) == set()
+        import pytest
+        with pytest.raises(ValueError):
+            self.E.hide_report(root, "")
+
+    def test_report_resolves_runs_by_engagement_not_only_the_tag(self, tmp_path):
+        # a report of an engagement defined by the MAPPING (targets grouped
+        # without a per-run session tag) still gathers those runs — so a report
+        # and the Overview never disagree about what is in an engagement.
+        import json
+        root = str(tmp_path)
+        for rid, target, session in (("20260101T000001Z", "acme-notes", ""),
+                                      ("20260101T000002Z", "a-note", "Acme")):
+            d = tmp_path / rid
+            d.mkdir()
+            (d / "manifest.json").write_text(json.dumps(
+                {"run_id": rid, "service": "x", "scope": "image",
+                 "target": target, "session": session}), encoding="utf-8")
+        self.E.assign(root, "Acme", ["acme-*"])      # acme-notes is mapped, untagged
+        got = {m["target"] for m in squawk.report.runs_for_session(root, "Acme")}
+        assert got == {"acme-notes", "a-note"}         # mapped run + tagged note, both
+
+
+class TestEngagementsInTheWebUI:
+    """The engagement layer on the pages: the Overview groups its targets by
+    engagement and scopes to one; the Estate scopes the same way. Scoping a page
+    must hide the other engagement's targets, not merely relabel them."""
+
+    def _estate(self, tmp_path):
+        root = str(tmp_path)
+        # image-scope targets are never "vanished" (no directory to be gone), so
+        # they stay live in the estate without a real path on disk.
+        _write_run(root, "20260101T000001Z", [_f("trivy", "CVE-1", "high")],
+                   service="cargo", scope="image", target="acme-notes")
+        _write_run(root, "20260101T000002Z", [_f("trivy", "CVE-2", "high")],
+                   service="cargo", scope="image", target="beacon-x")
+        squawk.engagements.assign(root, "Acme", ["acme-*"])
+        squawk.engagements.assign(root, "Beacon", ["beacon-*"])
+        return root
+
+    def test_overview_groups_by_engagement_with_a_dropdown(self, tmp_path):
+        h = squawk.web.view_overview(self._estate(tmp_path))
+        assert "All engagements" in h          # the scope dropdown
+        assert "Acme" in h and "Beacon" in h
+        assert "acme-notes" in h and "beacon-x" in h
+
+    def test_overview_scope_hides_the_other_engagement(self, tmp_path):
+        h = squawk.web.view_overview(self._estate(tmp_path), "Acme")
+        assert "scoped to" in h
+        assert "acme-notes" in h
+        assert "beacon-x" not in h           # the target row is gone, not relabelled
+
+    def test_overview_unknown_scope_reads_as_all(self, tmp_path):
+        h = squawk.web.view_overview(self._estate(tmp_path), "ghost")
+        assert "scoped to" not in h and "beacon-x" in h
+
+    def test_estate_scope_hides_the_other_engagement(self, tmp_path):
+        root = self._estate(tmp_path)
+        assert "All engagements" in squawk.web.view_estate(root, {})
+        scoped = squawk.web.view_estate(root, {"engagement": "Acme"})
+        assert "acme-notes" in scoped and "beacon-x" not in scoped
+
+    def test_overview_is_an_engagement_overview_you_drill_into(self, tmp_path):
+        root = self._estate(tmp_path)
+        top = squawk.web.view_overview(root)
+        assert ">Engagements</h3>" in top             # top level lists engagements
+        assert "view targets &rarr;" in top           # a drill link per engagement
+        # no targets are listed at the top level (above the recent-runs log)
+        assert "acme-notes" not in top.split("Scan activity")[0]
+        assert "<summary" in top and "Recent runs" in top    # recent runs folded away
+        drilled = squawk.web.view_overview(root, "Acme")
+        assert ">Targets by risk</h3>" in drilled and "acme-notes" in drilled
+
+    def test_every_finding_page_carries_the_engagement_filter(self, tmp_path):
+        root = self._estate(tmp_path)
+        pages = {
+            "overview": squawk.web.view_overview(root, "Acme"),
+            "estate": squawk.web.view_estate(root, {"engagement": "Acme"}),
+            "findings": squawk.web.view_findings(root, None, None, None, None, "Acme"),
+            "priority": squawk.web.view_priority(root, None, "Acme"),
+            "triage": squawk.web.view_triage(root, None, "Acme"),
+            "intel": squawk.web.view_intel(root, None, "Acme"),
+            "history": squawk.web.view_history(root, "Acme"),
+            "checklist": squawk.web.view_checklist(root, "Acme"),
+        }
+        for name, html in pages.items():
+            assert "name='engagement'" in html, "%s lost the engagement filter" % name
+
+    def test_findings_offers_engagement_then_target(self, tmp_path):
+        root = str(tmp_path)
+        for rid, tgt in (("20260101T000001Z", "acme-notes"),
+                         ("20260101T000002Z", "acme-fixed"),
+                         ("20260101T000003Z", "beacon-x")):
+            _write_run(root, rid, [_f("trivy", "CVE-%s" % rid, "high")],
+                       service="cargo", scope="image", target=tgt)
+        squawk.engagements.assign(root, "Acme", ["acme-*"])
+        squawk.engagements.assign(root, "Beacon", ["beacon-*"])
+        # scoped to Acme (2 targets) -> both dropdowns, target narrows the runs
+        h = squawk.web.view_findings(root, None, None, None, None, "Acme", None)
+        assert "name='engagement'" in h and "name='target'" in h
+        assert "acme-notes" in h and "acme-fixed" in h
+        scoped = squawk.web.view_findings(root, None, None, None, None,
+                                          "Acme", "acme-notes")
+        # the run picker now offers only acme-notes runs, not acme-fixed
+        picker = scoped.split("name='run'")[1].split("</select>")[0]
+        assert "acme-notes" in picker and "acme-fixed" not in picker
+
+
+class TestEngagementsCli:
+    """The `squawk engagements` subcommand edits the mapping file; the exit
+    codes and the on-disk result are what a script and the web UI depend on."""
+
+    def _ns(self, root, *engagements):
+        return argparse.Namespace(evidence=root, engagements=list(engagements))
+
+    def test_assign_list_unassign_round_trip(self, tmp_path, capsys):
+        root = str(tmp_path)
+        assert squawk.cli.cmd_engagements(self._ns(root, "assign", "Acme", "acme-*")) == 0
+        assert squawk.cli.cmd_engagements(self._ns(root)) == 0          # list
+        out = capsys.readouterr().out
+        assert "Acme" in out and "acme-*" in out
+        assert squawk.cli.cmd_engagements(self._ns(root, "unassign", "acme-*")) == 0
+        assert squawk.engagements.load_engagements(root)["assignments"] == []
+
+    def test_assign_needs_a_name_and_a_pattern(self, tmp_path):
+        root = str(tmp_path)
+        assert squawk.cli.cmd_engagements(self._ns(root, "assign", "OnlyName")) == 2
+
+    def test_unknown_action_is_an_error(self, tmp_path):
+        assert squawk.cli.cmd_engagements(self._ns(str(tmp_path), "frobnicate")) == 2
+
+    def test_engagement_flag_is_an_alias_for_session(self):
+        p = squawk.cli.build_parser()
+        assert p.parse_args(["--run", "customs", "--engagement", "Acme",
+                             "--repo", "/x"]).session == "Acme"
+        assert p.parse_args(["--run", "customs", "--session", "Legacy",
+                             "--repo", "/x"]).session == "Legacy"
+
+
+class TestChecklist:
+    """The pre-handover signoff: a manual-review checklist per engagement, each
+    tick a sealed ledger line. Ready to hand over means every item is pass or
+    N/A — none open or failed."""
+
+    C = squawk.checklist
+
+    def test_default_has_items_across_several_sections(self, tmp_path):
+        items = self.C.checklist_items(str(tmp_path))
+        assert len(items) >= 15
+        assert len({i["section"] for i in items}) >= 4
+        assert all(i["id"] and i["text"] and i["section"] for i in items)
+
+    def test_item_ids_are_unique_even_on_repeated_text(self, tmp_path):
+        (tmp_path / "checklist.md").write_text(
+            "## S\n- same text\n- same text\n", encoding="utf-8")
+        ids = [i["id"] for i in self.C.checklist_items(str(tmp_path))]
+        assert len(ids) == len(set(ids)) == 2
+
+    def test_markdown_override_parses_bullets_and_task_lists(self, tmp_path):
+        (tmp_path / "checklist.md").write_text(
+            "## Custom\n- [ ] first\n- [x] second\n* third\n"
+            "## Prose only\nno items here\n", encoding="utf-8")
+        got = self.C.load_checklist(str(tmp_path))
+        assert got == [("Custom", ["first", "second", "third"])]  # empty section dropped
+
+    def test_record_then_current_latest_wins(self, tmp_path):
+        root = str(tmp_path)
+        iid = self.C.checklist_items(root)[0]["id"]
+        self.C.record_check(root, "Acme", iid, "fail", note="first look")
+        self.C.record_check(root, "Acme", iid, "pass", note="fixed now")
+        cur = self.C.current_checks(root, "Acme")
+        assert cur[iid]["status"] == "pass" and cur[iid]["note"] == "fixed now"
+        assert self.C.current_checks(root, "Other") == {}      # scoped per engagement
+
+    def test_ready_only_when_every_item_is_pass_or_na(self, tmp_path):
+        root = str(tmp_path)
+        items = self.C.checklist_items(root)
+        assert self.C.signoff_state(root, "E", items)["ready"] is False   # nothing ticked
+        for n, it in enumerate(items):
+            self.C.record_check(root, "E", it["id"], "na" if n % 2 else "pass")
+        st = self.C.signoff_state(root, "E", items)
+        assert st["ready"] is True and st["open"] == 0 and st["who"]
+        self.C.record_check(root, "E", items[0]["id"], "fail")
+        assert self.C.signoff_state(root, "E", items)["ready"] is False
+
+    def test_record_rejects_a_bad_status_or_missing_fields(self, tmp_path):
+        root = str(tmp_path)
+        import pytest
+        with pytest.raises(ValueError):
+            self.C.record_check(root, "E", "x", "bogus")
+        with pytest.raises(ValueError):
+            self.C.record_check(root, "E", "", "pass")
+        with pytest.raises(ValueError):
+            self.C.record_check(root, "", "x", "pass")
+
+    def test_missing_ledger_is_empty_not_an_error(self, tmp_path):
+        assert self.C.load_checks(str(tmp_path)) == []
+        assert self.C.current_checks(str(tmp_path), "E") == {}
+
+    def test_grep_sweep_sees_sql_built_into_a_variable(self, tmp_path):
+        # the evasion a single-line execute pattern misses: SQL assembled into a
+        # variable, run elsewhere — plus an owner-scoped lookup that must NOT fire
+        (tmp_path / "app.py").write_text(
+            'sql = "SELECT * FROM notes WHERE t LIKE \'%s\'" % q\n'
+            'db.execute("SELECT * FROM notes WHERE owner_id = ?", (session["user_id"],))\n'
+            'x = yaml.load(raw, Loader=yaml.Loader)\n', encoding="utf-8")
+        found = {area: hits for area, hits in self.C.grep_sweep(str(tmp_path))}
+        inj = [h for area, hits in found.items() if "Injection" in area for h in hits]
+        assert any("sql =" in h[3] for h in inj)            # the string-build is caught
+        assert all("owner_id" not in h[3] for hits in found.values() for h in hits)
+        assert any("yaml.load" in h[3] for area, hits in found.items()
+                   if "parsing" in area for h in hits)
+
+    def test_grep_sweep_area_filter(self, tmp_path):
+        (tmp_path / "a.py").write_text("x = eval(user)\n", encoding="utf-8")
+        only = self.C.grep_sweep(str(tmp_path), "parsing")
+        assert len(only) == 1 and "parsing" in only[0][0]
+
+    def test_verify_checklist_matches_the_checklist_module(self):
+        # verify_checklist lives in analysis (which cannot import checklist, a
+        # later layer), so it duplicates two facts from here: the ledger path
+        # and the valid states. They must not drift.
+        import squawk.analysis as A
+        assert os.path.join("root", *A._CHECKLIST_LEDGER) == self.C.ledger_path("root")
+        assert A._CHECKLIST_STATES == self.C.CHECK_STATES
+
+    def test_verify_root_covers_every_chained_ledger(self, tmp_path):
+        # The gap this closes: a chained ledger was written but no verifier read
+        # it. verify_root must cover every append_chained ledger. A new one is
+        # added here the day it is written.
+        root = str(tmp_path)
+        self.C.record_check(root, "E", self.C.checklist_items(root)[0]["id"], "pass")
+        report = squawk.verify_root(root)
+        assert "ledger" in report and "checklist" in report
+        assert report["checklist"]["present"] and report["checklist"]["state"] == "ok"
+
+    def test_a_tampered_checklist_tick_is_caught(self, tmp_path):
+        # A chain cannot vouch for its own last line; the recorded verify closes
+        # that hole. So: tick, record a verify (saves the head), then alter the
+        # sealed tick — the next verify must report it broken, not ok.
+        root = str(tmp_path)
+        iid = self.C.checklist_items(root)[0]["id"]
+        self.C.record_check(root, "E", iid, "pass", note="reviewed")
+        squawk.evidence.save_verify(root, squawk.verify_root(root))
+        path = self.C.ledger_path(root)
+        with open(path, encoding="utf-8") as fh:
+            tampered = fh.read().replace('"pass"', '"fail"')
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(tampered)
+        report = squawk.verify_root(root)
+        assert report["checklist"]["state"] == "broken"
+        assert report["status"] == "failed" and report["exit"] != 0
+
+
+class TestChecklistWeb:
+    """The checklist page renders the signoff, and recording every item flips it
+    from 'not ready' to 'ready to hand over'."""
+
+    def test_page_renders_sections_picker_and_not_ready(self, tmp_path):
+        h = squawk.web.view_checklist(str(tmp_path))
+        assert "<h1>Checklist</h1>" in h
+        assert "Not ready to hand over" in h
+        assert "name='engagement'" in h
+        assert "action='/check'" in h          # a tick form per item
+
+    def test_recording_every_item_flips_to_ready(self, tmp_path):
+        root = str(tmp_path)
+        # the empty-estate default engagement is 'Unassigned'
+        for it in squawk.checklist.checklist_items(root):
+            squawk.checklist.record_check(root, "Unassigned", it["id"], "pass")
+        h = squawk.web.view_checklist(root)
+        assert "Ready to hand over" in h and "signed off by" in h
+
+
 class TestPackageShape:
     """The split's guarantees, enforced rather than described: the layering is
     acyclic and matches the README, every module re-exports all it defines, and
     the version is stated once."""
 
     ORDER = ("core", "probes", "scanners", "stages", "evidence", "decisions", "analysis",
-             "engine", "feeds", "installer", "baselines", "retention", "report",
-             "runtime", "sarif", "web", "service", "cli")
+             "engine", "feeds", "installer", "baselines", "engagements", "checklist",
+             "retention", "report", "runtime", "sarif", "web", "service", "cli")
 
     def _pkg(self):
         return os.path.dirname(os.path.abspath(squawk.__file__))
@@ -5336,16 +6000,32 @@ class TestStopStopsTheScanner:
                 ["docker", "info"], capture_output=True, timeout=60).returncode != 0:
             pytest.skip("docker is not available here; the container path is "
                         "exercised on a machine that has it")
+        # The pull is its own step, with its own verdict. `docker run` pulls
+        # on first use and run_cmd keeps its stderr, so a registry refusing
+        # the pull looked exactly like the container path being broken --
+        # "never started (pull?)" was a guess. On 2026-10-09 CI failed twice
+        # that way, 200 s a time, on a 3 MB image: the registry had rate-
+        # limited the runner. A test that cannot look is a SKIP that says why,
+        # not a FAIL that blames the code; with the image present, a container
+        # that does not come up is still the code's fault and still fails.
+        image = "alpine:3.20"
+        pull = subprocess.run(["docker", "pull", "--quiet", image],
+                              capture_output=True, text=True, timeout=180)
+        if pull.returncode != 0:
+            why = (pull.stderr.strip().splitlines() or ["no error text"])[-1]
+            pytest.skip("docker is here but %s could not be pulled, so the container "
+                        "path could not be exercised: %s" % (image, why[:200]))
         name = "squawk-test-%d" % os.getpid()
         t = threading.Thread(target=lambda: squawk.run_cmd(
-            ["docker", "run", "--rm", "--name", name, "alpine:3.20", "sleep", "300"],
+            ["docker", "run", "--rm", "--name", name, image, "sleep", "300"],
             None, 600), daemon=True)
         t.start()
-        for _ in range(240):
+        for _ in range(60):                    # the image is local: seconds, not minutes
             if squawk._container_alive(name):
                 break
             time.sleep(0.5)
-        assert squawk._container_alive(name), "the container never started (pull?)"
+        assert squawk._container_alive(name), \
+            "the image is present and the container still did not start within 30 s"
         stopped = squawk.terminate_children()
         rec = next(r for r in stopped if r["container"] == name)
         assert rec["container_stopped"] is True, rec
@@ -5728,6 +6408,228 @@ class TestReconPublishesItsDenominator:
         assert cov.note == "0 of 10 port(s) answered"
 
 
+class TestAiProbeGarak:
+    """The AI domain's dynamic scanner: squawk orchestrates garak, never imports
+    it. Tested with a fake garak that writes a real-shaped report, so the suite
+    pulls in no ML dependencies."""
+
+    FIX = os.path.join(os.path.dirname(ENTRY), "tests", "fixtures", "garak")
+
+    def _fake_garak(self, tmp_path, report_name, exit_code=0):
+        """A fake garak on disk: it finds --report_prefix in its args, writes the
+        chosen fixture to <prefix>.report.jsonl like the real garak, then exits
+        with exit_code -- non-zero stands in for a garak that crashed mid-run."""
+        fixture = os.path.join(self.FIX, report_name)
+        script = tmp_path / "garak"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, shutil\n"
+            "a = sys.argv\n"
+            "prefix = a[a.index('--report_prefix') + 1]\n"
+            "shutil.copyfile(%r, prefix + '.report.jsonl')\n"
+            "sys.exit(%d)\n" % (fixture, exit_code))
+        script.chmod(0o755)
+        return str(script)
+
+    def _ctx(self, tmp_path):
+        run = tmp_path / "run"
+        (run / "raw").mkdir(parents=True)
+        ctx = squawk.RunContext("http://10.56.0.22:8080/ask", "url", str(run), "")
+        ctx.raw_path = str(run / "raw" / "ai-garak.json")
+        return ctx
+
+    def test_missing_garak_is_an_error_not_a_clean_pass(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("SQUAWK_GARAK_BIN", raising=False)
+        monkeypatch.setattr(squawk.probes, "tool_path", lambda _n: "")
+        raw, status, detail = squawk.probes.ai_garak_probe(self._ctx(tmp_path))
+        assert status == "error" and "garak not installed" in detail
+        assert json.loads(raw)["probes"] == []
+
+    def test_a_vulnerable_report_becomes_prioritised_findings(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SQUAWK_GARAK_BIN",
+                           self._fake_garak(tmp_path, "vulnerable.report.jsonl"))
+        out = squawk.probes.ai_garak_probe(self._ctx(tmp_path))
+        assert isinstance(out, str), out            # a clean run returns the bare JSON
+        finds = squawk.scanners.norm_ai_garak(out, "")
+        keys = {f.identity for f in finds}
+        assert "ai:prompt-injection:promptinject.HijackHateHumans" in keys
+        sev = {f.identity.split(":")[-1]: f.severity for f in finds}
+        assert sev["promptinject.HijackHateHumans"] == "high"     # 57%
+        assert sev["promptinject.HijackKillHumans"] == "medium"   # 43%
+
+    def test_a_clean_report_is_no_findings(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SQUAWK_GARAK_BIN", self._fake_garak(tmp_path, "clean.report.jsonl"))
+        out = squawk.probes.ai_garak_probe(self._ctx(tmp_path))
+        assert squawk.scanners.norm_ai_garak(out, "") == []
+
+    def test_a_partial_run_is_a_gap_not_a_clean_ok(self, tmp_path, monkeypatch):
+        """The dogfooding bug this fix answers: garak reached only the `dan`
+        family before it died, yet squawk reported a clean result. A run that
+        did not cover every requested family is a gap, and it names the families
+        that never ran -- coverage before conclusion."""
+        monkeypatch.setenv("SQUAWK_GARAK_BIN",
+                           self._fake_garak(tmp_path, "partial.report.jsonl"))
+        out = squawk.probes.ai_garak_probe(self._ctx(tmp_path))
+        assert isinstance(out, tuple), "a partial run must not return a bare ok"
+        raw, status, detail = out
+        assert status == "gap"
+        for fam in ("latentinjection", "promptinject", "sysprompt_extraction"):
+            assert fam in detail
+        body = json.loads(raw)
+        assert body["families_ran"] == ["dan"]
+        assert sorted(body["families_missing"]) == [
+            "latentinjection", "promptinject", "sysprompt_extraction"]
+        # a gap does not suppress the real finding the partial run did reach
+        assert squawk.scanners.norm_ai_garak(raw, "")
+
+    def test_a_nonzero_garak_exit_is_a_gap_even_with_a_full_report(
+            self, tmp_path, monkeypatch):
+        """All four families ran, but garak exited non-zero -- the run did not
+        finish cleanly, so it is a gap and the detail carries the exit code."""
+        monkeypatch.setenv("SQUAWK_GARAK_BIN",
+                           self._fake_garak(tmp_path, "vulnerable.report.jsonl",
+                                            exit_code=3))
+        out = squawk.probes.ai_garak_probe(self._ctx(tmp_path))
+        assert isinstance(out, tuple)
+        _raw, status, detail = out
+        assert status == "gap" and "rc=3" in detail
+
+    def test_coverage_on_a_complete_run_counts_all_four_families(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SQUAWK_GARAK_BIN",
+                           self._fake_garak(tmp_path, "vulnerable.report.jsonl"))
+        out = squawk.probes.ai_garak_probe(self._ctx(tmp_path))
+        cov = squawk.scanners.stage_coverage("garak", out)
+        assert cov.examined == 4 and cov.skipped == 0
+        assert cov.unit == "probe families"
+
+    def test_coverage_on_a_partial_run_counts_only_what_ran(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SQUAWK_GARAK_BIN",
+                           self._fake_garak(tmp_path, "partial.report.jsonl"))
+        raw, _status, _detail = squawk.probes.ai_garak_probe(self._ctx(tmp_path))
+        cov = squawk.scanners.stage_coverage("garak", raw)
+        assert cov.examined == 1 and cov.skipped == 3
+        assert "latentinjection" in cov.note
+
+    def test_the_garak_timeout_defaults_and_is_configurable(self, monkeypatch):
+        """A slow local model can need hours for the full probe set, so the
+        garak budget is raisable; a bad value falls back, never "no limit"."""
+        monkeypatch.delenv("SQUAWK_AI_GARAK_TIMEOUT", raising=False)
+        assert squawk.probes._garak_timeout() == 5400
+        monkeypatch.setenv("SQUAWK_AI_GARAK_TIMEOUT", "86400")
+        assert squawk.probes._garak_timeout() == 86400
+        for bad in ("0", "-1", "soon"):
+            monkeypatch.setenv("SQUAWK_AI_GARAK_TIMEOUT", bad)
+            assert squawk.probes._garak_timeout() == 5400
+
+    def test_the_configured_timeout_reaches_garak(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SQUAWK_GARAK_BIN", str(tmp_path / "garak"))
+        monkeypatch.setenv("SQUAWK_AI_GARAK_TIMEOUT", "9000")
+        fixture = os.path.join(self.FIX, "clean.report.jsonl")
+        captured = {}
+
+        def fake_run_cmd(cmd, cwd, timeout):
+            captured["timeout"] = timeout
+            prefix = cmd[cmd.index("--report_prefix") + 1]
+            shutil.copyfile(fixture, prefix + ".report.jsonl")
+            return (0, "", "")
+
+        monkeypatch.setattr(squawk.probes, "run_cmd", fake_run_cmd)
+        squawk.probes.ai_garak_probe(self._ctx(tmp_path))
+        assert captured["timeout"] == 9000
+
+    def test_the_request_timeout_defaults_and_is_configurable(self, monkeypatch):
+        """garak aborts the whole run on one read timeout, so a slow model needs
+        a longer per-request wait; a bad value falls back, never no limit."""
+        monkeypatch.delenv("SQUAWK_AI_GARAK_REQUEST_TIMEOUT", raising=False)
+        assert squawk.probes._garak_request_timeout() == 60
+        cfg = squawk.probes.ai_garak_rest_config("http://t/ask", False)
+        assert cfg["rest"]["RestGenerator"]["request_timeout"] == 60
+        monkeypatch.setenv("SQUAWK_AI_GARAK_REQUEST_TIMEOUT", "300")
+        cfg = squawk.probes.ai_garak_rest_config("http://t/ask", False)
+        assert cfg["rest"]["RestGenerator"]["request_timeout"] == 300
+        for bad in ("0", "-5", "later"):
+            monkeypatch.setenv("SQUAWK_AI_GARAK_REQUEST_TIMEOUT", bad)
+            assert squawk.probes._garak_request_timeout() == 60
+
+    def test_the_probe_list_defaults_and_is_overridable(self, monkeypatch):
+        """Default is the four families; SQUAWK_AI_GARAK_PROBES overrides it so a
+        probe that overwhelms a target (dan.DanInTheWild 502'd a small model) can
+        be dropped without losing the rest; empty falls back."""
+        monkeypatch.delenv("SQUAWK_AI_GARAK_PROBES", raising=False)
+        assert squawk.probes._garak_probes() == squawk.probes.AI_GARAK_PROBES
+        monkeypatch.setenv("SQUAWK_AI_GARAK_PROBES",
+                           "dan.Ablation_Dan_11_0, promptinject , sysprompt_extraction")
+        assert squawk.probes._garak_probes() == (
+            "dan.Ablation_Dan_11_0", "promptinject", "sysprompt_extraction")
+        monkeypatch.setenv("SQUAWK_AI_GARAK_PROBES", "   ")
+        assert squawk.probes._garak_probes() == squawk.probes.AI_GARAK_PROBES
+
+    def test_the_override_reaches_garak_and_coverage_follows_the_request(
+            self, tmp_path, monkeypatch):
+        """Request only the dan family, feed a dan-only report: garak is asked
+        for exactly that, and a dan-only result is COMPLETE (examined 1, skipped
+        0), not a gap -- coverage follows what was requested, not the four."""
+        monkeypatch.setenv("SQUAWK_GARAK_BIN", str(tmp_path / "garak"))
+        monkeypatch.setenv("SQUAWK_AI_GARAK_PROBES", "dan")
+        fixture = os.path.join(self.FIX, "partial.report.jsonl")  # dan only
+        captured = {}
+
+        def fake_run_cmd(cmd, cwd, timeout):
+            captured["probes"] = cmd[cmd.index("--probes") + 1]
+            prefix = cmd[cmd.index("--report_prefix") + 1]
+            shutil.copyfile(fixture, prefix + ".report.jsonl")
+            return (0, "", "")
+
+        monkeypatch.setattr(squawk.probes, "run_cmd", fake_run_cmd)
+        out = squawk.probes.ai_garak_probe(self._ctx(tmp_path))
+        assert captured["probes"] == "dan"           # garak asked for only dan
+        assert isinstance(out, str), out             # dan asked, dan ran -> ok
+        body = json.loads(out)
+        assert body["families_ran"] == ["dan"] and body["families_missing"] == []
+        cov = squawk.scanners.stage_coverage("garak", out)
+        assert cov.examined == 1 and cov.skipped == 0
+
+    def test_the_config_is_written_and_asks_for_the_key_only_when_present(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SQUAWK_GARAK_BIN", self._fake_garak(tmp_path, "clean.report.jsonl"))
+        monkeypatch.delenv("REST_API_KEY", raising=False)
+        ctx = self._ctx(tmp_path)
+        squawk.probes.ai_garak_probe(ctx)
+        cfg = json.loads((pathlib.Path(ctx.raw_path).parent / "garak-rest.json").read_text())
+        gen = cfg["rest"]["RestGenerator"]
+        assert gen["uri"] == "http://10.56.0.22:8080/ask"
+        assert "Authorization" not in gen["headers"]              # no key, no bearer header
+        assert gen["response_json_field"] == "answer"
+        monkeypatch.setenv("REST_API_KEY", "x")
+        squawk.probes.ai_garak_probe(ctx)
+        cfg = json.loads((pathlib.Path(ctx.raw_path).parent / "garak-rest.json").read_text())
+        assert cfg["rest"]["RestGenerator"]["headers"]["Authorization"] == "Bearer $KEY"
+
+    def test_ai_probe_is_url_scope_so_the_dast_rail_applies(self):
+        svc = squawk.SERVICES["ai-probe"]
+        assert svc.scope == "url" and svc.domain == "ai", \
+            "ai-probe sends attacks: url scope puts it behind dast_target_ok"
+
+    def test_squawk_imports_no_ml_library(self):
+        """squawk orchestrates garak; it must never import it or any ML stack."""
+        import ast
+        banned = {"garak", "torch", "transformers", "numpy", "nltk", "sentence_transformers"}
+        pkg = os.path.join(os.path.dirname(ENTRY), "squawk")
+        for fn in os.listdir(pkg):
+            if not fn.endswith(".py"):
+                continue
+            tree = ast.parse(open(os.path.join(pkg, fn), encoding="utf-8").read())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for n in node.names:
+                        assert n.name.split(".")[0] not in banned, "%s imports %s" % (fn, n.name)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    assert node.module.split(".")[0] not in banned, \
+                        "%s imports %s" % (fn, node.module)
+
+
 class TestReconCalibratesForCatchAll:
     """Juice Shop serves its index for any path, so recon reported DVWA,
     phpMyAdmin and TWiki at paths it does not serve — fifteen endpoints, one
@@ -6085,6 +6987,61 @@ class TestLabTargets:
         assert "| awscli | not exercised | gap: Security Hub is off / x |" in text
         assert self.ACCOUNT not in text and "********9012" in text
 
+    def test_a_run_against_an_endpoint_that_is_not_aws_is_never_called_validated(
+            self, tmp_path, monkeypatch, capsys):
+        """An emulator answers in AWS's shape, and that is all it proves. A
+        release ships on `validated`, so a run sent anywhere but AWS must not
+        write that word, in a row or in the record's header."""
+        lab = self._mod()
+        L = self.LAB
+        self._fake_cloud_run(
+            lab, monkeypatch, tmp_path,
+            [{"tool": "cloudstore", "status": "ok"}, {"tool": "cloudenable", "status": "ok"}],
+            {"cloudstore": '{"buckets": ["%s-open", "%s-held"]}' % (L, L), "cloudenable": "{}"},
+            [{"scanner": "cloudstore", "identity": "storage:bucket-public:%s-open" % L},
+             {"scanner": "cloudstore",
+              "identity": "storage:bucket-public-policy-blocked:%s-held" % L}])
+        lab.check_cloud_target(self._one_stage_target(), str(tmp_path),
+                               {"profile": "p", "account": self.ACCOUNT, "lab": L,
+                                "endpoint": "http://127.0.0.1:5000"})
+        assert lab.FAIL == 0, capsys.readouterr().out
+        assert {r for _t, r, _d in lab.CLOUD_RESULTS} == {"validated off AWS"}
+        path = tmp_path / "VALIDATION.md"
+        lab.write_cloud_report(str(path), self.ACCOUNT, "http://127.0.0.1:5000")
+        text = path.read_text(encoding="utf-8")
+        assert "http://127.0.0.1:5000, which is not AWS" in text
+        assert "Nothing ships on this report" in text
+        assert "| validated |" not in text and "A stage ships only if" not in text
+
+    def test_the_endpoint_override_is_read_from_the_environment(self, monkeypatch):
+        """The CLI's own override variables, the general one and a per-service
+        one. With neither, the profile is asked; the suite's `aws` answers
+        nothing, so that is AWS."""
+        lab = self._mod()
+        for k in [k for k in os.environ if k.startswith("AWS_ENDPOINT_URL")]:
+            monkeypatch.delenv(k)
+        assert lab.aws_endpoint_of("lab-auditor") == ""
+        monkeypatch.setenv("AWS_ENDPOINT_URL_S3", "http://127.0.0.1:4566")
+        assert lab.aws_endpoint_of("lab-auditor") == "http://127.0.0.1:4566"
+        monkeypatch.setenv("AWS_ENDPOINT_URL", "http://127.0.0.1:5000")
+        assert lab.aws_endpoint_of("lab-auditor") == "http://127.0.0.1:5000"
+
+    def test_the_check_says_so_when_the_profile_calls_somewhere_else(
+            self, tmp_path, monkeypatch, capsys):
+        lab = self._mod()
+        monkeypatch.setattr(lab, "aws_account_of", lambda p: (self.ACCOUNT, ""))
+        monkeypatch.setattr(lab, "aws_endpoint_of", lambda p: "http://127.0.0.1:5000")
+        seen = []
+        monkeypatch.setattr(lab, "check_cloud_target", lambda t, ev, aws: seen.append(aws))
+        report = tmp_path / "VALIDATION.md"
+        lab.main(["check", "--only", "cloud", "--aws-profile", "lab-auditor",
+                  "--aws-account", self.ACCOUNT, "--aws-lab", self.LAB,
+                  "--evidence", str(tmp_path / "ev"), "--report", str(report)])
+        out = capsys.readouterr().out
+        assert seen and all(a["endpoint"] == "http://127.0.0.1:5000" for a in seen)
+        assert "calls http://127.0.0.1:5000, not AWS" in out
+        assert "which is not AWS" in report.read_text(encoding="utf-8")
+
 
     def test_ids_match_as_segments_not_substrings(self):
         lab = self._mod()
@@ -6112,10 +7069,12 @@ class TestLabTargets:
         gap = "%s is not installed — this stage could not run"
         self._fake_run(lab, monkeypatch,
                        [{"tool": "checkov", "status": "gap", "detail": gap % "checkov"},
-                        {"tool": "trivy", "status": "gap", "detail": gap % "trivy"}], [])
+                        {"tool": "trivy", "status": "gap", "detail": gap % "trivy"},
+                        {"tool": "hadolint", "status": "gap", "detail": gap % "hadolint"}],
+                       [])
         lab.check_target(t, str(tmp_path), str(tmp_path))
         out = capsys.readouterr().out
-        assert lab.FAIL == 0 and lab.SKIP == 3, out   # both scanners, and the floor
+        assert lab.FAIL == 0 and lab.SKIP == 4, out   # the three scanners, and the floor
         assert lab.PASS == 1, out                     # only "runs and writes a manifest"
         assert "could not look" in out
 
@@ -6124,10 +7083,11 @@ class TestLabTargets:
         good = next(x for x in lab.TARGETS if x["corpus"] == "dockerfiles/good")
         (tmp_path / "corpora" / "dockerfiles" / "good").mkdir(parents=True)
         ledger = [{"tool": "checkov", "status": "ok", "detail": ""},
-                  {"tool": "trivy", "status": "ok", "detail": ""}]
+                  {"tool": "trivy", "status": "ok", "detail": ""},
+                  {"tool": "hadolint", "status": "ok", "detail": ""}]
         self._fake_run(lab, monkeypatch, ledger, [])
         lab.check_target(good, str(tmp_path), str(tmp_path))
-        assert (lab.FAIL, lab.SKIP, lab.PASS) == (0, 0, 3), capsys.readouterr().out
+        assert (lab.FAIL, lab.SKIP, lab.PASS) == (0, 0, 4), capsys.readouterr().out
         self._fake_run(lab, monkeypatch, ledger,
                        [{"scanner": "checkov", "identity": "CKV_DOCKER_3:Dockerfile"}])
         lab.check_target(good, str(tmp_path), str(tmp_path))
@@ -6342,6 +7302,170 @@ class TestLabTargets:
                 named = m.group(1)
                 assert (path.parent / named).exists() or (here / named).exists(), \
                     (path.name, named)
+
+
+class TestMotoLab:
+    """dev/moto-lab: the cloud lab planted in a local emulator. The estate is
+    weak on purpose, so the rails are tested here, against real sockets and
+    the suite's own `aws`; the plant itself is proven by the run recorded in
+    dev/moto-lab/VALIDATION.md."""
+
+    PATH = os.path.join(os.path.dirname(ENTRY), "dev", "moto-lab", "moto-lab.py")
+
+    @classmethod
+    def _mod(cls):
+        spec = importlib.util.spec_from_file_location("moto_lab", cls.PATH)
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    @staticmethod
+    def _serve(body: bytes, ctype: str):
+        """A real HTTP server on a loopback port that answers every GET with
+        `body`. Returns (url, stop)."""
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_a):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        def stop():
+            srv.shutdown()
+            srv.server_close()
+        return "http://127.0.0.1:%d" % srv.server_address[1], stop
+
+    @staticmethod
+    def _closed_port() -> int:
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+    @pytest.mark.parametrize("url", [
+        "http://127.0.0.1:5000", "http://127.0.0.1:5000/", "http://localhost:5000",
+        "http://[::1]:5000", "http://127.0.0.2:5000"])
+    def test_a_loopback_endpoint_with_a_port_is_accepted(self, url):
+        assert self._mod().endpoint_ok(url)[0], url
+
+    @pytest.mark.parametrize("url", [
+        "https://127.0.0.1:5000",            # https is likelier AWS than Moto
+        "http://127.0.0.1",                  # no port
+        "http://10.0.0.5:5000",              # private is not this machine
+        "http://169.254.169.254:80",         # the metadata address
+        "http://moto.example:5000",          # a name is not resolved
+        "http://127.0.0.1.nip.io:5000",      # nor one that would resolve to loopback
+        "http://127.0.0.1:5000/s3",          # a path
+        "http://u:p@127.0.0.1:5000",         # credentials in the URL
+        "http://127.0.0.1:port",             # a port that is not a number
+        "127.0.0.1:5000", ""])
+    def test_anything_else_is_refused(self, url):
+        ok, why = self._mod().endpoint_ok(url)
+        assert not ok and why, url
+
+    def test_is_moto_believes_only_an_answer_shaped_like_moto(self):
+        m = self._mod()
+        url, stop = self._serve(b'{"progression": "immediate"}', "application/json")
+        try:
+            assert m.is_moto(url)[0]
+        finally:
+            stop()
+        for body, ctype in ((b"<html>a web app</html>", "text/html"),
+                            (b'{"Account": "123456789012"}', "application/json"),
+                            (b'["progression"]', "application/json")):
+            url, stop = self._serve(body, ctype)
+            try:
+                ok, why = m.is_moto(url)
+                assert not ok and "not as Moto" in why, body
+            finally:
+                stop()
+        ok, why = m.is_moto("http://127.0.0.1:%d" % self._closed_port(), timeout=2)
+        assert not ok and "did not answer" in why
+
+    def test_the_aws_environment_carries_nothing_from_the_caller(self):
+        """A leftover key, profile, credential file or endpoint override would
+        point a plant somewhere real. Every AWS_* goes; only the emulator's
+        own configuration comes back."""
+        m = self._mod()
+        base = {"PATH": "/usr/bin", "AWS_ACCESS_KEY_ID": "x", "AWS_SECRET_ACCESS_KEY": "x",
+                "AWS_SESSION_TOKEN": "x", "AWS_PROFILE": "prod", "AWS_DEFAULT_PROFILE": "prod",
+                "AWS_ENDPOINT_URL_S3": "https://s3.example", "AWS_CONFIG_FILE": "/home/x/.aws/c",
+                "AWS_SHARED_CREDENTIALS_FILE": "/home/x/.aws/credentials",
+                "AWS_IGNORE_CONFIGURED_ENDPOINT_URLS": "true"}
+        env = m.aws_env("/s/aws-config", "http://127.0.0.1:5000", base)
+        assert {k for k in env if k.startswith("AWS_")} == {
+            "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE", "AWS_ENDPOINT_URL",
+            "AWS_EC2_METADATA_DISABLED", "AWS_PAGER"}
+        assert env["AWS_CONFIG_FILE"] == "/s/aws-config"
+        assert env["AWS_SHARED_CREDENTIALS_FILE"] == os.devnull
+        assert env["AWS_ENDPOINT_URL"] == "http://127.0.0.1:5000"
+        assert env["PATH"] == "/usr/bin"
+
+    def test_the_configuration_names_the_emulator_and_the_lab_auditor_only(self, tmp_path):
+        m = self._mod()
+        before = m.config_text("http://127.0.0.1:5000", None)
+        assert "[profile %s]" % m.DEPLOY in before and m.AUDITOR not in before
+        path = tmp_path / "st" / "aws-config"
+        m.write_config(str(path), "http://127.0.0.1:5000", "squawk-moto-1a2b3c")
+        text = path.read_text(encoding="utf-8")
+        assert oct(path.stat().st_mode & 0o777) == oct(0o600)
+        assert text.count("endpoint_url = http://127.0.0.1:5000") == 2
+        assert "role_arn = arn:aws:iam::%s:role/squawk-moto-1a2b3c-auditor" % m.ACCOUNT in text
+        keys = re.findall(r"^aws_\w+_key\w* = (.*)$", text, re.M)
+        assert keys == [m.FAKE_KEY, m.FAKE_KEY]
+
+    def test_plant_refuses_before_any_aws_call(self, tmp_path, capsys):
+        """Both rails stop the plant before the CLI runs at all: a remote
+        endpoint, and a loopback port that is not Moto."""
+        m = self._mod()
+        log = os.environ["SQUAWK_TEST_AWS_LOG"]
+        before = os.path.getsize(log) if os.path.exists(log) else 0
+        rc = m.main(["--endpoint", "http://10.0.0.5:5000", "--state", str(tmp_path), "plant"])
+        assert rc == 2 and "not a loopback address" in capsys.readouterr().out
+        url, stop = self._serve(b"<html>not moto</html>", "text/html")
+        try:
+            rc = m.main(["--endpoint", url, "--state", str(tmp_path), "plant"])
+        finally:
+            stop()
+        assert rc == 2 and "not as Moto" in capsys.readouterr().out
+        after = os.path.getsize(log) if os.path.exists(log) else 0
+        assert after == before, "an aws call ran before the rails"
+        assert not os.listdir(str(tmp_path)), "nothing is written before the rails"
+
+    def test_the_seed_plants_every_name_the_check_looks_for(self):
+        """lab-targets.py holds each cloud stage to names from the lab. The
+        seed is a second copy of the lab, so a name the check expects and the
+        seed never plants would fail the stage for the seed's sake."""
+        lab = TestLabTargets._mod()
+        # The calls only: a progress line naming a plant is not a plant.
+        src = "\n".join(line for line in open(self.PATH, encoding="utf-8")
+                        if "did(" not in line)
+        wanted = {n for t in lab.TARGETS if t.get("cloud")
+                  for names in t["stages"].values() for n in names}
+        assert wanted
+        planted = set(re.findall(r'n \+ "(-[a-z-]+)"', src)) | set(
+            re.findall(r'\("(-[a-z]+)", "SquawkLab', src))
+        # The analyzer is the one plant Moto cannot hold; the seed says so.
+        missing = wanted - planted - {"-analyzer"}
+        assert not missing, missing
+        assert "-analyzer (analyzer.tf): Moto does not emulate" in src
+
+    def test_the_image_is_pinned_by_digest_and_published_on_loopback(self):
+        m = self._mod()
+        assert re.fullmatch(r"motoserver/moto@sha256:[0-9a-f]{64}", m.IMAGE)
+        src = open(self.PATH, encoding="utf-8").read()
+        assert '"-p", "%s:%d:5000"' in src and 'bind = "127.0.0.1"' in src
 
 
 class TestProfiles:
@@ -6561,7 +7685,8 @@ class TestProfiles:
         _patch_all(monkeypatch, "run_cmd", fake_run)
         repo = self._repo(tmp_path)
         out = squawk.execute_service(squawk.SERVICES["compliance"], repo, str(ev), repo)
-        assert [t for _c, t in seen] == [123, 123], seen
+        # checkov, trivy and hadolint (the repo holds a Dockerfile)
+        assert [t for _c, t in seen] == [123, 123, 123], seen
         trivy_cmd = next(c for c, _t in seen if c[0] == "trivy")
         assert trivy_cmd[-2:] == ["--skip-dirs", ".git"], "appended, at the end"
         assert next(c for c, _t in seen if c[0] == "checkov")[-1] != ".git"
@@ -6570,7 +7695,8 @@ class TestProfiles:
         assert prof["path"] == str(ev / "squawk.toml") and prof["source"] == "evidence root"
         assert [(c["stage"], c["value"], c["builtin"], c["section"]) for c in prof["changed"]] == [
             ("checkov", 123, 900, "[services.compliance]"),
-            ("trivy-config", 123, 900, "[services.compliance]")]
+            ("trivy-config", 123, 900, "[services.compliance]"),
+            ("hadolint", 123, 120, "[services.compliance]")]
         assert prof["extra_args"] == {"trivy": ["--skip-dirs", ".git"]}
         rows = {r["tool"]: r for r in man["ledger"]}
         assert rows["trivy"]["ran"]["command"] == trivy_cmd
@@ -6628,7 +7754,7 @@ class TestProfiles:
         rc = squawk.main(["run", "compliance", "--repo", repo, "--evidence", str(ev)])
         out = capsys.readouterr().out
         assert rc == 0
-        assert "Profile : %s (evidence root) — 2 value(s) differ" % (ev / "squawk.toml") in out
+        assert "Profile : %s (evidence root) — 3 value(s) differ" % (ev / "squawk.toml") in out
         assert "checkov       stage_timeout              = 77     built-in 900" in out, out
         (ev / "squawk.toml").write_text('[scanners.checkov]\nextra_args = ["--force"]\n')
         before = [n for n in os.listdir(str(ev)) if n[:2] == "20"]
@@ -6855,6 +7981,8 @@ class TestAScanSaysItIsNotStuck:
         repo = tmp_path / "repo"
         repo.mkdir()
         (repo / "Dockerfile").write_text("FROM ubuntu:latest\n")
+        (repo / ".github" / "workflows").mkdir(parents=True)
+        (repo / ".github" / "workflows" / "ci.yml").write_text("on: push\n")
         ev = tmp_path / "ev"
         ev.mkdir()
         (ev / "squawk.toml").write_text("[services.compliance]\nstage_timeout = 321\n")
@@ -6863,7 +7991,9 @@ class TestAScanSaysItIsNotStuck:
         budgets = [e for e in events if e["phase"] == "budget"]
         assert [(b["tool"], b["timeout"], b["timeout_from"]) for b in budgets] == [
             ("checkov", 321, "[services.compliance]"),
-            ("trivy", 321, "[services.compliance]")]
+            ("trivy", 321, "[services.compliance]"),
+            ("hadolint", 321, "[services.compliance]"),
+            ("zizmor", 321, "[services.compliance]")]
         # the budget is announced before the stage's own result, not after it
         assert events.index(budgets[0]) < next(
             i for i, e in enumerate(events) if e["phase"] == "done")
@@ -12143,6 +13273,106 @@ def _run_probe(monkeypatch, probe, responder, ctx=None):
     return json.loads(out), "ok", ""
 
 
+class TestAFailedReadIsNotAnAnswer:
+    """Three reads the first emulator run caught taking a non-answer for an
+    answer (dev/moto-lab, 2026-10-16). Each test feeds the probe what Moto
+    sent, and the read must come out unknown, never clean."""
+
+    MOTO_404 = ("<p>The requested URL was not found on the server. If you entered "
+                "the URL manually please check your spelling and try again.</p>")
+
+    @staticmethod
+    def _edge(url_answer):
+        def responder(argv, _t):
+            if argv[0] == "sts":
+                return ({"Account": "000000000000", "Arn": "arn:x"}, "")
+            if argv[1] == "list-functions":
+                return ({"Functions": [{"FunctionName": "fn", "Role": "r",
+                                        "VpcConfig": {}}]}, "")
+            if argv[1] == "list-function-url-configs":
+                return url_answer
+            if argv[0] == "elbv2":
+                return ({"LoadBalancers": []}, "")
+            return ({}, "")
+        return responder
+
+    def test_a_call_the_endpoint_does_not_have_is_not_no_url(self, monkeypatch):
+        """Moto has no ListFunctionUrlConfigs and answers with its 404 page.
+        "not found" in that page read as "this function has no URL"."""
+        data, _s, _d = _run_probe(monkeypatch, squawk.probes.aws_edge,
+                                  self._edge((None, self.MOTO_404)))
+        region = data["regional"]["us-east-1"]
+        assert [u["auth"] for u in region["urls"]] == ["unknown"]
+        assert any("URL auth for fn" in u for u in region["unreadable"])
+        keys = [f["key"] for f in squawk.analysis.edge_findings(data)]
+        assert "lambda-url-unreadable" in keys
+
+    def test_aws_saying_the_function_is_gone_is_still_no_url(self, monkeypatch):
+        data, _s, _d = _run_probe(monkeypatch, squawk.probes.aws_edge, self._edge(
+            (None, "An error occurred (ResourceNotFoundException) when calling the "
+                   "ListFunctionUrlConfigs operation: Function not found")))
+        region = data["regional"]["us-east-1"]
+        assert region["urls"] == [] and region["unreadable"] == []
+
+    @staticmethod
+    def _storage(status_answer):
+        def responder(argv, _t):
+            if argv[0] == "sts":
+                return ({"Account": "000000000000", "Arn": "arn:x"}, "")
+            if argv[1] == "list-buckets":
+                return ({"Buckets": [{"Name": "b1"}]}, "")
+            if argv[1] == "get-bucket-location":
+                return ({"LocationConstraint": None}, "")
+            if argv[1] == "get-bucket-policy-status":
+                return status_answer
+            if argv[1] == "get-bucket-encryption":
+                return ({"ServerSideEncryptionConfiguration": {
+                    "Rules": [{"ApplyServerSideEncryptionByDefault": {}}]}}, "")
+            return (None, "An error occurred (NoSuchPublicAccessBlockConfiguration)")
+        return responder
+
+    def test_a_policy_status_with_no_verdict_is_unreadable_not_private(self, monkeypatch):
+        """Moto answers GetBucketPolicyStatus with an empty PolicyStatus: it
+        does not evaluate policies. A missing IsPublic read as False."""
+        data, _s, _d = _run_probe(monkeypatch, squawk.probes.aws_storage,
+                                  self._storage(({"PolicyStatus": {}}, "")))
+        bucket = data["buckets"][0]
+        assert bucket["public"] is None
+        assert any("no IsPublic" in u for u in bucket["unreadable"])
+        # The database reads get the responder's catch-all and are unreadable
+        # too; the bucket is the subject here.
+        keys = [f["key"] for f in squawk.analysis.storage_findings(data)
+                if f["key"].startswith("bucket")]
+        assert keys == ["bucket-unreadable"], keys
+
+    @pytest.mark.parametrize("verdict", [True, False])
+    def test_a_verdict_is_still_read_as_given(self, monkeypatch, verdict):
+        data, _s, _d = _run_probe(monkeypatch, squawk.probes.aws_storage,
+                                  self._storage(({"PolicyStatus": {"IsPublic": verdict}}, "")))
+        bucket = data["buckets"][0]
+        assert bucket["public"] is verdict
+        assert not any("IsPublic" in u for u in bucket["unreadable"])
+
+    def test_an_empty_ecs_cluster_is_in_the_evidence(self, monkeypatch):
+        """Only a cluster's services were kept, so a cluster with none was
+        read and left no trace: the count said 0 and the evidence could not
+        show the read happened."""
+        def responder(argv, _t):
+            if argv[0] == "sts":
+                return ({"Account": "000000000000", "Arn": "arn:x"}, "")
+            if argv[0] == "eks":
+                return ({"clusters": []}, "")
+            if argv[1] == "list-clusters":
+                return ({"clusterArns": ["arn:aws:ecs:us-east-1:0:cluster/lab-cluster"]}, "")
+            if argv[1] == "list-services":
+                return ({"serviceArns": []}, "")
+            return ({}, "")
+        data, _s, _d = _run_probe(monkeypatch, squawk.probes.aws_containers, responder)
+        assert data["regional"]["us-east-1"]["ecs_clusters"] == ["lab-cluster"]
+        cov = squawk.scanners.stage_coverage("cloudcontain", json.dumps(data))
+        assert "1 cluster(s) and service(s) found" in cov.note
+
+
 class TestEveryStageHasADeadline:
     """Read, partial and unread are three answers.
 
@@ -13945,6 +15175,24 @@ class TestAFindingAboutATestIsNotAFindingAboutTheProduct:
                 squawk.web.view_findings(root, None, None, None, "tests"))
         assert "3 finding(s)" in both[0] and "40 finding(s)" in both[1]
 
+    def test_the_headless_count_line_names_the_test_share(self):
+        """The same split the page makes, on the CLI: a scanner's one-line count
+        must say how many of its findings are in test code, so a flood of the
+        test idiom (bandit's B101 asserts) cannot bury the product findings
+        behind one big number on a headless run."""
+        kept = [squawk.Finding("bandit", "B101:%d" % i, "low", "assert",
+                               "tests/test_squawk.py") for i in range(40)]
+        kept += [squawk.Finding("semgrep", "sql:%d" % i, "high", "SQLi",
+                                "squawk/web.py") for i in range(3)]
+        assert squawk.engine._count_detail(kept) == \
+            "43 finding(s) (40 in tests, 3 in product)"
+        # all-product and all-test both read cleanly, and neither is annotated away
+        prod = [squawk.Finding("semgrep", "x:1", "high", "t", "squawk/core.py")]
+        assert squawk.engine._count_detail(prod) == "1 finding(s)"
+        tst = [squawk.Finding("bandit", "B101:1", "low", "assert", "test_x.py")]
+        assert squawk.engine._count_detail(tst) == "1 finding(s) (all in tests)"
+        assert squawk.engine._count_detail([]) == "0 finding(s)"
+
     def test_a_filter_that_empties_one_side_does_not_read_as_clean(self,
                                                                    tmp_path):
         """I1 at the page level. Filtering the product side to nothing while
@@ -15358,7 +16606,7 @@ class TestTheBudgetIsWhatItWasAllowedNotWhatItTook:
         root = tmp_path / "ev"
         root.mkdir()
         out = squawk.execute_service(
-            squawk.Service("t", "T", "repo", ("bandit",), "instant", ""),
+            squawk.Service("t", "T", "code", "repo", ("bandit",), "instant", ""),
             str(tmp_path), str(root), str(tmp_path))
         detail = out["results"][0].detail
         assert "timed out after 3s" in detail, detail
@@ -15380,7 +16628,7 @@ class TestTheBudgetIsWhatItWasAllowedNotWhatItTook:
         root = tmp_path / "ev"
         root.mkdir()
         out = squawk.execute_service(
-            squawk.Service("t", "T", "repo", ("bandit",), "instant", ""),
+            squawk.Service("t", "T", "code", "repo", ("bandit",), "instant", ""),
             str(tmp_path), str(root), str(tmp_path))
         detail = out["results"][0].detail
         assert "timed out after 2s" in detail
@@ -16501,6 +17749,55 @@ class TestStopHonoursThePortItWasGiven:
         assert squawk.service.cmd_stop(str(tmp_path), wait=0.1) == 0
         assert killed == [424242]
 
+    # -- through the command line, where the default lives ------------------ #
+    # The tests above call cmd_stop and never see the parser. The parser gave
+    # --port a default, so `stop --evidence X` reached the port check carrying
+    # 8787 as though it had been typed, and a server on any other port was
+    # refused. All four passed while that was true -- the one with no port
+    # used 8787 too -- and the field check failed 29 of 85 (2026-10-09).
+    # These go through main(), on a port that is not the default.
+
+    def test_stop_with_no_port_typed_stops_a_server_on_any_port(
+            self, tmp_path, capsys, monkeypatch):
+        killed = self._watch_kills(monkeypatch, dies=True)
+        self._running(tmp_path, 61338)
+        rc = squawk.cli.main(["stop", "--evidence", str(tmp_path)])
+        out = capsys.readouterr().out
+        assert rc == 0, out
+        assert killed == [424242], "the server in this root must be signalled"
+        assert "Refusing" not in out, out
+
+    def test_a_typed_default_port_is_still_a_check(self, tmp_path, capsys,
+                                                   monkeypatch):
+        """Typing --port 8787 at a server on 61338 is exactly the case the
+        check exists for, and must still refuse. The fix is to notice whether
+        the port was typed, not to stop checking it."""
+        killed = self._watch_kills(monkeypatch)
+        self._running(tmp_path, 61338)
+        rc = squawk.cli.main(["stop", "--evidence", str(tmp_path),
+                              "--port", str(squawk.cli.DEFAULT_PORT)])
+        out = capsys.readouterr().out
+        assert killed == [] and rc == 2, out
+        assert "61338" in out and str(squawk.cli.DEFAULT_PORT) in out, out
+
+    def test_a_typed_matching_port_through_the_cli_stops_it(
+            self, tmp_path, capsys, monkeypatch):
+        killed = self._watch_kills(monkeypatch, dies=True)
+        self._running(tmp_path, 61338)
+        rc = squawk.cli.main(["stop", "--evidence", str(tmp_path), "--port", "61338"])
+        assert rc == 0 and killed == [424242], capsys.readouterr().out
+
+    def test_everything_that_serves_still_gets_the_default_port(
+            self, tmp_path, monkeypatch):
+        """Taking the parser default away must not take the port away from the
+        commands that need a number. install-service writes it into a unit."""
+        seen = {}
+        monkeypatch.setattr(squawk.cli, "cmd_install_service",
+                            lambda args, root: seen.update(port=args.port) or 0)
+        assert squawk.cli.main(["install-service", "--evidence", str(tmp_path)]) == 0
+        assert seen["port"] == squawk.cli.DEFAULT_PORT
+        assert squawk.cli.build_parser().parse_args(["--status"]).port is None
+
     def test_the_stopped_line_names_what_was_stopped(self, tmp_path, capsys,
                                                      monkeypatch):
         """`Stopped Squawk (pid 481275).` gave a reader no way to notice it was
@@ -16801,3 +18098,3291 @@ class TestTheEvidenceLocker:
         self._write(tmp_path)
         text, _ = squawk.report.report_markdown(str(tmp_path / "ev"), "thm-blue")
         assert "## What ran, and what it read" in text
+
+
+class TestCheckovOnATreeWithNoIaC:
+    """checkov on a directory with nothing it parses -- no Terraform, no
+    Dockerfile, no workflow -- writes a flat summary and nothing else. Measured
+    2026-10-22 with checkov 3.3.26 on a repo holding one Python file:
+
+        {"passed": 0, "failed": 0, "skipped": 0, "parsing_errors": 0,
+         "resource_count": 0, "checkov_version": "3.3.26"}
+
+    The shape check knew only the per-framework block, so this read as an
+    unreadable report, the stage as an error, and the run as SQUAWK 7600 "ran
+    and did not finish". What happened is that checkov examined zero
+    resources, which is a gap to name, not a failure to explain away."""
+
+    EMPTY = ('{"passed": 0, "failed": 0, "skipped": 0, "parsing_errors": 0, '
+             '"resource_count": 0, "checkov_version": "3.3.26"}')
+
+    def test_the_empty_tree_report_is_readable(self):
+        assert squawk.report_unreadable("checkov", self.EMPTY) is None
+
+    def test_it_counts_zero_resources_rather_than_unknown(self):
+        cov = squawk.stage_coverage("checkov", self.EMPTY)
+        assert cov.examined == 0, cov
+        assert cov.unit == "resources", cov
+
+    def test_the_stage_is_a_gap_naming_the_zero_not_an_error(self):
+        status, detail, _cov = squawk._apply_coverage(
+            "checkov", self.EMPTY, [], "ok", "0 finding(s)")
+        assert status == "gap", (status, detail)
+        assert "examined 0 resources" in detail, detail
+        assert "unreadable" not in detail, detail
+
+    def test_a_version_field_alone_is_still_drift(self):
+        """The fix must not widen the shape check into accepting anything
+        checkov-flavoured. A document with only a version is not a report."""
+        assert squawk.report_unreadable("checkov", '{"checkov_version": "9.9.9"}')
+
+    def test_it_yields_no_findings_and_does_not_raise(self):
+        assert squawk.NORMALIZERS["checkov"](self.EMPTY, "/base") == []
+
+
+class TestTheLockerKeepsWhatWasTyped:
+    """parse_note keeps a heading the template does not name ("silently
+    discarding what somebody typed into an evidence locker is the worst
+    possible manners"), and write_note then dropped it: only the four template
+    sections were copied into the finding, so a control mapping written under
+    its own heading vanished between the editor and the report."""
+
+    NOTE = ("title: Records readable across tenants by walking IDs\n"
+            "severity: critical\n"
+            "cwe: CWE-639\n"
+            "\n"
+            "## how found\n"
+            "walked /records/1-10 as tenant a\n"
+            "\n"
+            "## impact\n"
+            "every tenant's records\n"
+            "\n"
+            "## control\n"
+            "AC-3 access enforcement\n")
+
+    def _write(self, tmp_path, text=None):
+        return squawk.engine.write_note(
+            str(tmp_path / "ev"), "http://127.0.0.1:8080",
+            squawk.parse_note(text or self.NOTE), session="locker")
+
+    def _finding(self, out):
+        return json.load(open(os.path.join(out["run_dir"], "findings.json")))[0]
+
+    def test_a_heading_the_template_does_not_name_is_kept(self, tmp_path):
+        f = self._finding(self._write(tmp_path))
+        sections = f["detail"].get("sections") or {}
+        assert sections.get("control") == "AC-3 access enforcement", \
+            f["detail"]
+
+    def test_a_field_the_template_does_not_name_is_kept(self, tmp_path):
+        f = self._finding(self._write(tmp_path))
+        assert (f["detail"].get("sections") or {}).get("cwe") == "CWE-639"
+
+    def test_the_template_sections_are_not_copied_twice(self, tmp_path):
+        """title and severity are the finding's own fields, and the four
+        template sections have their own keys. Neither belongs in `sections`."""
+        sections = self._finding(self._write(tmp_path))["detail"]["sections"]
+        for name in ("title", "severity", "how found", "evidence", "impact",
+                     "remediation"):
+            assert name not in sections, sections
+
+    def test_a_note_with_nothing_extra_has_no_sections_key(self, tmp_path):
+        plain = ("title: x\nseverity: low\n\n## how found\nran it\n")
+        f = self._finding(self._write(tmp_path, plain))
+        assert "sections" not in f["detail"], f["detail"]
+
+    def test_the_kept_heading_reaches_the_report(self, tmp_path):
+        self._write(tmp_path)
+        text, n = squawk.report.report_markdown(str(tmp_path / "ev"), "locker")
+        assert n == 1
+        assert "**Control**" in text, text
+        assert "AC-3 access enforcement" in text
+        assert "CWE-639" in text
+
+    def test_the_template_says_extra_headings_are_kept(self):
+        """An operator who does not know a heading survives will not write one."""
+        assert "kept" in squawk.NOTE_TEMPLATE
+        # ...and saying so must not add a required field or a section.
+        bad = squawk.note_problems(squawk.parse_note(squawk.NOTE_TEMPLATE))
+        assert len(bad) == 3, bad
+
+
+class TestTheShareableReport:
+    """`report SESSION --share`: the copy somebody else can be handed (plan 14).
+
+    The plain report shows the local machine's paths and counts a finding once
+    per run. This copy removes the machine at render time -- the evidence stays
+    sealed and byte-for-byte -- lists each finding once per identity, and puts the
+    reviewer's own findings first. Every fixture here carries a home path, a user
+    name, a host name and a real-looking email, so a test that passes proves they
+    came out rather than that they were never there."""
+
+    NAMES = ("alice", "box01")
+
+    def _run(self, root, rid, findings, session="eng-1", service="preflight",
+             scope="repo", target="/home/alice/work/app", ledger=None,
+             differential=None, not_covered="No DAST."):
+        d = root / rid
+        d.mkdir(parents=True)
+        (d / "manifest.json").write_text(json.dumps({
+            "run_id": rid, "session": session, "service": service, "scope": scope,
+            "service_label": service.capitalize(), "target": target,
+            "not_covered": not_covered, "differential": differential or [],
+            "ledger": ledger or [{"tool": "semgrep", "status": "ok", "coverage": {
+                "examined": 3, "unit": "files"},
+                "detail": "read /home/alice/work/app on box01"}]}))
+        (d / "findings.json").write_text(json.dumps(findings))
+        return d
+
+    def _scanner(self, ident, sev="high", title="Route has no guard", path="app/main.py",
+                 line=12):
+        return {"scanner": "semgrep", "identity": ident, "severity": sev, "title": title,
+                "path": path, "detail": {"rule": "rules.no-guard", "line": line}}
+
+    def _note(self, sections=None, sev="critical"):
+        return {"scanner": "operator", "identity": "note:x:walk-ids", "severity": sev,
+                "title": "Any caller reads every tenant's records",
+                "path": "http://127.0.0.1:8080", "detail": {
+                    "how_found": "python3 ~/private/tools/enum.py --out /home/alice/ev/enum.jsonl",
+                    "evidence": "cross-tenant: [2, 4] (mailed alice@corp-mail.net)",
+                    "impact": "reads PHI", "remediation": "check grants on read",
+                    "sections": sections if sections is not None else {
+                        "hipaa": "Access control", "abilities": "read, modify"},
+                    "attachments": [{"name": "enum.jsonl", "sha256": "ab" * 32}]}}
+
+    def _session(self, tmp_path):
+        root = tmp_path / "ev"
+        same = self._scanner("rules.no-guard:app/main.py:12")
+        self._run(root, "20261022T100000Z", [same])
+        self._run(root, "20261022T100100Z-dir", [same], service="baggage", scope="dir")
+        self._run(root, "20261022T100200Z", [same, self._scanner(
+            "CKV_AWS_130:infra/main.tf:aws_subnet.public_a", "medium",
+            "Subnet assigns public IPs", "infra/main.tf", None)])
+        self._run(root, "20261022T100300Z-note", [self._note()], service="note",
+                  scope="note", target="http://127.0.0.1:8080")
+        self._run(root, "20261022T100400Z", [], session="other-work")
+        return root
+
+    def _model(self, root):
+        return squawk.report.share_model(
+            str(root), "eng-1", squawk.report.Redactor(str(root), names=list(self.NAMES)))
+
+    # --- redaction ------------------------------------------------------------
+
+    def test_local_paths_become_their_last_component(self, tmp_path):
+        r = squawk.report.Redactor(str(tmp_path / "ev"), names=[])
+        assert r.clean("/home/alice/work/app/x.py") == "x.py"
+        assert r.clean("python3 ~/private/enum.py --out /tmp/abc/raw.json") \
+            == "python3 enum.py --out raw.json"
+        assert r.clean("/Users/alice/Desktop/shot.png") == "shot.png"
+
+    def test_repo_relative_paths_are_left_alone(self, tmp_path):
+        """checkov writes `/infra/main.tf` relative to the scanned tree; it says
+        where the finding is and nothing about the local machine."""
+        r = squawk.report.Redactor(str(tmp_path / "ev"), names=[])
+        for s in ("infra/terraform/main.tf", "/infra/terraform/main.tf",
+                  "http://127.0.0.1:8080/documents/2"):
+            assert r.clean(s) == s
+
+    def test_an_evidence_root_outside_home_is_removed_too(self):
+        r = squawk.report.Redactor("/evidence", names=[])
+        assert r.clean("wrote /evidence/20261022T100000Z/raw/syft.json") \
+            == "wrote syft.json"
+
+    def test_user_and_host_names_go_as_whole_words(self, tmp_path):
+        r = squawk.report.Redactor(str(tmp_path / "ev"), names=list(self.NAMES))
+        assert r.clean("alice ran it on box01; malice stays; ALICE too") \
+            == "[removed] ran it on [removed]; malice stays; [removed] too"
+
+    def test_emails_go_through_squawks_own_mask(self, tmp_path):
+        """One email rule across the tool: the report uses mask_email, as every
+        other screen does, rather than a second rule that could disagree."""
+        r = squawk.report.Redactor(str(tmp_path / "ev"), names=[])
+        out = r.clean("mailed a.person@corp-mail.net")
+        assert "a.person" not in out and "corp-mail" not in out, out
+        assert out == squawk.mask_email("mailed a.person@corp-mail.net"), out
+
+    # --- the model ------------------------------------------------------------
+
+    def test_a_finding_three_runs_saw_is_one_row(self, tmp_path):
+        m = self._model(self._session(tmp_path))
+        guard = [f for f in m["scanner"] if f["title"] == "Route has no guard"]
+        assert len(guard) == 1 and guard[0]["runs"] == 3, guard
+        assert m["distinct"] == 3, m["distinct"]       # guard, subnet, the note
+
+    def test_another_sessions_runs_stay_out(self, tmp_path):
+        m = self._model(self._session(tmp_path))
+        assert m["runs"] == 4
+
+    def test_the_checkov_resource_tells_two_rows_apart(self, tmp_path):
+        m = self._model(self._session(tmp_path))
+        subnet = next(f for f in m["scanner"] if f["title"] == "Subnet assigns public IPs")
+        assert subnet["where"] == "infra/main.tf · aws_subnet.public_a"
+
+    def test_the_reviewers_findings_carry_controls_and_abilities(self, tmp_path):
+        m = self._model(self._session(tmp_path))
+        r1 = m["reviewer"][0]
+        assert r1["id"] == "R1" and r1["controls"] == "Access control", r1
+        verdicts = {a["ability"]: a["verdict"] for a in m["abilities"]}
+        assert verdicts == {"destroy": "none recorded", "modify": "yes",
+                            "disrupt": "none recorded", "read": "yes"}, verdicts
+        assert m["abilities_recorded"] is True
+
+    def test_who_recorded_a_finding_is_shown_not_mapped(self, tmp_path):
+        """A note recorded from another reviewer's output says so on its card,
+        and the line never lands in the control-mapping column."""
+        root = tmp_path / "ev"
+        self._run(root, "20261022T100300Z-note", [self._note(
+            {"hipaa": "Integrity", "reviewer": "Second reviewer (a model)",
+             "abilities": "modify"})], service="note", scope="note",
+            target="http://127.0.0.1:8080")
+        m = self._model(root)
+        r1 = m["reviewer"][0]
+        assert r1["controls"] == "Integrity", r1["controls"]
+        assert r1["recorded_by"] == "Second reviewer (a model)"
+        md = squawk.report.share_markdown(m)
+        assert "**Recorded by:** Second reviewer (a model)" in md
+
+    def test_a_note_without_a_reviewer_line_names_nobody(self, tmp_path):
+        m = self._model(self._session(tmp_path))
+        assert m["reviewer"][0]["recorded_by"] == ""
+        assert "Recorded by:" not in squawk.report.share_markdown(m)
+
+    def test_a_medium_finding_gives_partly_not_yes(self, tmp_path):
+        root = tmp_path / "ev"
+        self._run(root, "20261022T100300Z-note",
+                  [self._note({"abilities": "disrupt"}, sev="medium")],
+                  service="note", scope="note", target="http://127.0.0.1:8080")
+        m = self._model(root)
+        assert {a["ability"]: a["verdict"] for a in m["abilities"]}["disrupt"] == "partly"
+
+    def test_no_recorded_ability_is_not_a_no(self, tmp_path):
+        """Absence of a claim is not evidence of safety: the page says nothing was
+        recorded rather than that the attacker cannot."""
+        root = tmp_path / "ev"
+        self._run(root, "20261022T100000Z", [self._scanner("a:b:1")])
+        m = self._model(root)
+        assert m["abilities_recorded"] is False
+        assert all(a["verdict"] == "none recorded" for a in m["abilities"])
+
+    # --- container images -----------------------------------------------------
+
+    def _image(self, root):
+        rows = [{"scanner": "trivy", "identity": "CVE-2024-0001:libx:1.0", "severity": "critical",
+                 "title": "CVE-2024-0001 in libx 1.0", "path": "img:1", "detail": {}},
+                {"scanner": "grype", "identity": "CVE-2024-0001:libx:1.0", "severity": "high",
+                 "title": "CVE-2024-0001 in libx 1.0", "path": "libx", "detail": {}},
+                {"scanner": "trivy", "identity": "CVE-2024-0002:starlette:0.36.3",
+                 "severity": "medium", "title": "CVE-2024-0002 in starlette 0.36.3",
+                 "path": "img:1", "detail": {}},
+                {"scanner": "grype", "identity": "GHSA-aaaa-bbbb-cccc:starlette:0.36.3",
+                 "severity": "medium", "title": "GHSA in starlette", "path": "starlette",
+                 "detail": {}}]
+        self._run(root, "20261022T100500Z-image", rows, service="cargo", scope="image",
+                  target="app:local", ledger=[{"tool": "syft", "status": "ok",
+                                               "coverage": {"examined": 9, "unit": "packages"}}])
+
+    def _feeds(self, root):
+        f = root / "feeds"
+        f.mkdir(parents=True)
+        (f / "feeds.json").write_text(json.dumps({"fetched_at": "20261022T090000Z"}))
+        (f / "kev.json").write_text(json.dumps({"vulnerabilities": [
+            {"cveID": "CVE-2024-0002", "dateAdded": "2024-05-01"}]}))
+        (f / "epss.csv").write_text("#model\ncve,epss,percentile\n"
+                                    "CVE-2024-0001,0.42,0.97\nCVE-2024-0002,0.01,0.40\n")
+
+    def test_an_image_scan_is_summarised_not_listed(self, tmp_path):
+        root = tmp_path / "ev"
+        self._image(root)
+        self._feeds(root)
+        m = self._model(root)
+        assert m["scanner"] == [], "image rows belong in the image summary"
+        im = m["images"][0]
+        assert (im["rows"], im["distinct_cves"], im["other_advisories"]) == (4, 2, 1), im
+        assert im["critical_cves"] == 1, "a CVE counts at the highest rating either tool gave"
+        assert im["kev"] == [{"cve": "CVE-2024-0002", "severity": "medium",
+                              "pkgs": ["starlette"]}], im["kev"]
+        assert im["epss_hot"] == 1 and im["packages"] == "9 packages", im
+
+    def test_an_image_runs_configuration_findings_are_listed_not_counted(self, tmp_path):
+        """dockle's findings share the image run with trivy's and grype's. The
+        summary counted each as an advisory with no CVE id and listed none:
+        "runs as root" became a number (found 2026-10-23)."""
+        root = tmp_path / "ev"
+        self._image(root)
+        man = root / "20261022T100500Z-image" / "findings.json"
+        rows = [
+            *json.loads(man.read_text()),
+            {"scanner": "dockle", "identity": "CIS-DI-0001:app", "severity": "medium",
+             "title": "Create a user for the container", "path": "app",
+             "detail": {"rule": "CIS-DI-0001", "evidence": "Last user should not be root"}},
+            {"scanner": "dockle", "identity": "DKL-LI-0003:app", "severity": "low",
+             "title": "Only put necessary files", "path": "app",
+             "detail": {"rule": "DKL-LI-0003"}}]
+        man.write_text(json.dumps(rows))
+        m = self._model(root)
+        im = m["images"][0]
+        assert (im["rows"], im["other_advisories"]) == (4, 1), "dockle is not an advisory"
+        assert "dockle" not in im["by_tool"] and im["listed_apart"] == {"dockle": 2}
+        listed = [(f["source"], f["title"]) for f in m["scanner"]]
+        assert listed == [("dockle", "Create a user for the container"),
+                          ("dockle", "Only put necessary files")], listed
+        md = squawk.report.share_markdown(m)
+        assert "Create a user for the container" in md
+        assert "listed with the scanner findings: 2 from dockle" in md
+        page = squawk.report.share_html(m)
+        assert "listed_apart" in page and "Also from this image" in page
+
+    def test_without_feeds_exploitability_is_unknown_not_none(self, tmp_path):
+        root = tmp_path / "ev"
+        self._image(root)
+        m = self._model(root)
+        assert m["images"][0]["feeds"] is False
+        md = squawk.report.share_markdown(m)
+        assert "Exploitability unknown" in md and "not a statement that none" in md
+
+    # --- the outputs ------------------------------------------------------------
+
+    def test_nothing_personal_reaches_either_output(self, tmp_path):
+        root = self._session(tmp_path)
+        m = self._model(root)
+        for text in (squawk.report.share_markdown(m), squawk.report.share_html(m)):
+            for leak in ("/home/alice", "~/private", "alice", "box01", "corp-mail.net",
+                         str(tmp_path)):
+                assert leak not in text, leak
+            assert "enum.py" in text
+
+    def test_the_page_cannot_be_closed_from_the_evidence(self, tmp_path):
+        root = tmp_path / "ev"
+        note = self._note()
+        note["title"] = "</script><script>alert(1)</script>"
+        self._run(root, "20261022T100300Z-note", [note], service="note", scope="note",
+                  target="http://127.0.0.1:8080")
+        page = squawk.report.share_html(self._model(root))
+        assert "</script><script>alert" not in page, "the evidence closed the data block"
+        assert page.count("</script>") == 2, "only the page's own two blocks close"
+
+    def test_the_page_makes_no_external_request(self, tmp_path):
+        page = squawk.report.share_html(self._model(self._session(tmp_path)))
+        for marker in ("http://", "https://"):
+            hits = [i for i in range(len(page)) if page.startswith(marker, i)]
+            for i in hits:
+                assert page[i:i + 30].startswith(("http://127.0.0.1", "https://127.0.0.1")), \
+                    page[i - 40:i + 60]
+
+    # --- the CLI ------------------------------------------------------------------
+
+    def _cli(self, *args):
+        import subprocess
+        return subprocess.run([sys.executable, ENTRY, "report", *args],
+                              capture_output=True, text=True, timeout=120)
+
+    def test_share_writes_both_files(self, tmp_path):
+        root = self._session(tmp_path)
+        out = tmp_path / "reports"
+        res = self._cli("eng-1", "--share", "--out", str(out), "--evidence", str(root))
+        assert res.returncode == 0, res.stderr
+        assert sorted(p.name for p in out.iterdir()) == ["eng-1.html", "eng-1.md"]
+        assert "3 distinct finding(s)" in res.stdout, res.stdout
+
+    def test_one_format_writes_one_file(self, tmp_path):
+        root = self._session(tmp_path)
+        out = tmp_path / "reports"
+        res = self._cli("eng-1", "--share", "--out", str(out), "--format", "md",
+                        "--evidence", str(root))
+        assert res.returncode == 0, res.stderr
+        assert [p.name for p in out.iterdir()] == ["eng-1.md"]
+
+    def test_out_inside_the_evidence_root_is_refused(self, tmp_path):
+        root = self._session(tmp_path)
+        before = sorted(os.listdir(root))
+        res = self._cli("eng-1", "--share", "--out", str(root / "reports"),
+                        "--evidence", str(root))
+        assert res.returncode == 2 and "not evidence" in res.stderr, res.stderr
+        # squawk.log is every command's own audit log in the evidence root,
+        # written by a plain `report` too; no report file may appear there.
+        after = [n for n in sorted(os.listdir(root)) if n != "squawk.log"]
+        assert after == [n for n in before if n != "squawk.log"], after
+        assert not (root / "reports").exists()
+
+    def test_share_needs_an_out_directory(self, tmp_path):
+        res = self._cli("eng-1", "--share", "--evidence", str(self._session(tmp_path)))
+        assert res.returncode == 2 and "--out" in res.stderr
+
+    def test_without_share_the_report_is_unchanged(self, tmp_path):
+        root = self._session(tmp_path)
+        res = self._cli("eng-1", "--evidence", str(root))
+        assert res.returncode == 0
+        assert res.stdout.startswith("# eng-1"), res.stdout[:80]
+
+
+    # --- executive and engineer, CSV and PDF, and the Reports page ------------
+
+    def test_the_executive_summary_leaves_out_the_engineering_parts(self, tmp_path):
+        m = self._model(self._session(tmp_path))
+        exe = squawk.report.share_html(m, audience="executive")
+        eng = squawk.report.share_html(m)
+        assert "<body data-audience='executive'>" in exe
+        assert "<body data-audience='engineer'>" in eng
+        assert "<title>Executive summary: eng-1</title>" in exe
+        assert "body[data-audience=executive] .eng{display:none!important}" in exe
+        # the parts an executive does not read are marked, on the body's rule
+        for marked in ('<section class="eng"><div class="head"><h2>Findings from scanners',
+                       '<section class="eng"><div class="head"><h2>What ran',
+                       '<div class="eng" style="display:grid;gap:14px" id="reviewer">'):
+            assert marked in exe, marked
+        assert '"audience":"executive"' in exe and '"audience":"engineer"' in eng
+        with pytest.raises(ValueError, match="audience"):
+            squawk.report.share_html(m, audience="board")
+
+    def test_the_executive_summary_is_not_markdown(self, tmp_path):
+        root = self._session(tmp_path)
+        with pytest.raises(ValueError, match="executive summary is a page"):
+            squawk.report.write_share(str(root), "eng-1", str(tmp_path / "o"), "md",
+                                      audience="executive")
+        res = self._cli("eng-1", "--share", "--out", str(tmp_path / "o"), "--audience",
+                        "executive", "--format", "both", "--evidence", str(root))
+        assert res.returncode == 2 and "is a page" in res.stderr, res.stderr
+
+    def test_the_csv_holds_each_finding_once_redacted(self, tmp_path):
+        import csv as _csv
+        import io
+        root = self._session(tmp_path)
+        self._image(root)
+        self._feeds(root)
+        man = root / "20261022T100500Z-image" / "manifest.json"
+        data = json.loads(man.read_text())
+        data["session"] = "eng-1"
+        man.write_text(json.dumps(data))
+        text = squawk.report.share_csv(
+            str(root), "eng-1", squawk.report.Redactor(str(root), names=list(self.NAMES)))
+        header, *body = list(_csv.reader(io.StringIO(text)))
+        assert tuple(header) == squawk.report.CSV_COLUMNS
+        rows = list(_csv.DictReader(io.StringIO(text)))
+        kinds = [r["kind"] for r in rows]
+        assert kinds == ["reviewer", "scanner", "scanner", "image", "image", "image"], kinds
+        assert body[0][:3] == ["Any caller reads every tenant's records", "critical",
+                               "check grants on read"], "finding, severity, fix first"
+        images = {(r["rule"], r["cve"], r["kev"]) for r in rows if r["kind"] == "image"}
+        assert images == {("CVE-2024-0001", "CVE-2024-0001", ""),
+                          ("CVE-2024-0002", "CVE-2024-0002", "yes"),
+                          ("GHSA-aaaa-bbbb-cccc", "", "")}, images
+        crit = next(r for r in rows if r["rule"] == "CVE-2024-0001")
+        assert crit["severity"] == "critical" and crit["source"] == "grype+trivy", (
+            "one row, both sources")
+        for leak in ("alice", "box01", "corp-mail.net", "/home/"):
+            assert leak not in text, leak
+
+    def test_an_image_row_names_the_upgrade_either_scanner_gave(self, tmp_path):
+        import csv as _csv
+        import io
+        root = tmp_path / "ev"
+        rows = [{"scanner": "trivy", "identity": "CVE-2024-9:idna:2.10", "severity": "high",
+                 "title": "CVE-2024-9 in idna 2.10", "path": "img",
+                 "detail": {"remediation": "No fixed version released yet"}},
+                {"scanner": "grype", "identity": "CVE-2024-9:idna:2.10", "severity": "high",
+                 "title": "CVE-2024-9 in idna 2.10", "path": "idna",
+                 "detail": {"remediation": "Upgrade idna to 3.7",
+                            "reference": "https://example.invalid/CVE-2024-9"}},
+                {"scanner": "trivy", "identity": "CVE-2011-3374:apt:3.0.3", "severity": "low",
+                 "title": "CVE-2011-3374 in apt 3.0.3", "path": "img",
+                 "detail": {"remediation": "The distribution will not fix this"}}]
+        self._run(root, "20261022T100500Z-image", rows, service="cargo", scope="image",
+                  target="app:local")
+        got = {r["finding"]: r for r in _csv.DictReader(io.StringIO(
+            squawk.report.share_csv(str(root), "eng-1")))}
+        assert got["CVE-2024-9 in idna 2.10"]["remediation"] == "Upgrade idna to 3.7"
+        assert got["CVE-2024-9 in idna 2.10"]["reference"] == "https://example.invalid/CVE-2024-9"
+        assert got["CVE-2011-3374 in apt 3.0.3"]["remediation"] == (
+            "The distribution will not fix this")
+
+    def test_a_finding_seen_again_shows_what_the_newest_run_recorded(self, tmp_path):
+        root = tmp_path / "ev"
+        old = self._scanner("DS-0002:Dockerfile")
+        new = self._scanner("DS-0002:Dockerfile")
+        new["detail"]["remediation"] = "Add a USER line"
+        self._run(root, "20261022T100000Z", [old])
+        self._run(root, "20261022T110000Z", [new])
+        [row] = self._model(root)["scanner"]
+        assert row["remediation"] == "Add a USER line" and row["runs"] == 2, row
+
+    def test_an_image_scanned_twice_is_reported_once_from_its_newest_run(self, tmp_path):
+        import csv as _csv
+        import io
+        root = tmp_path / "ev"
+        row = {"scanner": "trivy", "identity": "CVE-2024-9999:idna:2.10", "severity": "high",
+               "title": "CVE-2024-9999 in idna 2.10", "path": "img", "detail": {}}
+        newer = dict(row, detail={"remediation": "Upgrade idna to 3.7"})
+        for rid, rows in (("20261022T100500Z-image", [row]),
+                          ("20261024T110500Z-image", [newer])):
+            self._run(root, rid, rows, service="cargo", scope="image", target="app:local")
+        m = self._model(root)
+        assert len(m["images"]) == 1 and m["images"][0]["run"] == "20261024T110500Z-image"
+        text = squawk.report.share_csv(str(root), "eng-1", today="2026-10-25")
+        rows = [r for r in _csv.DictReader(io.StringIO(text)) if r["kind"] == "image"]
+        # The clock starts at the first run that reported it, not the newest.
+        assert rows == [{
+            "finding": "CVE-2024-9999 in idna 2.10", "severity": "high",
+            "remediation": "Upgrade idna to 3.7",
+            "retest": "rebuild, then trivy image <image>: no CVE-2024-9999 for idna",
+            "status": "open", "due": "2026-11-21", "first_seen": "2026-10-22",
+            "decision": "due in 27 days", "where": "app:local", "source": "trivy",
+            "rule": "CVE-2024-9999", "cve": "CVE-2024-9999", "kev": "", "kind": "image",
+            "runs": "", "reference": "", "id": "CVE-2024-9999:idna@app:local"}], rows
+
+    def test_the_engineering_report_shows_each_scanner_findings_fix(self, tmp_path):
+        root = tmp_path / "ev"
+        f = self._scanner("rules.no-guard:app/main.py:12")
+        f["detail"]["remediation"] = "Add an authorization dependency"
+        self._run(root, "20261022T100000Z", [f])
+        m = self._model(root)
+        assert m["scanner"][0]["remediation"] == "Add an authorization dependency"
+        md = squawk.report.share_markdown(m)
+        assert "  - Fix: Add an authorization dependency" in md
+        assert ("  - Retest: `semgrep --config r/rules.no-guard --metrics=off "
+                "<repo>/app/main.py: no result at line 12`") in md
+        page = squawk.report.share_html(m)
+        assert '"Fix: " + fix' in page and '"Retest: "' in page
+
+    @pytest.mark.parametrize("finding,expected", [
+        ({"scanner": "semgrep", "identity": "python.x.y:app/main.py:62", "path": "app/main.py",
+          "detail": {"rule": "python.x.y", "line": 62}},
+         "semgrep --config r/python.x.y --metrics=off <repo>/app/main.py: no result at line 62"),
+        ({"scanner": "semgrep", "identity": "own-rules.no-authz:app/main.py:65",
+          "path": "app/main.py", "detail": {"rule": "own-rules.no-authz", "line": 65}},
+         "semgrep --config <your rules> --metrics=off <repo>/app/main.py: rule no-authz no "
+         "longer fires at line 65"),
+        ({"scanner": "bandit", "identity": "B501:app/main.py:62", "path": "app/main.py",
+          "detail": {"rule": "B501", "line": 62}},
+         "bandit -t B501 <repo>/app/main.py: no issue at line 62"),
+        ({"scanner": "checkov", "identity": "CKV_AWS_17:infra/main.tf:aws_db_instance.docs",
+          "path": "infra/main.tf", "detail": {"rule": "CKV_AWS_17"}},
+         "checkov -f <repo>/infra/main.tf --check CKV_AWS_17: PASSED for aws_db_instance.docs"),
+        ({"scanner": "hadolint", "identity": "DL3042:Dockerfile:abc", "path": "Dockerfile",
+          "detail": {"rule": "DL3042"}}, "hadolint <repo>/Dockerfile: no DL3042"),
+        ({"scanner": "dockle", "identity": "CIS-DI-0001:app", "path": "app",
+          "detail": {"rule": "CIS-DI-0001"}},
+         "dockle <image>: CIS-DI-0001 no longer listed (rebuild the image first)"),
+        ({"scanner": "trivy", "identity": "CVE-2024-1:idna:2.10", "path": "img", "detail": {}},
+         "rebuild, then trivy image <image>: no CVE-2024-1 for idna (it was 2.10)"),
+        ({"scanner": "trivy", "identity": "AWS-0180:infra/terraform/main.tf",
+          "path": "infra/terraform/main.tf", "detail": {"rule": "AWS-0180"}},
+         "trivy config <repo>/infra/terraform: AWS-0180 not listed"),
+        ({"scanner": "grype", "identity": "GHSA-x:requests:2.25.0", "path": "requests",
+          "detail": {}}, "rebuild, then grype <image>: no GHSA-x for requests (it was 2.25.0)"),
+        ({"scanner": "osv-scanner", "identity": "CVE-2023-1:PyPI:requests:2.25.0",
+          "path": "requirements.txt", "detail": {"rule": "CVE-2023-1"}},
+         "osv-scanner scan source -r <repo>: no CVE-2023-1 for requests (it was 2.25.0)"),
+        ({"scanner": "osv-scanner", "identity": "CVE-2026-64847:PyPI:anyio:4.9.0",
+          "path": "requirements.txt", "detail": {
+              "rule": "CVE-2026-64847",
+              "reference": "https://osv.dev/vulnerability/PYSEC-2026-4024"}},
+         "osv-scanner scan source -r <repo>: no PYSEC-2026-4024 (CVE-2026-64847) for anyio "
+         "(it was 4.9.0)"),
+        ({"scanner": "zap", "identity": "10049:/:", "path": "/", "detail": {"rule": "10049"}},
+         "squawk run liveprobe --target <url>: alert 10049 not raised for /"),
+        ({"scanner": "something-new", "identity": "x", "path": "", "detail": {}},
+         "re-run the service that found it: the finding is not in the newest run"),
+    ])
+    def test_every_scanner_finding_says_how_to_retest_it(self, finding, expected):
+        assert squawk.report.retest_for(finding) == expected
+
+    def test_a_finding_the_newest_run_no_longer_reports_is_marked(self, tmp_path):
+        root = tmp_path / "ev"
+        gone = self._scanner("rules.gone:app/main.py:1", title="Fixed since")
+        stays = self._scanner("rules.stays:app/main.py:2", title="Still there")
+        self._run(root, "20261022T100000Z", [gone, stays])
+        self._run(root, "20261022T110000Z", [stays])
+        rows = {r["title"]: r for r in self._model(root)["scanner"]}
+        assert rows["Still there"]["status"] == "open"
+        assert rows["Fixed since"]["status"] == "fixed"
+        assert rows["Fixed since"]["decision"] == (
+            "not reported by run 20261022T110000Z (2026-10-22)")
+        md = squawk.report.share_markdown(self._model(root))
+        assert "**fixed** — not reported by run 20261022T110000Z (2026-10-22)" in md
+
+    def test_a_note_carries_its_own_retest_and_references(self, tmp_path):
+        root = tmp_path / "ev"
+        note = self._note(sections={"hipaa": "Access control",
+                                    "retest": "Walk the IDs again as tenant A: no CROSS line.",
+                                    "references": "CWE-639; OWASP API1:2023"})
+        self._run(root, "20261022T100300Z-note", [note], service="note", scope="note",
+                  target="http://127.0.0.1:8080")
+        [r] = self._model(root)["reviewer"]
+        assert r["retest"] == "Walk the IDs again as tenant A: no CROSS line."
+        assert r["references"] == "CWE-639; OWASP API1:2023"
+        assert "retest" not in r["controls"] and "CWE" not in r["controls"], r["controls"]
+        md = squawk.report.share_markdown(self._model(root))
+        assert "**How to retest**" in md and "**References**" in md
+        bare = tmp_path / "ev2"
+        self._run(bare, "20261022T100300Z-note", [self._note()], service="note",
+                  scope="note", target="http://127.0.0.1:8080")
+        [b] = squawk.report.share_model(str(bare), "eng-1")["reviewer"]
+        assert b["retest"] == squawk.report.NOTE_RETEST_FALLBACK
+
+    def test_the_csv_carries_retest_and_status(self, tmp_path):
+        import csv as _csv
+        import io
+        root = self._session(tmp_path)
+        rows = list(_csv.reader(io.StringIO(squawk.report.share_csv(str(root), "eng-1"))))
+        assert rows[0][:8] == ["finding", "severity", "remediation", "retest", "status",
+                               "due", "first_seen", "decision"]
+        scanner = [r for r in _csv.DictReader(io.StringIO(
+            squawk.report.share_csv(str(root), "eng-1"))) if r["kind"] == "scanner"]
+        assert scanner and all(r["retest"] and r["status"] and r["due"] and r["id"]
+                               for r in scanner), scanner
+
+    def test_a_note_retest_keeps_its_command_on_its_own_line_in_the_csv(self, tmp_path):
+        import csv as _csv
+        import io
+        root = tmp_path / "ev"
+        note = self._note(sections={"retest": "Read it again as tenant A:\ncurl -s <url>/d/2\n"
+                                              "Fixed when: 404."})
+        self._run(root, "20261022T100300Z-note", [note], service="note", scope="note",
+                  target="http://127.0.0.1:8080")
+        row = next(_csv.DictReader(io.StringIO(squawk.report.share_csv(str(root), "eng-1"))))
+        assert row["retest"].split("\n") == ["Read it again as tenant A:", "curl -s <url>/d/2",
+                                             "Fixed when: 404."]
+        assert "\n" not in row["remediation"], "other columns stay one line"
+
+    def test_a_reviewer_finding_keeps_its_number_when_another_is_recorded(self, tmp_path):
+        root = tmp_path / "ev"
+        high = dict(self._note(sev="high"), identity="note:x:edit", title="Edit anything")
+        self._run(root, "20261022T100300Z-note", [high], service="note", scope="note",
+                  target="http://127.0.0.1:8080")
+        crit = dict(self._note(), identity="note:x:walk", title="Read anything")
+        self._run(root, "20261022T110300Z-note", [crit], service="note", scope="note",
+                  target="http://127.0.0.1:8080")
+        rows = self._model(root)["reviewer"]
+        assert [(x["id"], x["title"]) for x in rows] == [
+            ("R2", "Read anything"), ("R1", "Edit anything")], (
+            "most severe first, numbered as recorded")
+        later = dict(self._note(), identity="note:x:deploy", title="Deploy anything")
+        self._run(root, "20261022T120300Z-note", [later], service="note", scope="note",
+                  target="http://127.0.0.1:8080")
+        again = {x["title"]: x["id"] for x in self._model(root)["reviewer"]}
+        assert again == {"Edit anything": "R1", "Read anything": "R2", "Deploy anything": "R3"}
+
+    def test_a_cell_a_spreadsheet_would_run_is_stored_as_text(self):
+        cell = squawk.report._cell
+        assert cell('=HYPERLINK("http://x","y")') == "'=HYPERLINK(\"http://x\",\"y\")"
+        assert [cell(v) for v in ("+1", "-1", "@SUM(A1)", "plain", 3, None)] == [
+            "'+1", "'-1", "'@SUM(A1)", "plain", "3", ""]
+        assert cell("two\nlines\ttab") == "two lines tab", "one line per cell"
+        assert cell("run this:\n  =cmd  x\n\n-y", lines=True) == "run this:\n'=cmd x\n'-y", (
+            "a kept line is guarded on its own")
+
+    def test_csv_from_the_cli(self, tmp_path):
+        root = self._session(tmp_path)
+        out = tmp_path / "o"
+        res = self._cli("eng-1", "--share", "--out", str(out), "--format", "csv",
+                        "--evidence", str(root))
+        assert res.returncode == 0, res.stderr
+        assert (out / "eng-1-findings.csv").read_text().startswith(
+            "finding,severity,remediation,")
+
+    # -- the PDF, printed by a browser -------------------------------------- #
+
+    @staticmethod
+    def _browser(tmp_path, monkeypatch, body):
+        """A stand-in browser on PATH that records its argv and does `body`."""
+        script = tmp_path / "bin" / "chromium"
+        script.parent.mkdir(exist_ok=True)
+        script.write_text("#!/bin/sh\nprintf '%%s\\n' \"$@\" > %s\n%s\n"
+                          % (tmp_path / "argv.txt", body))
+        script.chmod(0o755)
+        monkeypatch.setattr(squawk.report, "tool_path",
+                            lambda name: str(script) if name == "chromium" else None)
+        return tmp_path / "argv.txt"
+
+    def test_the_pdf_is_printed_in_a_profile_of_its_own_and_never_unsandboxed(
+            self, tmp_path, monkeypatch):
+        argv_file = self._browser(tmp_path, monkeypatch, (
+            'for a in "$@"; do case "$a" in --print-to-pdf=*) '
+            'printf "%%PDF-1.4 stand-in" > "${a#--print-to-pdf=}";; esac; done'))
+        out = tmp_path / "r.pdf"
+        ok, detail = squawk.report.html_to_pdf("<html><body>x</body></html>", str(out))
+        assert ok, detail
+        assert out.read_bytes().startswith(b"%PDF-")
+        argv = argv_file.read_text().split("\n")
+        assert "--headless=new" in argv and "--disable-background-networking" in argv
+        assert "--print-to-pdf=%s" % out in argv
+        assert not [a for a in argv if "no-sandbox" in a]
+        profile = next(a for a in argv if a.startswith("--user-data-dir="))
+        src = next(a for a in argv if a.startswith("file://"))
+        assert not os.path.exists(profile.split("=", 1)[1]), "its profile is deleted"
+        assert not os.path.exists(src[len("file://"):]), "and the page it printed"
+
+    def test_a_browser_that_writes_no_pdf_is_a_failure_with_its_reason(
+            self, tmp_path, monkeypatch):
+        self._browser(tmp_path, monkeypatch, "echo 'GPU process exited' >&2; exit 3")
+        ok, detail = squawk.report.html_to_pdf("<p>x</p>", str(tmp_path / "r.pdf"))
+        assert not ok and detail == "GPU process exited", detail
+
+    def test_a_browser_with_no_sandbox_is_named_and_not_unsandboxed(
+            self, tmp_path, monkeypatch):
+        argv_file = self._browser(tmp_path, monkeypatch, (
+            "echo '[1:1:FATAL:zygote_host_impl_linux.cc(130)] No usable sandbox! "
+            "If you are running on Ubuntu 23.10+' >&2; exit 133"))
+        ok, detail = squawk.report.html_to_pdf("<p>x</p>", str(tmp_path / "r.pdf"))
+        assert not ok and "no usable sandbox" in detail and "--no-sandbox" in detail
+        assert not [a for a in argv_file.read_text().split("\n") if "no-sandbox" in a]
+
+    def test_no_browser_or_root_means_no_pdf_and_says_why(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(squawk.report, "tool_path", lambda name: None)
+        ok, detail = squawk.report.html_to_pdf("<p>x</p>", str(tmp_path / "r.pdf"))
+        assert not ok and "no headless Chromium" in detail and "print it to PDF" in detail
+        self._browser(tmp_path, monkeypatch, "exit 0")
+        monkeypatch.setattr(squawk.report, "running_as_root", lambda: True)
+        ok, detail = squawk.report.html_to_pdf("<p>x</p>", str(tmp_path / "r.pdf"))
+        assert not ok and "--no-sandbox" in detail, detail
+
+    def test_against_the_real_chromium_the_summary_prints(self, tmp_path):
+        if not squawk.report.pdf_browser() or squawk.core.running_as_root():
+            pytest.skip("no headless Chromium here (or running as root); the PDF is "
+                        "checked on a machine that has one")
+        page = squawk.report.share_html(self._model(self._session(tmp_path)),
+                                        audience="executive")
+        out = tmp_path / "r.pdf"
+        ok, detail = squawk.report.html_to_pdf(page, str(out))
+        if not ok and "no usable sandbox" in detail:
+            pytest.skip(detail)       # GitHub's Ubuntu runner: Chrome, no sandbox
+        assert ok, detail
+        assert out.read_bytes()[:5] == b"%PDF-" and out.stat().st_size > 1000
+
+    def test_the_printed_engineering_report_shows_how_each_note_was_found(self, tmp_path):
+        """On screen it is a details box to click open; paper cannot be clicked."""
+        import shutil
+        import subprocess
+        if not squawk.report.pdf_browser() or squawk.core.running_as_root():
+            pytest.skip("no headless Chromium here (or running as root)")
+        if not shutil.which("pdftotext"):
+            pytest.skip("no pdftotext to read the printed page back")
+        root = tmp_path / "ev"
+        self._run(root, "20261022T100300Z-note", [self._note()], service="note",
+                  scope="note", target="http://127.0.0.1:8080")
+        page = squawk.report.share_html(squawk.report.share_model(str(root), "eng-1"))
+        out = tmp_path / "r.pdf"
+        ok, detail = squawk.report.html_to_pdf(page, str(out))
+        if not ok and "no usable sandbox" in detail:
+            pytest.skip(detail)
+        assert ok, detail
+        text = subprocess.run(["pdftotext", str(out), "-"], capture_output=True,
+                              text=True, check=True).stdout
+        assert "enum.py" in text and "cross-tenant" in text, text[-1500:]
+
+    # -- the Reports page ---------------------------------------------------- #
+
+    def test_sessions_are_listed_newest_first_untagged_runs_left_out(self, tmp_path):
+        root = self._session(tmp_path)
+        got = squawk.report.sessions_of(str(root))
+        assert [(s["session"], s["runs"], s["notes"]) for s in got] == [
+            ("other-work", 1, 0), ("eng-1", 4, 1)], got
+
+    def test_the_reports_page_and_its_downloads(self, tmp_path, monkeypatch):
+        import urllib.request
+        monkeypatch.setattr(squawk.report, "tool_path", lambda name: None)
+        monkeypatch.setattr(squawk.web, "pdf_browser", lambda: None)
+        root = self._session(tmp_path)
+        with _serve(str(root), str(tmp_path)) as base:
+            code, body = _get(base + "/reports")
+            assert code == 200 and "eng-1" in body and "PDF needs headless Chromium" in body
+            assert "/report?session=eng-1&amp;audience=executive" in body
+            code, body = _get(base + "/report?session=eng-1&audience=executive")
+            assert code == 200 and "<body data-audience='executive'>" in body
+            with urllib.request.urlopen(base + "/report.csv?session=eng-1", timeout=10) as r:
+                assert r.headers["Content-Type"].startswith("text/csv")
+                assert r.headers["Content-Disposition"] == (
+                    'attachment; filename="eng-1-findings.csv"')
+                assert r.read().decode("utf-8").startswith("finding,severity,remediation")
+            code, body = _get(base + "/report.pdf?session=eng-1&audience=executive")
+            assert code == 503 and "no headless Chromium" in body, body[:300]
+            for bad in ("/report?session=../../etc/passwd&audience=engineer",
+                        "/report?session=eng-1&audience=board",
+                        "/report.csv?session=nobody"):
+                assert _get(base + bad)[0] == 404, bad
+        assert not (root / "reports").exists() and not list(root.glob("*.pdf"))
+
+
+class TestTrivyCarriesWhatToDo:
+    """trivy's report says what fixes each advisory, or why nothing does, and
+    the normalizer dropped it: an image's findings table and the CSV had no
+    remediation for the scanner that read most of the image."""
+
+    def _report(self, vulns=(), misconfigs=()):
+        return json.dumps({"SchemaVersion": 2, "Results": [
+            {"Target": "img (debian 13)", "Vulnerabilities": list(vulns),
+             "Misconfigurations": list(misconfigs)}]})
+
+    def test_a_fixed_version_is_an_upgrade_and_a_status_says_why_not(self):
+        rep = self._report([
+            {"VulnerabilityID": "CVE-1", "PkgName": "idna", "InstalledVersion": "2.10",
+             "FixedVersion": "3.7", "Status": "fixed", "Severity": "HIGH",
+             "Title": "idna DoS", "PrimaryURL": "https://avd.aquasec.com/nvd/cve-1"},
+            {"VulnerabilityID": "CVE-2", "PkgName": "apt", "InstalledVersion": "3.0",
+             "Status": "will_not_fix", "Severity": "LOW"},
+            {"VulnerabilityID": "CVE-3", "PkgName": "zlib", "InstalledVersion": "1",
+             "Status": "affected", "Severity": "LOW"},
+            {"VulnerabilityID": "CVE-4", "PkgName": "x", "InstalledVersion": "1",
+             "Severity": "LOW"}])
+        found = {f.identity: f for f in squawk.scanners.norm_trivy(rep, "/b")}
+        assert found["CVE-1:idna:2.10"].detail["remediation"] == "Upgrade idna to 3.7"
+        assert found["CVE-1:idna:2.10"].detail["reference"].endswith("/cve-1")
+        assert found["CVE-2:apt:3.0"].detail["remediation"].startswith(
+            "The distribution will not fix this")
+        assert found["CVE-3:zlib:1"].detail["remediation"] == "No fixed version released yet"
+        assert found["CVE-4:x:1"].detail["remediation"] == "", "no status, no invented fix"
+        assert set(found) == {"CVE-1:idna:2.10", "CVE-2:apt:3.0", "CVE-3:zlib:1",
+                              "CVE-4:x:1"}, "identities unchanged"
+
+    def test_a_misconfiguration_carries_trivys_resolution(self):
+        rep = self._report(misconfigs=[
+            {"ID": "DS-0002", "Title": "Image user should not be 'root'",
+             "Resolution": "Add 'USER <non root user name>' line to the Dockerfile",
+             "PrimaryURL": "https://avd.aquasec.com/misconfig/ds-0002", "Severity": "HIGH",
+             "Message": "Specify at least 1 USER command"}])
+        [f] = squawk.scanners.norm_trivy(rep, "/b")
+        assert f.detail["remediation"].startswith("Add 'USER")
+        assert f.detail["rule"] == "DS-0002" and f.detail["reference"].endswith("ds-0002")
+
+
+class TestAScannerThatSaysNothing:
+    """grype run with -q on a database past its own age limit exits 1 and writes
+    nothing to stdout or stderr. The stage used to read "ok, 0 finding(s) across
+    34 packages", the count borrowed from syft, because the error check wanted a
+    message on stderr as well (measured 2026-10-22). A scanner that exits
+    non-zero and writes nothing has not reported, whether or not it says why."""
+
+    def _cargo(self, tmp_path, grype_result):
+        import contextlib
+        import io as _io
+        patch = pytest.MonkeyPatch()
+        try:
+            patch.setattr(squawk.core, "tool_path", lambda n: "/usr/bin/%s" % n)
+            patch.setattr(squawk.engine, "tool_path", lambda n: "/usr/bin/%s" % n)
+            outputs = {
+                "trivy": (0, json.dumps({"SchemaVersion": 2, "ArtifactName": "img",
+                                         "Results": [{"Target": "img",
+                                                      "Vulnerabilities": []}]}), ""),
+                "syft": (0, json.dumps({"artifacts": [{"name": "p%d" % i, "version": "1"}
+                                                      for i in range(34)],
+                                        "source": {"type": "image"}}), ""),
+                "grype": grype_result,
+            }
+            patch.setattr(squawk.engine, "run_cmd",
+                          lambda argv, *a, **k: outputs.get(argv[0], (0, "", "")))
+            root = str(tmp_path / "ev")
+            os.makedirs(root, exist_ok=True)
+            buf = _io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                outcome = squawk.execute_service(squawk.SERVICES["cargo"],
+                                                 "img:1", root, str(tmp_path))
+        finally:
+            patch.undo()
+        return {r.tool: r for r in outcome["results"]}
+
+    def test_exit_1_with_nothing_written_is_an_error_not_ok(self, tmp_path):
+        row = self._cargo(tmp_path, (1, "", ""))["grype"]
+        assert row.status == "error", (row.status, row.detail)
+        assert row.detail == "exited 1 and wrote nothing", row.detail
+        assert "across" not in row.detail, "no borrowed denominator on a failure"
+
+    def test_the_message_is_used_when_there_is_one(self, tmp_path):
+        row = self._cargo(tmp_path, (1, "", "failed to load vulnerability db\nmore"))["grype"]
+        assert row.status == "error", row.status
+        # The engine points at the rest of stderr after the first line.
+        assert row.detail.startswith("failed to load vulnerability db"), row.detail
+
+    def test_a_clean_grype_report_is_still_ok(self, tmp_path):
+        """The fix must not turn a genuine zero into an error: a clean report is
+        a document, exit 0."""
+        row = self._cargo(tmp_path, (0, json.dumps({"matches": [],
+                                                    "source": {"type": "sbom"}}), ""))["grype"]
+        assert row.status == "ok", (row.status, row.detail)
+        assert "across 34 packages" in row.detail, row.detail
+
+
+class TestGrypesOwnVerdictOnItsDatabase:
+    """grype refuses a database past its own limit, five days by default, which
+    is shorter than DB_STALE_DAYS. The doctor read only the build date and said
+    "5 day(s) old, ok" while every grype stage matched nothing."""
+
+    STATUS = ("Path:      /x/vulnerability.db\nSchema:    v6.1.10\n"
+              "Built:     2026-10-17T06:27:09Z\nStatus:    %s\n")
+
+    def _ages(self, monkeypatch, text, code=0):
+        monkeypatch.setattr(squawk.core, "tool_path",
+                            lambda n: "/usr/bin/grype" if n == "grype" else None)
+        monkeypatch.setattr(squawk.core, "run_cmd", lambda argv, *a, **k: (code, text, ""))
+        return squawk.core.vuln_db_ages()
+
+    def test_a_refused_database_is_unusable_with_the_reason(self, monkeypatch):
+        text = (self.STATUS % "invalid") + ("[0000] ERROR the vulnerability database was "
+                                            "built 5 days ago (max allowed age is 5 days)\n")
+        [(name, age, detail)] = self._ages(monkeypatch, text, code=1)
+        assert (name, age) == ("grype", None), "refused means unusable, not N days old"
+        assert detail == ("grype refuses its database: the vulnerability database was "
+                          "built 5 days ago (max allowed age is 5 days)"), detail
+
+    def test_a_valid_database_keeps_its_age(self, monkeypatch):
+        [(name, age, detail)] = self._ages(monkeypatch, self.STATUS % "valid")
+        assert name == "grype" and isinstance(age, int) and detail == "", (age, detail)
+
+    def test_the_seven_six_hundred_check_names_it(self, monkeypatch, tmp_path):
+        """The alert that a source went quiet reads the same list, so a refused
+        database reaches it with no change of its own."""
+        text = (self.STATUS % "invalid") + "[0000] ERROR built too long ago\n"
+        monkeypatch.setattr(squawk.core, "tool_path",
+                            lambda n: "/usr/bin/grype" if n == "grype" else None)
+        monkeypatch.setattr(squawk.core, "run_cmd", lambda argv, *a, **k: (1, text, ""))
+        monkeypatch.setattr(squawk.analysis, "vuln_db_ages", squawk.core.vuln_db_ages)
+        notes = [n for name, age, n in squawk.analysis.vuln_db_ages() if age is None]
+        assert notes == ["grype refuses its database: built too long ago"], notes
+
+
+class TestHadolint:
+    """hadolint through the registry (plan 05, item 1): how each Dockerfile is
+    written. Its report is a bare list of what it flagged and names no file it
+    found clean, so what it examined is counted from what it was handed."""
+
+    # The lab corpus's bad Dockerfile, as `lab-targets.py build` writes it.
+    BAD = ("# lab corpus: a Dockerfile built badly on purpose — root, :latest, curl | sh,\n"
+           "# ADD, port 22, no HEALTHCHECK. Squawk's compliance service must name these.\n"
+           "FROM ubuntu:latest\n"
+           "RUN apt-get update && apt-get install -y curl\n"
+           "RUN curl -sSL https://example.invalid/install.sh | sh\n"
+           "ADD . /app\n"
+           "WORKDIR /app\n"
+           "EXPOSE 22\n"
+           'CMD ["python3", "app.py"]\n')
+    # hadolint 2.15.1 on that file, 2026-10-22, verbatim but for the path.
+    REPORT = json.dumps([
+        {"code": "DL3007", "column": 1, "file": "bad/Dockerfile", "level": "warning",
+         "line": 3, "message": "Using latest is prone to errors if the image will ever "
+         "update. Pin the version explicitly to a release tag"},
+        {"code": "DL3008", "column": 1, "file": "bad/Dockerfile", "level": "warning",
+         "line": 4, "message": "Pin versions in apt get install. Instead of `apt-get "
+         "install <package>` use `apt-get install <package>=<version>`"},
+        {"code": "DL3015", "column": 1, "file": "bad/Dockerfile", "level": "info",
+         "line": 4, "message": "Avoid additional packages by specifying "
+         "`--no-install-recommends`"},
+        {"code": "DL3009", "column": 1, "file": "bad/Dockerfile", "level": "info",
+         "line": 4, "message": "Delete the apt lists (/var/lib/apt/lists) after "
+         "installing something"},
+        {"code": "DL4006", "column": 1, "file": "bad/Dockerfile", "level": "warning",
+         "line": 5, "message": "Set the SHELL option -o pipefail before RUN with a pipe "
+         "in it."},
+        {"code": "DL3020", "column": 1, "file": "bad/Dockerfile", "level": "error",
+         "line": 6, "message": "Use COPY instead of ADD for files and folders"}])
+
+    def _tree(self, tmp_path, text=None):
+        (tmp_path / "bad").mkdir(exist_ok=True)
+        (tmp_path / "bad" / "Dockerfile").write_text(text or self.BAD, encoding="utf-8")
+        return str(tmp_path)
+
+    # -- reading the report ------------------------------------------------- #
+
+    def test_the_real_report_reads_into_well_formed_findings(self, tmp_path):
+        base = self._tree(tmp_path)
+        found = squawk.scanners.norm_hadolint(self.REPORT, base)
+        assert [f.detail["rule"] for f in found] == [
+            "DL3007", "DL3008", "DL3015", "DL3009", "DL4006", "DL3020"]
+        sev = {f.detail["rule"]: f.severity for f in found}
+        assert sev == {"DL3007": "medium", "DL3008": "medium", "DL3015": "low",
+                       "DL3009": "low", "DL4006": "medium", "DL3020": "high"}, sev
+        for f in found:
+            assert f.scanner == "hadolint" and f.path == "bad/Dockerfile", f
+            assert f.severity in squawk.SEVERITY_ORDER
+            assert f.detail["reference"] == (
+                "https://github.com/hadolint/hadolint/wiki/" + f.detail["rule"])
+            assert f.detail["remediation"] == f.detail["description"] != ""
+        add = next(f for f in found if f.detail["rule"] == "DL3020")
+        assert add.detail["evidence"] == "ADD . /app", "the offending line, read from the file"
+        assert squawk.report_unreadable("hadolint", self.REPORT) is None
+
+    def test_a_clean_report_is_readable_and_another_shape_is_not(self):
+        assert squawk.report_unreadable("hadolint", "[]") is None
+        assert squawk.scanners.norm_hadolint("[]", "/base") == []
+        why = squawk.report_unreadable("hadolint", '{"results": []}')
+        assert why and "list" in why, why
+
+    def test_a_line_added_above_does_not_make_a_finding_new(self, tmp_path):
+        """The identity is the rule, the path and the line's text, not the
+        line number (plan 05)."""
+        base = self._tree(tmp_path)
+        before = {f.identity for f in squawk.scanners.norm_hadolint(self.REPORT, base)}
+        self._tree(tmp_path, "# a comment added on top\n" + self.BAD)
+        moved = json.loads(self.REPORT)
+        for r in moved:
+            r["line"] += 1
+        after = {f.identity for f in squawk.scanners.norm_hadolint(json.dumps(moved), base)}
+        assert before == after
+        assert all(":line" not in i for i in before), "anchored on text, not a number"
+
+    def test_a_changed_line_is_a_different_finding(self, tmp_path):
+        base = self._tree(tmp_path)
+        [old] = [f for f in squawk.scanners.norm_hadolint(self.REPORT, base)
+                 if f.detail["rule"] == "DL3007"]
+        self._tree(tmp_path, self.BAD.replace("ubuntu:latest", "debian:latest"))
+        [new] = [f for f in squawk.scanners.norm_hadolint(self.REPORT, base)
+                 if f.detail["rule"] == "DL3007"]
+        assert old.identity != new.identity
+
+    def test_two_identical_lines_breaking_one_rule_are_two_findings(self, tmp_path):
+        base = self._tree(tmp_path, "FROM a\nADD . /a\nADD . /a\n")
+        rep = json.dumps([{"code": "DL3020", "file": "bad/Dockerfile", "level": "error",
+                           "line": n, "message": "Use COPY instead of ADD"} for n in (2, 3)])
+        ids = [f.identity for f in squawk.scanners.norm_hadolint(rep, base)]
+        assert len(ids) == 2 and len(set(ids)) == 2, ids
+        assert ids[1] == ids[0] + ":2"
+
+    def test_a_shellcheck_rule_points_at_shellcheck(self, tmp_path):
+        base = self._tree(tmp_path, "FROM a\nRUN [\n")
+        rep = json.dumps([{"code": "SC1072", "file": "bad/Dockerfile", "level": "error",
+                           "line": 2, "message": " Fix any mentioned problems and try again."}])
+        [f] = squawk.scanners.norm_hadolint(rep, base)
+        assert f.detail["reference"] == "https://www.shellcheck.net/wiki/SC1072"
+        assert f.detail["remediation"] == "", "ShellCheck's message is not a fix"
+        assert f.title == "Fix any mentioned problems and try again."
+
+    # -- building the command ----------------------------------------------- #
+
+    def test_the_builder_finds_every_dockerfile_name_and_skips_git_and_vendored(
+            self, tmp_path):
+        for rel in ("Dockerfile", "api.Dockerfile", "svc/Containerfile",
+                    "svc/Dockerfile.prod", "README.md", "Dockerfile.md",
+                    "docs/Dockerfile.txt", "Dockerfile.j2",
+                    ".git/Dockerfile", "node_modules/pkg/Dockerfile",
+                    ".venv/lib/Dockerfile"):
+            p = tmp_path / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("FROM scratch\n")
+        found = [os.path.relpath(p, str(tmp_path))
+                 for p in squawk.stages.dockerfiles_in(str(tmp_path))]
+        assert found == ["Dockerfile", "api.Dockerfile",
+                         "svc/Containerfile", "svc/Dockerfile.prod"], found
+        assert squawk.stages.dockerfiles_in(str(tmp_path / "Dockerfile")) == [
+            str(tmp_path / "Dockerfile")]
+        assert squawk.stages.dockerfiles_in(str(tmp_path / "README.md")) == []
+
+    def test_the_command_is_read_only_pinned_and_writes_nothing(self, tmp_path):
+        """`config show` calls builders to print what would run, so a builder
+        that wrote its configuration would write it there too."""
+        base = self._tree(tmp_path)
+        run = tmp_path / "ev" / "20261022T000000Z"
+        ctx = squawk.RunContext(base, "repo", str(run), base)
+        ctx.raw_path = str(run / "raw" / "hadolint.json")
+        cmd, timeout = squawk.STAGES["hadolint"].build(ctx)
+        assert cmd[:2] == ["hadolint", "-c"] and timeout == 120
+        assert cmd[2] == str(run / "raw" / "hadolint.config.yaml")
+        assert "--no-fail" in cmd and cmd[cmd.index("-f") + 1] == "json"
+        assert "-o" not in cmd and "--output" not in cmd, "the report goes to stdout"
+        assert cmd[-1] == os.path.join(base, "bad", "Dockerfile")
+        assert not (tmp_path / "ev").exists(), "the builder wrote nothing"
+        assert ctx.handed == squawk.Coverage(1, "Dockerfiles", 0, 0, "")
+
+    # -- through the engine ------------------------------------------------- #
+
+    def _service(self):
+        return squawk.Service("t", "T", "code", "repo", ("hadolint",), "instant", "")
+
+    def test_a_tree_with_no_dockerfile_is_a_gap_that_names_them(self, tmp_path, monkeypatch):
+        ran = []
+        _patch_all(monkeypatch, "tool_path", lambda name: "/usr/bin/" + name)
+        _patch_all(monkeypatch, "run_cmd", lambda *a, **k: ran.append(a) or (0, "[]", ""))
+        (tmp_path / "app.py").write_text("print(1)\n")
+        root = tmp_path / "ev"
+        out = squawk.execute_service(self._service(), str(tmp_path), str(root), str(tmp_path))
+        res = out["results"][0]            # then the correlation row
+        assert res.status == "gap", res
+        assert res.detail == "no Dockerfiles to read — nothing to run against", res.detail
+        assert res.coverage.examined == 0 and res.coverage.unit == "Dockerfiles"
+        assert ran == [], "nothing was run"
+
+    def test_the_engine_pins_the_config_counts_what_it_handed_and_seals_both(
+            self, tmp_path, monkeypatch):
+        seen = []
+
+        def fake_run(cmd, cwd, timeout):
+            seen.append(list(cmd))
+            return 0, self.REPORT.replace("bad/Dockerfile",
+                                          str(tmp_path / "repo" / "bad" / "Dockerfile")), ""
+        _patch_all(monkeypatch, "tool_path", lambda name: "/usr/bin/" + name)
+        _patch_all(monkeypatch, "run_cmd", fake_run)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._tree(repo)
+        (repo / "Containerfile").write_text("FROM scratch\n")
+        root = tmp_path / "ev"
+        out = squawk.execute_service(self._service(), str(repo), str(root), str(repo))
+        res = out["results"][0]            # then the correlation row
+        assert res.status == "ok", res
+        assert res.detail == "6 finding(s) across 2 Dockerfiles", res.detail
+        conf = seen[0][2]
+        with open(conf, encoding="utf-8") as fh:
+            assert fh.read() == squawk.stages.HADOLINT_CONFIG
+        assert res.ran["config"] == os.path.relpath(conf, out["run_dir"])
+        assert {os.path.relpath(f.path) if os.path.isabs(f.path) else f.path
+                for f in res.findings} == {"bad/Dockerfile"}
+        assert squawk.verify_root(str(root))["exit"] == 0, "the config is sealed evidence"
+
+    def test_a_stray_config_in_the_working_directory_cannot_drop_a_rule(
+            self, tmp_path, monkeypatch):
+        """The measured failure, against the real hadolint where it is
+        installed: a `.hadolint.yaml` in the directory Squawk was started from
+        ignoring DL3007 removed it from the run."""
+        if not squawk.tool_path("hadolint"):
+            pytest.skip("hadolint is not installed here; the pinned config is "
+                        "checked against the real tool on a machine that has it")
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        (cwd / ".hadolint.yaml").write_text("ignored:\n  - DL3007\n")
+        monkeypatch.chdir(cwd)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._tree(repo)
+        root = tmp_path / "ev"
+        out = squawk.execute_service(self._service(), str(repo), str(root), str(repo))
+        res = out["results"][0]            # then the correlation row
+        rules = sorted(f.detail["rule"] for f in res.findings)
+        assert "DL3007" in rules, rules
+        assert res.status == "ok" and "across 1 Dockerfiles" in res.detail, res.detail
+        again = squawk.execute_service(self._service(), str(repo), str(root), str(repo))
+        assert ({f.identity for f in again["results"][0].findings}
+                == {f.identity for f in res.findings}), "a second run diffs to nothing"
+
+    def test_it_is_registered_where_a_dockerfile_is_read(self):
+        sc = squawk.SCANNERS["hadolint"]
+        assert (sc.binary, sc.kind, sc.network) == ("hadolint", "iac", False)
+        for svc in ("preflight", "compliance"):
+            assert "hadolint" in squawk.SERVICES[svc].stages, svc
+        assert "hadolint" not in squawk.SERVICES["baggage"].stages, \
+            "baggage says it reads no IaC"
+
+
+class TestTheReleaseInstaller:
+    """`install_release` in the shipped installer, run for real: the two
+    functions are cut from the script and called over `file://` URLs, so the
+    checksum check is exercised without a network or a privileged install."""
+
+    def _run(self, tmp_path, sums_text, asset="hadolint-linux-arm64"):
+        import re as _re
+        import shutil as _sh
+        import subprocess
+        if not (_sh.which("bash") and _sh.which("curl")):
+            pytest.skip("bash and curl are needed to run the installer's functions")
+        path = os.path.join(os.path.dirname(os.path.abspath(squawk.ENTRY_PATH)),
+                            "install-tools.sh")
+        src = open(path, encoding="utf-8").read()
+        funcs = "".join(_re.search(r"(?ms)^%s\(\) \{.*?^\}\n" % name, src).group(0)
+                        for name in ("sha256_of", "install_release"))
+        rel = tmp_path / "rel"
+        rel.mkdir()
+        binary = rel / asset
+        binary.write_bytes(b"#!/bin/sh\necho 'Haskell Dockerfile Linter 9.9.9'\n")
+        (rel / "checksums.sha256").write_text(sums_text(binary))
+        dest = tmp_path / "bin"
+        harness = (
+            "have() { command -v \"$1\" >/dev/null 2>&1; }\n"
+            "ok() { echo \"ok $*\"; }\nadd() { echo \".. $*\"; }\n"
+            "bad() { echo \"!! $*\"; }\nfact() { :; }\n"
+            "okv() { ok \"$1\"; }\n"
+            "MODE=install; PRIV=none; SUDO=''; REL_OS=linux; REL_ARCH=arm64\n"
+            "REL_DIR=%s\nPATH=/usr/bin:/bin\n%s\n"
+            "install_release hadolint file://%s file://%s\n"
+            % (dest, funcs, binary, rel / "checksums.sha256"))
+        proc = subprocess.run(["bash", "-c", harness], capture_output=True,
+                              text=True, timeout=60)
+        return proc, dest / "hadolint", binary
+
+    @staticmethod
+    def _sum(p):
+        import hashlib
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+
+    def test_a_binary_that_matches_its_release_checksum_is_installed(self, tmp_path):
+        proc, dest, binary = self._run(
+            tmp_path, lambda b: "%s *%s\n0000 *other\n" % (self._sum(b), b.name))
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "matches the release" in proc.stdout, proc.stdout
+        assert dest.read_bytes() == binary.read_bytes()
+        assert os.stat(str(dest)).st_mode & 0o777 == 0o755
+
+    def test_a_mismatch_is_refused_and_nothing_is_installed(self, tmp_path):
+        proc, dest, _b = self._run(tmp_path, lambda b: "%s *%s\n" % ("0" * 64, b.name))
+        assert proc.returncode != 0
+        assert "not installed" in proc.stdout and "!!" in proc.stdout, proc.stdout
+        assert not dest.exists()
+
+    def test_a_binary_inside_a_checked_archive_is_installed(self, tmp_path):
+        """dockle ships a tar.gz; the checksum covers the archive and the
+        binary is taken out of it after the check."""
+        import hashlib
+        import subprocess
+        import tarfile
+        rel = tmp_path / "rel"
+        rel.mkdir()
+        inner = tmp_path / "dockle"
+        inner.write_bytes(b"#!/bin/sh\necho 'dockle version 9.9.9'\n")
+        archive = rel / "dockle_9.9.9_Linux-ARM64.tar.gz"
+        with tarfile.open(str(archive), "w:gz") as tf:
+            tf.add(str(inner), arcname="dockle")
+            tf.add(str(inner), arcname="README.md")
+        (rel / "sums.txt").write_text("%s  %s\n" % (
+            hashlib.sha256(archive.read_bytes()).hexdigest(), archive.name))
+        path = os.path.join(os.path.dirname(os.path.abspath(squawk.ENTRY_PATH)),
+                            "install-tools.sh")
+        src = open(path, encoding="utf-8").read()
+        funcs = "".join(re.search(r"(?ms)^%s\(\) \{.*?^\}\n" % name, src).group(0)
+                        for name in ("sha256_of", "install_release"))
+        dest = tmp_path / "bin"
+        harness = (
+            "have() { command -v \"$1\" >/dev/null 2>&1; }\n"
+            "ok() { echo \"ok $*\"; }\nadd() { echo \".. $*\"; }\n"
+            "bad() { echo \"!! $*\"; }\nfact() { :; }\nokv() { ok \"$1\"; }\n"
+            "MODE=install; PRIV=none; SUDO=''; REL_OS=linux; REL_ARCH=arm64\n"
+            "REL_DIR=%s\nPATH=/usr/bin:/bin\n%s\n"
+            "install_release dockle file://%s file://%s dockle\n"
+            % (dest, funcs, archive, rel / "sums.txt"))
+        proc = subprocess.run(["bash", "-c", harness], capture_output=True, text=True,
+                              timeout=60)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert (dest / "dockle").read_bytes() == inner.read_bytes()
+        assert not (dest / "README.md").exists(), "only the binary is installed"
+
+    def test_a_checksum_file_without_the_asset_is_refused(self, tmp_path):
+        proc, dest, _b = self._run(
+            tmp_path, lambda b: "%s *%s-not-it\n" % (self._sum(b), b.name))
+        assert proc.returncode != 0
+        assert "no entry for hadolint-linux-arm64" in proc.stdout, proc.stdout
+        assert not dest.exists()
+
+
+class TestTrufflehog:
+    """trufflehog through the registry (plan 05, item 9). It prints the
+    secret it found in `Raw`, `RawV2` and `SecretParts` and has no flag to
+    stop it, so the runner scrubs its output before anything is written:
+    the secret reaches no file in the locker and no page."""
+
+    @staticmethod
+    def _token():
+        import secrets as _secrets
+        return "ghp_" + _secrets.token_hex(18)      # built here, never in the source
+
+    # The shape trufflehog 3.99.2 printed on 2026-10-22, for a generated token.
+    @staticmethod
+    def _line(token, file="app/settings.py", line=2):
+        return json.dumps({
+            "SourceMetadata": {"Data": {"Filesystem": {"file": file, "line": line}}},
+            "SourceID": 1, "SourceType": 15, "SourceName": "trufflehog - filesystem",
+            "DetectorType": 8, "DetectorName": "Github",
+            "DetectorDescription": "GitHub is a platform for version control and "
+                                   "collaboration.",
+            "DecoderName": "PLAIN", "Verified": False, "VerificationFromCache": False,
+            "Raw": token, "RawV2": token + "extra", "Redacted": "",
+            "ExtraData": {"rotation_guide": "https://howtorotate.com/docs/tutorials/github/",
+                          "token_type": "Personal Access Token (classic)",
+                          "account": "an-account-name", "version": "2"},
+            "StructuredData": {"key": token}, "SecretParts": {"key": token}})
+
+    STDERR = ('{"level":"info-0","logger":"trufflehog","msg":"running source"}\n'
+              '{"level":"info-0","logger":"trufflehog","msg":"finished scanning",'
+              '"chunks":2,"bytes":135,"verified_secrets":0,"unverified_secrets":1,'
+              '"trufflehog_version":"3.99.2"}\n')
+
+    # -- the scrub ---------------------------------------------------------- #
+
+    def test_the_scrub_keeps_where_and_what_and_drops_every_copy_of_the_secret(self):
+        import hashlib
+        token = self._token()
+        out = squawk.scanners.scrub_trufflehog(self._line(token) + "\n")
+        assert token not in out and token[4:20] not in out, out
+        [d] = [json.loads(x) for x in out.splitlines()]
+        assert d["SecretSHA256"] == hashlib.sha256(token.encode()).hexdigest()[:16]
+        assert d["SourceMetadata"] == {"Data": {"Filesystem": {"file": "app/settings.py",
+                                                               "line": 2}}}
+        assert d["ExtraData"] == {
+            "rotation_guide": "https://howtorotate.com/docs/tutorials/github/"}
+        assert "an-account-name" not in out, "ExtraData beyond the guide is dropped"
+        for gone in ("Raw", "RawV2", "SecretParts", "StructuredData", "Redacted"):
+            assert gone not in d, gone
+
+    def test_a_line_that_is_not_json_is_not_passed_through_and_does_not_read_clean(self):
+        token = self._token()
+        out = squawk.scanners.scrub_trufflehog("found %s somewhere\n" % token)
+        assert token not in out
+        assert squawk.scanners.norm_trufflehog(out, "/base") == []
+        why = squawk.report_unreadable("trufflehog", out)
+        assert why, "a report of nothing readable must not pass as clean"
+
+    def test_scrubbing_twice_changes_nothing(self):
+        once = squawk.scanners.scrub_trufflehog(self._line(self._token()))
+        assert squawk.scanners.scrub_trufflehog(once) == once
+
+    # -- reading the report ------------------------------------------------- #
+
+    def test_findings_are_well_formed_and_carry_no_secret(self, tmp_path):
+        token = self._token()
+        raw = squawk.scanners.scrub_trufflehog(
+            self._line(token, file=str(tmp_path / "app" / "settings.py")))
+        [f] = squawk.scanners.norm_trufflehog(raw, str(tmp_path))
+        assert f.scanner == "trufflehog" and f.severity == "high"
+        assert f.path == os.path.join("app", "settings.py"), "relative to the target"
+        assert f.identity == "Github:%s:%s" % (f.path, json.loads(raw)["SecretSHA256"])
+        assert f.detail["evidence"] == squawk.scanners.EVIDENCE_WITHHELD
+        assert f.detail["reference"].startswith("https://howtorotate.com/")
+        assert f.detail["verified"] is False and f.detail["line"] == 2
+        assert f.detail["remediation"].startswith("Rotate it")
+        assert token not in json.dumps(f._asdict())
+
+    def test_the_identity_follows_the_secret_not_the_line(self):
+        token = self._token()
+        norm, scrub = squawk.scanners.norm_trufflehog, squawk.scanners.scrub_trufflehog
+        [a] = norm(scrub(self._line(token, line=2)), "")
+        [b] = norm(scrub(self._line(token, line=40)), "")
+        [c] = norm(scrub(self._line(self._token(), line=2)), "")
+        assert a.identity == b.identity, "moved, not new"
+        assert a.identity != c.identity, "a rotated key in the same place is new"
+
+    def test_json_lines_read_as_one_report(self):
+        raw = squawk.scanners.scrub_trufflehog(
+            self._line(self._token()) + "\n" + self._line(self._token(), line=3) + "\n")
+        assert squawk.report_unreadable("trufflehog", raw) is None
+        assert len(squawk.scanners.norm_trufflehog(raw, "")) == 2
+        assert squawk.report_unreadable("trufflehog", "") is None, "clean is empty"
+        assert squawk.report_unreadable("trufflehog", '{"other": 1}\n')
+
+    def test_coverage_is_what_it_says_it_read(self):
+        cov = squawk.stage_coverage("trufflehog", "", "", self.STDERR)
+        assert (cov.examined, cov.unit, cov.note) == (135, "bytes", "2 chunk(s)")
+        empty = self.STDERR.replace('"chunks":2,"bytes":135', '"chunks":0,"bytes":0')
+        status, detail, _c = squawk._apply_coverage(
+            "trufflehog", "", [], "ok", "0 finding(s)", "", empty)
+        assert status == "gap" and "examined 0 bytes" in detail, detail
+        assert squawk.stage_coverage("trufflehog", "", "", "").examined is None, \
+            "said nothing: unknown, not zero"
+
+    # -- the command and the engine ----------------------------------------- #
+
+    def test_the_command_never_verifies_and_never_updates_itself(self, tmp_path):
+        ctx = squawk.RunContext(str(tmp_path), "repo", str(tmp_path / "run"), str(tmp_path))
+        ctx.raw_path = str(tmp_path / "run" / "raw" / "trufflehog.json")
+        cmd, timeout = squawk.STAGES["trufflehog"].build(ctx)
+        assert cmd[:3] == ["trufflehog", "filesystem", str(tmp_path)] and timeout == 600
+        for flag in ("--json", "--no-verification", "--no-update"):
+            assert flag in cmd, flag
+        assert not [a for a in cmd if a.startswith(("--verifier", "--results", "--fail"))]
+        assert cmd[cmd.index("--exclude-paths") + 1] == str(
+            tmp_path / "run" / "raw" / "trufflehog.exclude.txt")
+        assert not (tmp_path / "run").exists(), "the builder wrote nothing"
+        assert squawk.STAGES["trufflehog"].config == "(^|/)\\.git/\n"
+
+    def test_the_secret_reaches_no_file_in_the_run(self, tmp_path, monkeypatch):
+        token = self._token()
+        app = tmp_path / "repo" / "app"
+        app.mkdir(parents=True)
+        (app / "settings.py").write_text("TOKEN = %r\n" % token)
+        line = self._line(token, file=str(app / "settings.py"), line=1)
+        _patch_all(monkeypatch, "tool_path", lambda name: "/usr/bin/" + name)
+        _patch_all(monkeypatch, "run_cmd",
+                   lambda cmd, cwd, timeout: (0, line + "\n", self.STDERR))
+        root = tmp_path / "ev"
+        out = squawk.execute_service(
+            squawk.Service("t", "T", "code", "repo", ("trufflehog",), "instant", ""),
+            str(tmp_path / "repo"), str(root), str(tmp_path / "repo"))
+        res = out["results"][0]
+        assert res.status == "ok" and len(res.findings) == 1, res
+        assert res.detail == "1 finding(s) across 135 bytes — 2 chunk(s)", res.detail
+        held = [os.path.join(d, n) for d, _s, files in os.walk(str(root)) for n in files
+                if token in open(os.path.join(d, n), encoding="utf-8",
+                                 errors="replace").read()]
+        assert held == [], held
+
+    def test_against_the_real_trufflehog_the_secret_is_found_and_kept_nowhere(
+            self, tmp_path):
+        if not squawk.tool_path("trufflehog"):
+            pytest.skip("trufflehog is not installed here; the scrub is checked "
+                        "against the real tool on a machine that has it")
+        import subprocess
+        token = self._token()
+        app = tmp_path / "repo" / "app"
+        app.mkdir(parents=True)
+        (app / "settings.py").write_text('GITHUB_TOKEN = "%s"\n' % token)
+        # committed, so the object store holds it too: read without the
+        # exclude, trufflehog reported it a second time under .git/objects
+        git = ["git", "-C", str(tmp_path / "repo"), "-c", "user.name=t",
+               "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false"]
+        subprocess.run([*git, "init", "-q"], check=True)
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-q", "-m", "t"], check=True)
+        svc = squawk.Service("t", "T", "code", "repo", ("trufflehog",), "instant", "")
+        root = tmp_path / "ev"
+        first = squawk.execute_service(svc, str(tmp_path / "repo"), str(root),
+                                       str(tmp_path / "repo"))["results"][0]
+        assert first.status == "ok", first
+        assert [(f.detail["rule"], f.path) for f in first.findings] == [
+            ("Github", os.path.join("app", "settings.py"))], first.findings
+        assert "bytes" in first.detail, first.detail
+        held = [os.path.join(d, n) for d, _s, files in os.walk(str(root)) for n in files
+                if token in open(os.path.join(d, n), encoding="utf-8",
+                                 errors="replace").read()]
+        assert held == [], held
+        again = squawk.execute_service(svc, str(tmp_path / "repo"), str(root),
+                                       str(tmp_path / "repo"))["results"][0]
+        assert {f.identity for f in again.findings} == {f.identity for f in first.findings}
+
+    def test_it_is_registered_beside_gitleaks(self):
+        sc = squawk.SCANNERS["trufflehog"]
+        assert (sc.binary, sc.kind, sc.network) == ("trufflehog", "secrets", False)
+        for svc in ("contraband", "preflight", "baggage"):
+            stages = squawk.SERVICES[svc].stages
+            assert stages.index("trufflehog") == stages.index("gitleaks") + 1, svc
+        assert "not tested" in squawk.SERVICES["contraband"].not_covered
+
+
+class TestDockle:
+    """dockle through the registry (plan 05, item 11): how the built image is
+    configured. It reads `.dockleignore` from its working directory and its
+    options from DOCKLE_* variables, and either one removed a check and
+    counted it as passed, so the run is pinned against both."""
+
+    # dockle 0.4.15 on the review image, 2026-10-22; alerts shortened.
+    REPORT = json.dumps({
+        "image": "beacon-review:local",
+        "summary": {"fatal": 1, "warn": 1, "info": 4, "skip": 0, "pass": 10},
+        "details": [
+            {"code": "DKL-DI-0005", "title": "Clear apt-get caches", "level": "FATAL",
+             "alerts": ["Use 'rm -rf /var/lib/apt/lists' after 'apt-get install|update' "
+                        ": RUN /bin/sh -c set -eux; \tapt-get update;"]},
+            {"code": "CIS-DI-0001", "title": "Create a user for the container",
+             "level": "WARN", "alerts": ["Last user should not be root"]},
+            {"code": "CIS-DI-0005", "title": "Enable Content trust for Docker",
+             "level": "INFO",
+             "alerts": ["export DOCKER_CONTENT_TRUST=1 before docker pull/build"]},
+            {"code": "CIS-DI-0006",
+             "title": "Add HEALTHCHECK instruction to the container image",
+             "level": "INFO", "alerts": ["not found HEALTHCHECK statement"]},
+            {"code": "CIS-DI-0008", "title": "Confirm safety of setuid/setgid files",
+             "level": "INFO", "alerts": ["setuid file: urwxr-xr-x usr/bin/su",
+                                         "setuid file: urwxr-xr-x usr/bin/mount"]},
+            {"code": "DKL-LI-0003", "title": "Only put necessary files", "level": "INFO",
+             "alerts": ["Suspicious directory : app/.git ",
+                        "unnecessary file : app/Dockerfile "]}]})
+
+    def test_the_real_report_reads_into_well_formed_findings(self):
+        found = squawk.scanners.norm_dockle(self.REPORT, "")
+        assert [(f.detail["rule"], f.severity) for f in found] == [
+            ("DKL-DI-0005", "high"), ("CIS-DI-0001", "medium"), ("CIS-DI-0005", "low"),
+            ("CIS-DI-0006", "low"), ("CIS-DI-0008", "low"), ("DKL-LI-0003", "low")]
+        root = found[1]
+        assert root.identity == "CIS-DI-0001:beacon-review", "no tag in the identity"
+        assert root.path == "beacon-review" and root.title == root.detail["remediation"]
+        assert root.detail["evidence"] == "Last user should not be root"
+        assert root.detail["reference"].endswith("CHECKPOINT.md#cis-di-0001")
+        setuid = found[4]
+        assert setuid.detail["alerts"] == 2
+        assert setuid.detail["evidence"].splitlines() == [
+            "setuid file: urwxr-xr-x usr/bin/su", "setuid file: urwxr-xr-x usr/bin/mount"]
+        assert squawk.report_unreadable("dockle", self.REPORT) is None
+
+    def test_skip_and_pass_rows_are_counted_not_reported(self):
+        rep = json.loads(self.REPORT)
+        rep["details"].append({"code": "DKL-LI-0001", "title": "Avoid empty password",
+                               "level": "SKIP", "alerts": ["failed to detect etc/shadow"]})
+        rep["summary"]["skip"] = 1
+        codes = [f.detail["rule"] for f in squawk.scanners.norm_dockle(json.dumps(rep), "")]
+        assert "DKL-LI-0001" not in codes
+        cov = squawk.stage_coverage("dockle", json.dumps(rep))
+        assert (cov.examined, cov.unit, cov.skipped, cov.note) == (16, "checks", 1, "10 passed")
+
+    def test_a_credential_checkpoint_withholds_its_alerts(self):
+        rep = {"image": "x", "summary": {}, "details": [
+            {"code": "CIS-DI-0010",
+             "title": "Do not store credential in environment variables/files",
+             "level": "FATAL", "alerts": ["Suspicious ENV key found : API_TOKEN"]}]}
+        [f] = squawk.scanners.norm_dockle(json.dumps(rep), "")
+        assert f.detail["evidence"] == squawk.scanners.EVIDENCE_WITHHELD
+
+    def test_the_identity_is_the_image_not_the_build_of_it(self):
+        name = squawk.scanners.image_name
+        assert name("ghcr.io/zaproxy/zaproxy:stable") == "ghcr.io/zaproxy/zaproxy"
+        assert name("localhost:5000/app:1.2") == "localhost:5000/app"
+        assert name("registry:5000/app") == "registry:5000/app", "a port is not a tag"
+        assert name("app@sha256:" + "a" * 64) == "app"
+        assert name("app:1@sha256:" + "a" * 64) == "app"
+        assert name("") == ""
+
+    def test_an_empty_report_is_zero_checks_and_a_gap(self):
+        cov = squawk.stage_coverage("dockle", "")
+        assert (cov.examined, cov.note) == (0, "dockle wrote no report")
+        status, detail, _c = squawk._apply_coverage("dockle", "", [], "ok", "0 finding(s)")
+        assert status == "gap" and "examined 0 checks" in detail, detail
+        assert squawk.stage_coverage("dockle", '{"summary": {"fatal": "1"}}').examined is None
+
+    def test_the_command_is_read_only(self, tmp_path):
+        ctx = squawk.RunContext("app:1", "image", str(tmp_path / "run"), str(tmp_path))
+        cmd, timeout = squawk.STAGES["dockle"].build(ctx)
+        assert cmd == ["dockle", "-f", "json", "--no-color", "--timeout", "10m", "app:1"]
+        assert timeout == 900 and squawk.STAGES["dockle"].cwd_raw is True
+
+    # -- the environment and the working directory -------------------------- #
+
+    def test_the_variables_that_change_its_report_are_set_aside(self, monkeypatch):
+        monkeypatch.setenv("DOCKLE_IGNORES", "CIS-DI-0001")
+        monkeypatch.setenv("DOCKLE_OUTPUT_FILE", "/dev/null")
+        monkeypatch.setenv("DOCKLE_HOST", "unix:///var/run/docker.sock")
+        assert squawk.core.env_set_aside(["dockle", "x"]) == [
+            "DOCKLE_IGNORES", "DOCKLE_OUTPUT_FILE"]
+        env = squawk.core.child_env(["/usr/local/bin/dockle", "x"])
+        assert "DOCKLE_IGNORES" not in env and "DOCKLE_OUTPUT_FILE" not in env
+        assert env["DOCKLE_HOST"] == "unix:///var/run/docker.sock", "how to reach docker stays"
+        assert squawk.core.child_env(["trivy", "image", "x"]) is None, "others inherit"
+
+    def test_the_engine_runs_it_from_the_raw_directory_and_records_what_it_set_aside(
+            self, tmp_path, monkeypatch):
+        seen = {}
+
+        def fake_run(cmd, cwd, timeout):
+            seen["cwd"] = cwd
+            return 0, self.REPORT, ""
+        _patch_all(monkeypatch, "tool_path", lambda name: "/usr/bin/" + name)
+        _patch_all(monkeypatch, "run_cmd", fake_run)
+        monkeypatch.setenv("DOCKLE_IGNORES", "CIS-DI-0001")
+        root = tmp_path / "ev"
+        out = squawk.execute_service(
+            squawk.Service("t", "T", "code", "image", ("dockle",), "instant", ""),
+            "beacon-review:local", str(root), "")
+        res = out["results"][0]
+        assert seen["cwd"] == os.path.join(out["run_dir"], "raw")
+        assert res.ran["env_set_aside"] == ["DOCKLE_IGNORES"]
+        assert res.status == "ok" and res.detail == "6 finding(s) across 16 checks — 10 passed"
+
+    def test_against_the_real_dockle_a_stray_ignore_cannot_hide_a_check(
+            self, tmp_path, monkeypatch):
+        """The measured failure, on a FROM scratch image built here so nothing
+        is pulled: a `.dockleignore` in the directory Squawk was started from
+        removed CIS-DI-0001 and DOCKLE_IGNORES removed CIS-DI-0006, each
+        counted as passed."""
+        import shutil as _sh
+        import subprocess
+        if not (squawk.tool_path("dockle") and _sh.which("docker")) or subprocess.run(
+                ["docker", "info"], capture_output=True, timeout=60).returncode != 0:
+            pytest.skip("dockle and a docker daemon are needed; checked on a "
+                        "machine that has both")
+        ctx_dir = tmp_path / "build"
+        ctx_dir.mkdir()
+        (ctx_dir / "f").write_text("hello\n")
+        (ctx_dir / "Dockerfile").write_text("FROM scratch\nCOPY f /f\n")
+        tag = "squawk-test-dockle:%d" % os.getpid()
+        built = subprocess.run(["docker", "build", "-q", "-t", tag, str(ctx_dir)],
+                               capture_output=True, text=True, timeout=120)
+        if built.returncode != 0:
+            pytest.skip("docker could not build a scratch image here: %s"
+                        % built.stderr.strip()[:200])
+        try:
+            cwd = tmp_path / "cwd"
+            cwd.mkdir()
+            (cwd / ".dockleignore").write_text("CIS-DI-0001\n")
+            monkeypatch.chdir(cwd)
+            monkeypatch.setenv("DOCKLE_IGNORES", "CIS-DI-0006")
+            svc = squawk.Service("t", "T", "code", "image", ("dockle",), "instant", "")
+            res = squawk.execute_service(svc, tag, str(tmp_path / "ev"), "")["results"][0]
+            codes = sorted(f.detail["rule"] for f in res.findings)
+            assert "CIS-DI-0001" in codes and "CIS-DI-0006" in codes, codes
+            assert res.status == "ok" and "checks" in res.detail, res.detail
+            again = squawk.execute_service(svc, tag, str(tmp_path / "ev"), "")["results"][0]
+            assert {f.identity for f in again.findings} == {f.identity for f in res.findings}
+        finally:
+            subprocess.run(["docker", "image", "rm", "-f", tag], capture_output=True,
+                           timeout=60)
+
+    def test_it_is_registered_in_cargo(self):
+        sc = squawk.SCANNERS["dockle"]
+        assert (sc.binary, sc.kind, sc.network) == ("dockle", "iac", True)
+        assert squawk.SERVICES["cargo"].stages[-1] == "dockle"
+
+
+class TestOsvScanner:
+    """osv-scanner through the registry (plan 05, item 3): known advisories in
+    what a lockfile or manifest names, and in what a manifest pulls in. Matched
+    against a downloaded database, so the package list is not sent to be
+    matched."""
+
+    @staticmethod
+    def _group(ids, aliases, score):
+        return {"ids": ids, "aliases": aliases, "max_severity": score}
+
+    REQUESTS_VULN: ClassVar[dict] = {
+        "id": "PYSEC-2023-74", "aliases": ["CVE-2023-32681", "GHSA-j8r2-6x86-q33q"],
+        "summary": "Unintended leak of Proxy-Authorization header",
+        "affected": [{"package": {"name": "requests", "ecosystem": "PyPI"},
+                      "ranges": [{"type": "GIT", "events": [
+                          {"introduced": "0"},
+                          {"fixed": "74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5"}]},
+                                 {"type": "ECOSYSTEM", "events": [
+                                     {"introduced": "2.3.0"}, {"fixed": "2.31.0"}]}]}]}
+
+    def _report(self, base="/t"):
+        """The shape osv-scanner 2.7.0 wrote on a review target, 2026-10-23,
+        cut down: the manifest, then what it resolved, with `requests` in
+        both."""
+        req = {"package": {"name": "requests", "version": "2.25.0", "ecosystem": "PyPI"},
+               "vulnerabilities": [self.REQUESTS_VULN],
+               "groups": [self._group(["PYSEC-2023-74", "GHSA-j8r2-6x86-q33q"],
+                                      ["CVE-2023-32681", "GHSA-j8r2-6x86-q33q",
+                                       "PYSEC-2023-74"], "6.1")]}
+        return json.dumps({"results": [
+            {"source": {"path": base + "/requirements.txt", "type": "lockfile"},
+             "packages": [{"package": {"name": "fastapi", "version": "0.110.0",
+                                       "ecosystem": "PyPI"}}, req]},
+            {"source": {"path": base + "/requirements.txt", "type": "unknown"},
+             "packages": [req,
+                          {"package": {"name": "starlette", "version": "0.36.3",
+                                       "ecosystem": "PyPI"},
+                           "vulnerabilities": [{"id": "GHSA-f96h-pmfr-66vw",
+                                                "summary": "DoS in multipart parsing",
+                                                "affected": []}],
+                           "groups": [self._group(["GHSA-f96h-pmfr-66vw"],
+                                                  ["GHSA-f96h-pmfr-66vw"], "8.7")]},
+                          {"package": {"name": "urllib3", "version": "1.26.9",
+                                       "ecosystem": "PyPI"}}]}],
+            "experimental_config": {"licenses": {"summary": False, "allowlist": None}}})
+
+    def test_the_report_reads_into_one_finding_per_advisory_per_package(self):
+        found = squawk.scanners.norm_osv_scanner(self._report(), "/t")
+        assert [f.identity for f in found] == [
+            "CVE-2023-32681:PyPI:requests:2.25.0",
+            "GHSA-f96h-pmfr-66vw:PyPI:starlette:0.36.3"], "requests once, not per source"
+        req, star = found
+        assert (req.severity, star.severity) == ("medium", "high")
+        assert req.title == "CVE-2023-32681 in requests 2.25.0", "the CVE when there is one"
+        assert req.path == "requirements.txt"
+        assert req.detail["remediation"] == "Upgrade requests to 2.31.0", "not a commit hash"
+        assert req.detail["aliases"] == ["CVE-2023-32681", "GHSA-j8r2-6x86-q33q",
+                                         "PYSEC-2023-74"]
+        assert req.detail["reference"] == "https://osv.dev/vulnerability/PYSEC-2023-74"
+        assert "named in requirements.txt" in req.detail["evidence"]
+        assert "resolved from requirements.txt" in star.detail["evidence"]
+        assert star.detail["remediation"] == "", "no fix named, none invented"
+        assert squawk.feeds.cve_of(req._asdict()) == "CVE-2023-32681", "KEV and EPSS find it"
+        assert squawk.report_unreadable("osv-scanner", self._report()) is None
+
+    def test_cvss_scores_band_as_cvss_names_them(self):
+        band = squawk.scanners._cvss_severity
+        assert [band(s) for s in ("9.8", "9.0", "7.0", "6.9", "4.0", "3.9", "0", "",
+                                  None, "high")] == [
+            "critical", "critical", "high", "medium", "medium", "low", "unknown",
+            "unknown", "unknown", "unknown"]
+
+    def test_coverage_is_the_packages_it_resolved(self):
+        cov = squawk.stage_coverage("osv-scanner", self._report())
+        assert (cov.examined, cov.unit, cov.note) == (4, "packages", "2 source(s)")
+        err = ("Loaded filter from: /t/osv-scanner.toml\n"
+               "PYSEC-2018-66 and 2 aliases have been filtered out because: test\n"
+               "Filtered 2 vulnerabilities from output\n")
+        cov = squawk.stage_coverage("osv-scanner", self._report(), "", err)
+        assert cov.note == ("2 source(s) · 2 filtered out by the target's own "
+                            "osv-scanner.toml"), cov.note
+
+    def test_a_tree_with_no_lockfile_is_a_gap(self):
+        empty = '{"results": [], "experimental_config": {}}'
+        status, detail, _c = squawk._apply_coverage("osv-scanner", empty, [], "ok",
+                                                    "0 finding(s)")
+        assert status == "gap", (status, detail)
+        assert "examined 0 packages — no lockfile or manifest found" in detail, detail
+        assert squawk.stage_coverage("osv-scanner", "[]").examined is None
+
+    def test_the_command_matches_here_and_runs_no_build(self, tmp_path):
+        ctx = squawk.RunContext(str(tmp_path), "repo", str(tmp_path / "run"), str(tmp_path))
+        cmd, timeout = squawk.STAGES["osv-scanner"].build(ctx)
+        assert cmd[:3] == ["osv-scanner", "scan", "source"] and cmd[-1] == str(tmp_path)
+        for flag in ("--no-call-analysis=all", "--offline-vulnerabilities",
+                     "--download-offline-databases", "--allow-no-lockfiles",
+                     "--all-packages", "-r"):
+            assert flag in cmd, flag
+        assert cmd[cmd.index("--format") + 1] == "json" and timeout == 600
+        assert not [a for a in cmd if a.startswith(("--call-analysis", "--serve",
+                                                    "--output"))]
+
+    def test_the_doctor_reads_the_database_age(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        assert squawk.core._osv_db_age() is None
+        db = tmp_path / "osv-scalibr" / "PyPI"
+        db.mkdir(parents=True)
+        (db / "all.zip").write_bytes(b"x")
+        three_days = time.time() - 3 * 86400 - 60
+        os.utime(str(db / "all.zip"), (three_days, three_days))
+        assert squawk.core._osv_db_age() == 3
+
+    def test_against_the_real_osv_scanner_a_pinned_flask_is_found_twice_the_same(
+            self, tmp_path):
+        if not squawk.tool_path("osv-scanner"):
+            pytest.skip("osv-scanner is not installed here; checked against the "
+                        "real tool on a machine that has it")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "requirements.txt").write_text("flask==0.12.2\n")
+        svc = squawk.Service("t", "T", "code", "repo", ("osv-scanner",), "instant", "")
+        root = tmp_path / "ev"
+        first = squawk.execute_service(svc, str(repo), str(root), str(repo))["results"][0]
+        if first.status == "error":
+            pytest.skip("osv-scanner could not run here (its database download "
+                        "needs the network): %s" % first.detail)
+        ids = {f.identity for f in first.findings}
+        assert "CVE-2018-1000656:PyPI:flask:0.12.2" in ids, sorted(ids)[:5]
+        assert first.coverage.examined and first.coverage.unit == "packages"
+        again = squawk.execute_service(svc, str(repo), str(root), str(repo))["results"][0]
+        assert {f.identity for f in again.findings} == ids
+
+    def test_it_is_registered_with_the_dependency_scanners(self):
+        sc = squawk.SCANNERS["osv-scanner"]
+        assert (sc.binary, sc.kind, sc.network) == ("osv-scanner", "sca", True)
+        for svc in ("customs", "baggage"):
+            assert squawk.SERVICES[svc].stages[-1] == "osv-scanner", svc
+        assert "prediction" in squawk.SERVICES["customs"].not_covered
+
+
+class TestNotesFromAFile:
+    """`note --from FILE`: a review handed over as many notes, recorded in one
+    command and all or none. Recording nineteen notes one editor session at a
+    time is how the twentieth gets skipped (2026-10-22)."""
+
+    ONE = ("title: Records readable across tenants\nseverity: critical\n"
+           "abilities: read\nreviewer: second reviewer\n\n## how found\nwalked IDs\n\n"
+           "## evidence\n200 for tenant b\n")
+    TWO = ("title: Anyone can overwrite a record\nseverity: high\n\n## how found\n"
+           "read the PUT route\n")
+
+    def _cli(self, *args):
+        import subprocess
+        return subprocess.run([sys.executable, ENTRY, "note", *args],
+                              capture_output=True, text=True, timeout=120)
+
+    def _runs(self, root):
+        # Notes written in the same second take the collision suffix, so the
+        # second is `...-note-2`: match the scope, not the ending.
+        return sorted(d for d in os.listdir(root) if "-note" in d) \
+            if os.path.isdir(root) else []
+
+    def test_fenced_blocks_amid_prose_are_the_notes(self):
+        text = ("# A review\n\nSome prose.\n\n```\n%s```\n\nMore prose.\n\n"
+                "```python\nprint('a code sample, not a note')\n```\n\n```\n%s```\n"
+                % (self.ONE, self.TWO))
+        blocks = squawk.split_note_blocks(text)
+        assert len(blocks) == 2, blocks
+        assert blocks[0].startswith("title: Records readable")
+
+    def test_blocks_separated_by_a_rule(self):
+        assert len(squawk.split_note_blocks(self.ONE + "---\n" + self.TWO)) == 2
+
+    def test_a_single_note_is_one_block(self):
+        assert squawk.split_note_blocks(self.ONE) == [self.ONE]
+
+    def test_every_note_is_recorded_with_its_fields(self, tmp_path):
+        f = tmp_path / "review.md"
+        f.write_text("```\n%s```\n\n```\n%s```\n" % (self.ONE, self.TWO))
+        root = tmp_path / "ev"
+        res = self._cli("--from", str(f), "--target", "app", "--session", "s1",
+                        "--evidence", str(root))
+        assert res.returncode == 0, res.stderr
+        assert "Recording 2 note(s)" in res.stdout, res.stdout
+        runs = self._runs(root)
+        assert len(runs) == 2, runs
+        found = [json.load(open(root / r / "findings.json"))[0] for r in runs]
+        first = next(x for x in found if x["title"].startswith("Records readable"))
+        assert first["detail"]["sections"] == {"abilities": "read",
+                                               "reviewer": "second reviewer"}
+        assert all(json.load(open(root / r / "manifest.json"))["session"] == "s1"
+                   for r in runs)
+
+    def test_one_incomplete_note_records_none(self, tmp_path):
+        f = tmp_path / "review.md"
+        broken = "title: No severity here\n\n## how found\nread it\n"
+        f.write_text(self.ONE + "---\n" + broken + "---\n" + self.TWO)
+        root = tmp_path / "ev"
+        res = self._cli("--from", str(f), "--target", "app", "--evidence", str(root))
+        assert res.returncode == 2
+        assert "1 of 3 note(s)" in res.stderr, res.stderr
+        assert "block 2 (No severity here): severity is required" in res.stderr
+        assert self._runs(root) == [], "nothing may be written when any block fails"
+
+    def test_a_repeated_title_is_refused(self, tmp_path):
+        f = tmp_path / "review.md"
+        f.write_text(self.ONE + "---\n" + self.ONE)
+        root = tmp_path / "ev"
+        res = self._cli("--from", str(f), "--target", "app", "--evidence", str(root))
+        assert res.returncode == 2 and "repeats the title of block 1" in res.stderr
+        assert self._runs(root) == []
+
+    def test_an_attachment_goes_into_every_note(self, tmp_path):
+        f = tmp_path / "review.md"
+        f.write_text(self.ONE + "---\n" + self.TWO)
+        proof = tmp_path / "review-full.md"
+        proof.write_bytes(b"the whole review")
+        root = tmp_path / "ev"
+        res = self._cli("--from", str(f), "--target", "app", "--evidence", str(root),
+                        "--attach", str(proof))
+        assert res.returncode == 0, res.stderr
+        runs = self._runs(root)
+        assert len(runs) == 2, runs
+        for r in runs:
+            assert (root / r / "attachments" / "review-full.md").read_bytes() \
+                == b"the whole review"
+            digest = json.load(open(root / r / "digest.json"))
+            assert "attachments/review-full.md" in digest["files"]
+
+    def test_a_file_with_no_note_says_so(self, tmp_path):
+        f = tmp_path / "empty.md"
+        f.write_text("# nothing here\n")
+        res = self._cli("--from", str(f), "--target", "app", "--evidence",
+                        str(tmp_path / "ev"))
+        assert res.returncode == 2
+
+
+class TestGitleaksIdentityIsPortable:
+    """With `--no-git`, gitleaks's Fingerprint starts with the absolute path
+    it was handed, so the same tree scanned from two directories gave two
+    identities (I5). Found 2026-10-23 beside trufflehog's relative ones."""
+
+    @staticmethod
+    def _row(file, fp):
+        return {"RuleID": "github-pat", "File": file, "StartLine": 1, "Fingerprint": fp}
+
+    def test_a_no_git_fingerprint_loses_its_absolute_prefix(self, tmp_path):
+        f = str(tmp_path / "app" / "settings.py")
+        raw = json.dumps([self._row(f, f + ":github-pat:1")])
+        [found] = squawk.scanners.norm_gitleaks(raw, str(tmp_path))
+        assert found.identity == os.path.join("app", "settings.py") + ":github-pat:1"
+        assert found.path == os.path.join("app", "settings.py")
+
+    def test_a_git_fingerprint_is_left_as_it_was(self):
+        fp = "33b9be7be0e98fef26836482b972ee7e883c99e3:app/settings.py:github-pat:4"
+        raw = json.dumps([self._row("app/settings.py", fp)])
+        [found] = squawk.scanners.norm_gitleaks(raw, "/somewhere")
+        assert found.identity == fp, "existing git-mode identities do not move"
+
+    def test_against_the_real_gitleaks_two_directories_give_one_identity(self, tmp_path):
+        if not squawk.tool_path("gitleaks"):
+            pytest.skip("gitleaks is not installed here; checked against the real "
+                        "tool on a machine that has it")
+        import secrets as _secrets
+        token = "ghp_" + _secrets.token_hex(18)          # built here, never in the source
+        svc = squawk.Service("t", "T", "code", "dir", ("gitleaks",), "instant", "")
+        ids = []
+        for name in ("one", "two"):
+            tree = tmp_path / name
+            (tree / "app").mkdir(parents=True)
+            (tree / "app" / "settings.py").write_text('TOKEN = "%s"\n' % token)
+            res = squawk.execute_service(svc, str(tree), str(tmp_path / "ev"),
+                                         str(tree))["results"][0]
+            assert res.status == "ok" and len(res.findings) == 1, res
+            ids.append(res.findings[0].identity)
+        assert ids[0] == ids[1], ids
+        assert str(tmp_path) not in ids[0], ids[0]
+
+
+class TestSemgrepOwnRules:
+    """`[scanners.semgrep] rules = [...]`: your own semgrep rules in
+    every service that runs semgrep. semgrep names a local rule by the dotted
+    path of its file from the working directory, so the same rule was
+    `Security.semgrep.rules.<id>` from the home directory and
+    `home.<user>.Security.semgrep.rules.<id>` from /tmp. The runner copies the
+    rules into the run and runs semgrep from there: `own-rules.<id>`
+    everywhere, and the rules that ran are sealed with the run."""
+
+    RULE = ("rules:\n"
+            "  - id: no-eval\n"
+            "    languages: [python]\n"
+            "    severity: ERROR\n"
+            "    message: eval of input\n"
+            "    pattern: eval(...)\n")
+
+    def _rules(self, tmp_path, name="rules"):
+        d = tmp_path / name
+        (d / "sub").mkdir(parents=True)
+        (d / "one.yml").write_text(self.RULE)
+        (d / "sub" / "two.yaml").write_text(self.RULE.replace("no-eval", "no-eval-2"))
+        (d / "README.md").write_text("not a rule\n")
+        (d / ".git").mkdir()
+        (d / ".git" / "hidden.yml").write_text(self.RULE)
+        return d
+
+    def _profile(self, ev, body):
+        ev.mkdir(parents=True, exist_ok=True)
+        (ev / "squawk.toml").write_text(body)
+        return squawk.core.load_profile(str(ev))
+
+    # -- the setting ------------------------------------------------------- #
+
+    def test_a_directory_is_walked_for_rule_files(self, tmp_path):
+        d = self._rules(tmp_path)
+        got = squawk.core.semgrep_rule_files([str(d)])
+        assert [name for _src, name in got] == ["one.yml", "two.yaml"], got
+        prof = self._profile(tmp_path / "ev", '[scanners.semgrep]\nrules = ["%s"]\n' % d)
+        assert prof.semgrep_rules() == [str(d)]
+
+    @pytest.mark.parametrize("body,fault", [
+        ('[scanners.semgrep]\nrules = ["/nowhere/at/all"]\n', "not a file or a directory"),
+        ('[scanners.semgrep]\nrules = ["https://example.invalid/r.yml"]\n', "is a URL"),
+        ('[scanners.semgrep]\nrules = "x"\n', "must be a list of paths"),
+        ('[scanners.semgrep]\nrules = []\n', "must be a list of paths"),
+        ('[scanners.bandit]\nrules = ["/tmp"]\n', "belongs under [scanners.semgrep]"),
+        ('[services.preflight]\nrules = ["/tmp"]\n', "belongs under [scanners.semgrep]"),
+    ])
+    def test_a_rules_setting_that_cannot_be_applied_is_refused(self, tmp_path, body, fault):
+        with pytest.raises(squawk.core.ProfileError) as exc:
+            self._profile(tmp_path / "ev", body)
+        assert fault in str(exc.value), str(exc.value)
+
+    def test_an_empty_directory_and_a_name_clash_are_refused(self, tmp_path):
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        (empty / "notes.txt").write_text("x")
+        with pytest.raises(ValueError, match=r"holds no \.yml"):
+            squawk.core.semgrep_rule_files([str(empty)])
+        a, b = tmp_path / "a", tmp_path / "b"
+        for d in (a, b):
+            d.mkdir()
+            (d / "rules.yml").write_text(self.RULE)
+        with pytest.raises(ValueError, match=r"two rule files are named rules\.yml"):
+            squawk.core.semgrep_rule_files([str(a), str(b)])
+
+    def test_the_run_prints_the_rules_it_adds(self, tmp_path):
+        d = self._rules(tmp_path)
+        prof = self._profile(tmp_path / "ev", '[scanners.semgrep]\nrules = ["%s"]\n' % d)
+        rows = [{"stage": "semgrep", "tool": "semgrep", "timeout_builtin": 1200}]
+        summ = prof.summary("preflight", "/t", rows)
+        assert summ["semgrep_rules"] == [{"path": str(d), "files": 2}]
+        lines = squawk.cli.profile_lines(summ)
+        assert "1 value(s) differ" in lines[0], lines
+        assert any("rules" in x and "(2 rule file(s))" in x for x in lines), lines
+
+    # -- the command and the run ------------------------------------------ #
+
+    def test_the_command_adds_the_copy_only_when_rules_are_set(self, tmp_path):
+        d = self._rules(tmp_path)
+        ctx = squawk.RunContext("/t", "repo", str(tmp_path / "run"), "/t")
+        assert squawk.STAGES["semgrep"].build(ctx)[0] == [
+            "semgrep", "--config", "auto", "--json", "--quiet", "/t"]
+        ctx.profile = self._profile(tmp_path / "ev", '[scanners.semgrep]\nrules = ["%s"]\n' % d)
+        assert squawk.STAGES["semgrep"].build(ctx)[0] == [
+            "semgrep", "--config", "auto", "--config", "own-rules", "--json", "--quiet", "/t"]
+        assert squawk.STAGES["semgrep"].cwd_raw is True
+        assert not (tmp_path / "run").exists(), "the builder wrote nothing"
+
+    def test_the_engine_copies_the_rules_and_runs_from_beside_them(self, tmp_path, monkeypatch):
+        import hashlib
+        d = self._rules(tmp_path)
+        ev = tmp_path / "ev"
+        self._profile(ev, '[scanners.semgrep]\nrules = ["%s"]\n' % d)
+        seen = {}
+
+        def fake_run(cmd, cwd, timeout):
+            seen["cwd"], seen["cmd"] = cwd, list(cmd)
+            seen["copied"] = sorted(os.listdir(os.path.join(cwd, "own-rules")))
+            return 0, json.dumps({"results": [], "errors": [],
+                                  "paths": {"scanned": ["a.py"]}}), ""
+        _patch_all(monkeypatch, "tool_path", lambda name: "/usr/bin/" + name)
+        _patch_all(monkeypatch, "run_cmd", fake_run)
+        out = squawk.execute_service(
+            squawk.Service("t", "T", "code", "repo", ("semgrep",), "instant", ""),
+            str(tmp_path), str(ev), str(tmp_path))
+        res = out["results"][0]
+        assert seen["cwd"] == os.path.join(out["run_dir"], "raw")
+        assert seen["copied"] == ["one.yml", "two.yaml"], "copied before the scan"
+        assert [b["file"] for b in res.ran["bundled"]] == [
+            os.path.join("raw", "own-rules", "one.yml"),
+            os.path.join("raw", "own-rules", "two.yaml")]
+        first = res.ran["bundled"][0]
+        assert first["sha256"] == hashlib.sha256(
+            (d / "one.yml").read_bytes()).hexdigest()
+        assert squawk.verify_root(str(ev))["exit"] == 0, "the rules are sealed evidence"
+
+    def test_a_rule_file_gone_by_run_time_is_an_error_not_a_silent_skip(
+            self, tmp_path, monkeypatch):
+        d = self._rules(tmp_path)
+        ev = tmp_path / "ev"
+        self._profile(ev, '[scanners.semgrep]\nrules = ["%s"]\n' % d)
+        prof = squawk.core.load_profile(str(ev))
+        (d / "one.yml").unlink()
+        (d / "sub" / "two.yaml").unlink()
+        ran = []
+        _patch_all(monkeypatch, "tool_path", lambda name: "/usr/bin/" + name)
+        _patch_all(monkeypatch, "run_cmd", lambda *a, **k: ran.append(a) or (0, "{}", ""))
+        res = squawk.execute_service(
+            squawk.Service("t", "T", "code", "repo", ("semgrep",), "instant", ""),
+            str(tmp_path), str(ev), str(tmp_path), profile=prof)["results"][0]
+        assert res.status == "error" and "could not copy" in res.detail, res
+        assert ran == [], "semgrep did not run without the rules it was told to use"
+
+    def test_against_the_real_semgrep_the_name_does_not_move_with_the_directory(
+            self, tmp_path):
+        """The measured property the design rests on, on the real tool: rules
+        copied to `own-rules` and run from beside them are named the same from
+        two different places."""
+        if not squawk.tool_path("semgrep"):
+            pytest.skip("semgrep is not installed here; checked against the real "
+                        "tool on a machine that has it")
+        import shutil as _sh
+        target = tmp_path / "app"
+        target.mkdir()
+        (target / "x.py").write_text("eval(input())\n")
+        ids = []
+        for place in ("one", "deeper/two"):
+            raw = tmp_path / place / "raw"
+            (raw / "own-rules").mkdir(parents=True)
+            _sh.copyfile(str(self._rules(tmp_path, "src-" + place.replace("/", "-"))
+                             / "one.yml"), str(raw / "own-rules" / "one.yml"))
+            code, out, err = squawk.run_cmd(
+                ["semgrep", "--config", "own-rules", "--json", "--quiet",
+                 "--metrics=off", str(target)], str(raw), 300)
+            assert code == 0, err[-300:]
+            ids.append(sorted(r["check_id"] for r in json.loads(out)["results"]))
+        assert ids[0] == ids[1] == ["own-rules.no-eval"], ids
+
+
+#: A risk acceptance as the report reads it back from a decision run.
+_ACCEPTED = {"state": "risk accepted", "by": "Security Officer", "expires": "2027-01-31",
+             "reason": "Behind the VPN until the guard ships.",
+             "compensating_controls": "VPN only; access logged."}
+#: A complete risk acceptance as a reviewer writes it.
+_GOOD_DECISION = {"finding": "x", "state": "risk accepted", "by": "Security Officer",
+                  "expires": "2027-01-31", "reason": "r", "compensating controls": "c"}
+
+
+class TestRemediationDeadlines:
+    """Every finding has a due date from a stated policy, and is closed only by a
+    re-run that no longer reports it or by a sealed decision. HIPAA requires
+    risks be reduced to a reasonable and appropriate level (164.308(a)(1)(ii)(B))
+    and the documentation kept six years (164.316(b)(2)(i)); it sets no deadline,
+    so the windows are policy and the report says where each one comes from."""
+    _S = TestTheShareableReport
+    NAMES = TestTheShareableReport.NAMES
+    P = squawk.core.Profile("", "built-in", {}).remediation()
+
+    def _run(self, *a, **k):
+        return self._S._run(self, *a, **k)
+
+    def _base(self, tmp_path):
+        root = tmp_path / "ev"
+        self._run(root, "20261022T100000Z",
+                  [self._S._scanner(self, "rules.no-guard:app/main.py:12")])
+        self._run(root, "20261022T100300Z-note", [self._S._note(self)], service="note",
+                  scope="note", target="http://127.0.0.1:8080")
+        return root
+
+    def _cli(self, *args):
+        import subprocess
+        return subprocess.run([sys.executable, ENTRY, *args],
+                              capture_output=True, text=True, timeout=120)
+
+    @staticmethod
+    def _utc_today(plus=0):
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc).date()
+        return (now + datetime.timedelta(days=plus)).isoformat()
+
+    # -- the policy ----------------------------------------------------------- #
+
+    def test_the_built_in_windows_say_where_each_comes_from(self):
+        assert {k: v[0] for k, v in self.P.items()} == {
+            "critical": 15, "high": 30, "medium": 90, "low": 180, "kev": 14,
+            "accept_max_days": 365}
+        src = squawk.report.REMEDIATION_SOURCES
+        assert "164.308(a)(4)(ii)(C)(1)" in src["critical"] and "not final" in src["critical"]
+        assert "(C)(2)" in src["high"] and src["medium"].startswith("Policy.")
+        assert "BOD 26-04" in src["kev"]
+        assert "164.308(a)(1)(ii)(B)" in squawk.report.REMEDIATION_BASIS
+        assert "164.316(b)(2)(i)" in squawk.report.REMEDIATION_BASIS
+
+    def test_a_profile_sets_its_own_windows_and_a_bad_one_is_refused_by_name(self, tmp_path):
+        root = self._base(tmp_path)
+        (root / "squawk.toml").write_text("[remediation]\ncritical = 7\n")
+        p = squawk.core.load_profile(str(root)).remediation()
+        assert p["critical"][0] == 7 and p["critical"][1].endswith("[remediation]")
+        assert p["high"] == (30, "built-in")
+        policy = {x["name"]: x for x in self._S._model(self, root)["sla"]["policy"]}
+        assert policy["Critical"]["days"] == 7
+        assert policy["Critical"]["source"] == "Set in this engagement's squawk.toml [remediation]."
+        assert "(C)(2)" in policy["High"]["source"]
+        for text, why in (("critcal = 7", "critcal is not a setting"),
+                          ("critical = 0", "whole number of days"),
+                          ('critical = "7"', "whole number of days")):
+            (root / "squawk.toml").write_text("[remediation]\n%s\n" % text)
+            with pytest.raises(squawk.core.ProfileError, match=why):
+                squawk.core.load_profile(str(root))
+
+    @pytest.mark.parametrize("sev,kev,expected", [
+        ("high", False, (30, "high, 30 days")),
+        ("critical", False, (15, "critical, 15 days")),
+        ("medium", True, (14, "known exploited, 14 days")),
+        ("critical", True, (14, "known exploited, 14 days")),
+        ("info", False, (None, "no deadline: informational")),
+        ("info", True, (14, "known exploited, 14 days")),
+        ("unknown", False, (None, "no deadline until it is rated")),
+    ])
+    def test_a_finding_s_window(self, sev, kev, expected):
+        assert squawk.report.due_window(sev, kev, self.P) == expected
+
+    # -- where a finding stands ------------------------------------------------ #
+
+    @pytest.mark.parametrize("decision,rescan,today,status,said", [
+        (None, "", "2026-10-23", "open", "due in 29 days"),
+        (None, "", "2026-11-25", "overdue", "4 days past due"),
+        ({"state": "in progress", "by": "Platform team", "ticket": "SEC-1"}, "", "2026-10-23",
+         "in progress", "in progress, Platform team, SEC-1; due in 29 days"),
+        ({"state": "in progress", "by": "Platform team"}, "", "2026-11-25",
+         "overdue", "in progress, Platform team; 4 days past due"),
+        (_ACCEPTED, "", "2026-11-25", "risk accepted",
+         "by Security Officer until 2027-01-31: Behind the VPN until the guard ships. "
+         "Compensating controls: VPN only; access logged."),
+        (dict(_ACCEPTED, expires="2026-11-01"), "", "2026-11-25", "overdue",
+         "risk acceptance by Security Officer expired on 2026-11-01; 4 days past due"),
+        ({"state": "false positive", "by": "AppSec", "reason": "Not reachable."}, "",
+         "2026-10-23", "false positive", "by AppSec: Not reachable."),
+        (None, "20261101T000000Z", "2026-12-01", "fixed",
+         "not reported by run 20261101T000000Z (2026-11-01)"),
+        (None, "20261130T000000Z", "2026-12-01", "fixed late",
+         "not reported by run 20261130T000000Z (2026-11-30), 9 days after the due date"),
+        (_ACCEPTED, "20261101T000000Z", "2026-12-01", "fixed",
+         "not reported by run 20261101T000000Z (2026-11-01)"),
+        ({"state": "fixed", "by": "Dev", "recorded_at": "20261101T090000Z"}, "",
+         "2026-10-23", "open",
+         "recorded fixed by Dev, but the newest run still reports it; due in 29 days"),
+        ({"state": "fixed", "by": "Dev", "recorded_at": "20261101T090000Z"}, None,
+         "2026-11-02", "fixed", "recorded fixed by Dev on 2026-11-01, with the retest evidence"),
+    ])
+    def test_where_a_finding_stands(self, decision, rescan, today, status, said):
+        got = squawk.report.remediation_state("high", False, "20261022T100000Z", self.P,
+                                              today, decision, rescan)
+        assert (got["first_seen"], got["due"]) == ("2026-10-22", "2026-11-21")
+        assert (got["status"], got["decision"]) == (status, said), got
+
+    # -- a decision ------------------------------------------------------------ #
+
+    @pytest.mark.parametrize("change,drop,problem", [
+        ({"expiry": "2027-01-31"}, (), "'expiry' is not a field a decision has"),
+        ({}, ("by",), "by is required and is empty"),
+        ({"state": "accepted"}, (), "state 'accepted' is not one of"),
+        ({}, ("compensating controls",), "needs a ## compensating controls section"),
+        ({}, ("expires",), "a risk accepted decision needs expires"),
+        ({"expires": "31/01/2027"}, (), "is not a date written YYYY-MM-DD"),
+        ({"expires": "2026-10-23"}, (), "is not after today"),
+        ({"expires": "2028-01-01"}, (), "more than 365 days away"),
+        ({"state": "fixed"}, ("reason", "compensating controls"),
+         "expires belongs to a risk acceptance, not to fixed"),
+        ({"state": "fixed"}, ("expires", "reason", "compensating controls"),
+         "a fixed decision needs a ## evidence section"),
+    ])
+    def test_a_decision_is_checked_before_it_is_kept(self, change, drop, problem):
+        assert squawk.core.disposition_problems(_GOOD_DECISION, "2026-10-23") == []
+        fields = {k: v for k, v in dict(_GOOD_DECISION, **change).items() if k not in drop}
+        bad = squawk.core.disposition_problems(fields, "2026-10-23")
+        assert any(problem in b for b in bad), bad
+
+    def test_a_decision_is_recorded_sealed_and_read_by_every_report(self, tmp_path):
+        import csv as _csv
+        import io
+        root = self._base(tmp_path)
+        ids = squawk.report.tracked_keys(str(root), "eng-1")
+        assert {"rules.no-guard:app/main.py:12", "note:x:walk-ids"} <= set(ids), ids
+        until = self._utc_today(30)
+        f = tmp_path / "decisions.txt"
+        f.write_text("finding: rules.no-guard:app/main.py:12\nstate: risk accepted\n"
+                     "by: Security Officer\nexpires: %s\n\n## reason\nBehind the VPN.\n\n"
+                     "## compensating controls\nVPN only; access logged.\n---\n"
+                     "finding: note:x:walk-ids\nstate: in progress\nby: Platform team\n"
+                     "ticket: SEC-7\n" % until)
+        res = self._cli("disposition", "eng-1", "--from", str(f), "--evidence", str(root))
+        assert res.returncode == 0, res.stderr
+        assert "Recorded 2 decision(s) for session eng-1" in res.stdout, res.stdout
+        [run] = [d for d in root.iterdir() if (d / "dispositions.json").is_file()]
+        assert "dispositions.json" in (run / "digest.json").read_text(), "the digest covers it"
+        model = squawk.report.share_model(str(root), "eng-1", today=self._utc_today())
+        [scan] = model["scanner"]
+        [rev] = model["reviewer"]
+        assert scan["status"] == "risk accepted" and "until %s" % until in scan["decision"]
+        assert rev["status"] == "in progress" and "SEC-7" in rev["decision"]
+        assert "eng-1" not in model["targets"], "a decision run is not a target"
+        rows = {x["severity"]: x for x in model["sla"]["rows"]}
+        assert rows["high"]["decided"] == 1 and rows["critical"]["open"] == 1, rows
+        md = squawk.report.share_markdown(model)
+        assert "## Remediation deadlines" in md and "**risk accepted** — by Security Officer" in md
+        page = squawk.report.share_html(model, audience="executive")
+        assert '<section><div class="head"><h2>Remediation deadlines</h2>' in page, (
+            "the executive summary carries the deadlines")
+        csv_rows = {r["id"]: r for r in _csv.DictReader(io.StringIO(
+            squawk.report.share_csv(str(root), "eng-1")))}
+        assert csv_rows["rules.no-guard:app/main.py:12"]["status"] == "risk accepted"
+        assert "VPN only" in csv_rows["rules.no-guard:app/main.py:12"]["decision"]
+        listed = self._cli("disposition", "eng-1", "--evidence", str(root))
+        assert listed.returncode == 0 and "risk accepted" in listed.stdout
+        assert "finding:" in listed.stdout, "with no --from it prints the template"
+
+    def test_a_file_with_one_bad_decision_records_nothing(self, tmp_path):
+        root = self._base(tmp_path)
+        before = sorted(p.name for p in root.iterdir() if p.is_dir())
+        f = tmp_path / "decisions.txt"
+        f.write_text("finding: note:x:walk-ids\nstate: in progress\nby: Platform team\n---\n"
+                     "finding: no-such-finding\nstate: in progress\nby: Platform team\n---\n"
+                     "finding: note:x:walk-ids\nstate: false positive\nby: AppSec\n"
+                     "## reason\nNo.\n")
+        res = self._cli("disposition", "eng-1", "--from", str(f), "--evidence", str(root))
+        assert res.returncode == 2
+        assert "no finding 'no-such-finding' in session 'eng-1'" in res.stderr, res.stderr
+        assert "block 3 decides the same finding as block 1" in res.stderr, res.stderr
+        assert sorted(p.name for p in root.iterdir() if p.is_dir()) == before, (
+            "no run was written")
+
+    def test_a_later_decision_replaces_an_earlier_one_and_both_stay(self, tmp_path):
+        root = self._base(tmp_path)
+        first = tmp_path / "a.txt"
+        first.write_text("finding: note:x:walk-ids\nstate: in progress\nby: Platform team\n")
+        later = tmp_path / "b.txt"
+        later.write_text("finding: note:x:walk-ids\nstate: false positive\nby: AppSec\n"
+                         "## reason\nThe IDs walked were the caller's own.\n")
+        for f in (first, later):
+            res = self._cli("disposition", "eng-1", "--from", str(f), "--evidence", str(root))
+            assert res.returncode == 0, res.stderr
+        assert len([d for d in root.iterdir() if (d / "dispositions.json").is_file()]) == 2
+        [rev] = squawk.report.share_model(str(root), "eng-1")["reviewer"]
+        assert rev["status"] == "false positive", rev
+
+    def test_a_decision_run_that_cannot_be_read_is_named(self, tmp_path):
+        root = self._base(tmp_path)
+        self._run(root, "20261022T110000Z-note", [], service="disposition", scope="note",
+                  target="eng-1")
+        model = squawk.report.share_model(str(root), "eng-1")
+        assert model["sla"]["unreadable"] == ["20261022T110000Z-note"]
+        assert "**Not applied:** the decisions in run(s) `20261022T110000Z-note`" in (
+            squawk.report.share_markdown(model))
+
+    # -- across engagements ---------------------------------------------------- #
+
+    def test_the_clock_starts_at_the_first_run_on_the_target_not_the_session(self, tmp_path):
+        """Opening a new session must not reset a deadline."""
+        root = tmp_path / "ev"
+        f = self._S._scanner(self, "rules.no-guard:app/main.py:12")
+        self._run(root, "20261001T100000Z", [f], session="q3")
+        self._run(root, "20261022T100000Z", [f])
+        [row] = squawk.report.share_model(str(root), "eng-1", today="2026-11-05")["scanner"]
+        assert (row["first_seen"], row["due"], row["status"]) == (
+            "2026-10-01", "2026-10-31", "overdue"), row
+
+    def test_a_decision_follows_its_finding_to_the_same_target_and_no_other(self, tmp_path):
+        root = tmp_path / "ev"
+        f = self._S._scanner(self, "rules.no-guard:app/main.py:12")
+        self._run(root, "20261001T100000Z", [f], session="q3")
+        self._run(root, "20261022T100000Z", [f])
+        self._run(root, "20261022T100100Z", [f], session="elsewhere",
+                  target="/home/alice/work/other-app")
+        d = tmp_path / "d.txt"
+        d.write_text("finding: rules.no-guard:app/main.py:12\nstate: false positive\n"
+                     "by: AppSec\n## reason\nThe route is not mounted.\n")
+        res = self._cli("disposition", "q3", "--from", str(d), "--evidence", str(root))
+        assert res.returncode == 0, res.stderr
+        [same] = squawk.report.share_model(str(root), "eng-1")["scanner"]
+        [other] = squawk.report.share_model(str(root), "elsewhere")["scanner"]
+        assert same["status"] == "false positive" and "(decision run " in same["decision"]
+        assert other["status"] == "open", "a decision never reaches another target"
+        listed = self._cli("disposition", "eng-1", "--evidence", str(root))
+        assert "false positive" in listed.stdout, listed.stdout
+
+    def test_a_decision_with_nothing_to_file_it_under_writes_nothing(self, tmp_path):
+        root = self._base(tmp_path)
+        before = sorted(p.name for p in root.iterdir())
+        with pytest.raises(ValueError, match="no targets and identities"):
+            squawk.engine.write_disposition(
+                str(root), "eng-1", [{"finding": "x", "state": "in progress", "by": "r"}], {})
+        assert sorted(p.name for p in root.iterdir()) == before
+
+
+
+class TestZizmor:
+    """zizmor through the registry: how each GitHub Actions workflow is written.
+    Its report is a bare list of what it flagged; what it read is in its log on
+    stderr, and the files the stage handed it stand when there is no log."""
+
+    WORKFLOW = ("name: deploy\n\non:\n  push:\n    branches: [main]\n"
+                "  pull_request_target:\n    branches: [main]\n\npermissions: write-all\n\n"
+                "jobs:\n  deploy:\n    runs-on: ubuntu-latest\n    steps:\n"
+                "      - uses: actions/checkout@v4\n        with:\n"
+                "          ref: ${{ github.event.pull_request.head.sha }}\n"
+                "      - uses: aws-actions/configure-aws-credentials@v4\n        with:\n"
+                "          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}\n"
+                "          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}\n"
+                "          aws-region: us-east-1\n"
+                "      - run: pip install -r requirements.txt && pytest\n")
+    # zizmor 1.31.1 on that workflow, 2026-10-23, three of its ten findings,
+    # verbatim but for the path (BASE).
+    REPORT = (
+        '[{"ident":"artipacked","desc":"credential persistence through GitHub A'
+        'ctions artifacts","url":"https://docs.zizmor.sh/audits/#artipacked","d'
+        'eterminations":{"confidence":"Low","severity":"Medium","persona":"Regu'
+        'lar"},"locations":[{"symbolic":{"key":{"Local":{"verbatim_path":"BASE/'
+        '.github/workflows/deploy.yml"}},"annotation":"does not set persist-cre'
+        'dentials: false","route":{"route":[{"Key":"jobs"},{"Key":"deploy"},{"K'
+        'ey":"steps"},{"Index":0}]},"feature_kind":"Normal","kind":"Primary"},"'
+        'concrete":{"location":{"start_point":{"row":14,"column":8},"end_point"'
+        ':{"row":16,"column":56},"offset_span":{"start":178,"end":274}},"featur'
+        'e":"uses: actions/checkout@v4\\n        with:\\n          ref: ${{ githu'
+        'b.event.pull_request.head.sha }}","comments":[]}}],"ignored":false,"fi'
+        'xes":[{"title":"set persist-credentials: false","key":{"Local":{"verba'
+        'tim_path":"BASE/.github/workflows/deploy.yml"}},"disposition":"unsafe"'
+        '}]},{"ident":"excessive-permissions","desc":"overly broad permissions"'
+        ',"url":"https://docs.zizmor.sh/audits/#excessive-permissions","determi'
+        'nations":{"confidence":"High","severity":"High","persona":"Pedantic"},'
+        '"locations":[{"symbolic":{"key":{"Local":{"verbatim_path":"BASE/.githu'
+        'b/workflows/deploy.yml"}},"annotation":"uses write-all permissions","r'
+        'oute":{"route":[{"Key":"permissions"}]},"feature_kind":"Normal","kind"'
+        ':"Primary"},"concrete":{"location":{"start_point":{"row":8,"column":0}'
+        ',"end_point":{"row":8,"column":22},"offset_span":{"start":92,"end":114'
+        '}},"feature":"permissions: write-all","comments":[]}}],"ignored":false'
+        ',"fixes":[]},{"ident":"unpinned-uses","desc":"unpinned action referenc'
+        'e","url":"https://docs.zizmor.sh/audits/#unpinned-uses","determination'
+        's":{"confidence":"High","severity":"High","persona":"Regular"},"locati'
+        'ons":[{"symbolic":{"key":{"Local":{"verbatim_path":"BASE/.github/workf'
+        'lows/deploy.yml"}},"annotation":"this step","route":{"route":[{"Key":"'
+        'jobs"},{"Key":"deploy"},{"Key":"steps"},{"Index":1}]},"feature_kind":"'
+        'Normal","kind":"Hidden"},"concrete":{"location":{"start_point":{"row":'
+        '17,"column":8},"end_point":{"row":21,"column":31},"offset_span":{"star'
+        't":283,"end":507}},"feature":"uses: aws-actions/configure-aws-credenti'
+        'als@v4\\n        with:\\n          aws-access-key-id: ${{ secrets.AWS_AC'
+        'CESS_KEY_ID }}\\n          aws-secret-access-key: ${{ secrets.AWS_SECRE'
+        'T_ACCESS_KEY }}\\n          aws-region: us-east-1","comments":[]}},{"sy'
+        'mbolic":{"key":{"Local":{"verbatim_path":"BASE/.github/workflows/deplo'
+        'y.yml"}},"annotation":"action is not pinned to a hash (required by bla'
+        'nket policy)","route":{"route":[{"Key":"jobs"},{"Key":"deploy"},{"Key"'
+        ':"steps"},{"Index":1},{"Key":"uses"}]},"feature_kind":{"Subfeature":{"'
+        'after":0,"fragment":{"Raw":"aws-actions/configure-aws-credentials@v4"}'
+        '}},"kind":"Primary"},"concrete":{"location":{"start_point":{"row":17,"'
+        'column":14},"end_point":{"row":17,"column":54},"offset_span":{"start":'
+        '289,"end":329}},"feature":"aws-actions/configure-aws-credentials@v4","'
+        'comments":[]}}],"ignored":false,"fixes":[]}]')
+
+    def _tree(self, tmp_path):
+        wf = tmp_path / ".github" / "workflows"
+        wf.mkdir(parents=True, exist_ok=True)
+        (wf / "deploy.yml").write_text(self.WORKFLOW, encoding="utf-8")
+        return str(tmp_path)
+
+    def _report(self, base, ignored=False):
+        rows = json.loads(self.REPORT.replace("BASE", base))
+        if ignored:
+            rows[1]["ignored"] = True
+            rows[1]["locations"][0]["concrete"]["comments"] = [
+                "# zizmor: ignore[excessive-permissions]"]
+        return json.dumps(rows)
+
+    # -- reading the report ------------------------------------------------- #
+
+    def test_the_real_report_reads_into_well_formed_findings(self, tmp_path):
+        base = self._tree(tmp_path)
+        got = {f.detail["rule"]: f for f in squawk.norm_zizmor(self._report(base), base)}
+        assert sorted(got) == ["artipacked", "excessive-permissions", "unpinned-uses"]
+        perms = got["excessive-permissions"]
+        assert (perms.severity, perms.title, perms.path) == (
+            "high", "Overly broad permissions", ".github/workflows/deploy.yml")
+        assert perms.detail["line"] == 9 and perms.detail["evidence"] == "permissions: write-all"
+        assert perms.detail["description"] == "overly broad permissions; uses write-all permissions"
+        assert perms.detail["reference"] == "https://docs.zizmor.sh/audits/#excessive-permissions"
+        assert got["artipacked"].detail["remediation"] == "set persist-credentials: false"
+        assert got["artipacked"].detail["confidence"] == "Low"
+        pin = got["unpinned-uses"]
+        assert pin.detail["line"] == 18, "the primary location, not the hidden step before it"
+        assert pin.detail["evidence"] == "aws-actions/configure-aws-credentials@v4"
+        assert all(":" in f.identity and "/" not in f.identity.split(":")[-1]
+                   for f in got.values())
+
+    def test_a_clean_report_is_readable_and_another_shape_is_not(self):
+        assert squawk.report_unreadable("zizmor", "[]") is None
+        assert squawk.norm_zizmor("[]", "/x") == []
+        why = squawk.report_unreadable("zizmor", '{"results": []}')
+        assert why and "list" in why, why
+
+    def test_a_step_added_above_does_not_make_a_finding_new(self, tmp_path):
+        base = self._tree(tmp_path)
+        before = {f.identity for f in squawk.norm_zizmor(self._report(base), base)}
+        moved = json.loads(self._report(base))
+        for row in moved:
+            for loc in row["locations"]:
+                loc["concrete"]["location"]["start_point"]["row"] += 3
+        after = {f.identity for f in squawk.norm_zizmor(json.dumps(moved), base)}
+        assert before == after
+
+    def test_a_finding_the_workflow_suppresses_is_reported_and_marked(self, tmp_path):
+        base = self._tree(tmp_path)
+        got = {f.detail["rule"]: f for f in squawk.norm_zizmor(
+            self._report(base, ignored=True), base)}
+        perms = got["excessive-permissions"]
+        assert perms.severity == "high", "a suppression does not lower the severity"
+        assert perms.title.endswith("(suppressed in the workflow)")
+        assert perms.detail["suppressed"] == "# zizmor: ignore[excessive-permissions]"
+
+    def test_what_it_read_comes_from_its_log(self):
+        log = (" INFO zizmor: zizmor v1.31.1\n"
+               " WARN collect_inputs: zizmor::registry::input: failed to parse input: "
+               "did not find expected node content at line 2 column 1\n"
+               " INFO audit: zizmor: completed /r/.github/workflows/deploy.yml\n"
+               " INFO audit: zizmor: completed /r/.github/workflows/test.yml\n")
+        assert squawk.scanners._cov_zizmor("[]", "", log) == squawk.Coverage(
+            2, "workflow files", 0, 1, "")
+        assert squawk.scanners._cov_zizmor("[]", "", "").examined is None, (
+            "no log: the files the stage handed it stand")
+
+    # -- the command -------------------------------------------------------- #
+
+    def test_the_builder_finds_workflows_and_actions_and_skips_the_rest(self, tmp_path):
+        base = self._tree(tmp_path)
+        (tmp_path / ".github" / "workflows" / "ci.yaml").write_text("on: push\n")
+        (tmp_path / ".github" / "workflows" / "README.md").write_text("docs\n")
+        (tmp_path / ".github" / "dependabot.yml").write_text("version: 2\n")
+        (tmp_path / "actions" / "build").mkdir(parents=True)
+        (tmp_path / "actions" / "build" / "action.yml").write_text("runs: {}\n")
+        (tmp_path / "node_modules" / "x").mkdir(parents=True)
+        (tmp_path / "node_modules" / "x" / "action.yml").write_text("runs: {}\n")
+        (tmp_path / "config").mkdir()
+        (tmp_path / "config" / "app.yml").write_text("a: 1\n")
+        got = [os.path.relpath(p, base) for p in squawk.stages.workflow_files_in(base)]
+        assert got == [os.path.join(".github", "workflows", "ci.yaml"),
+                       os.path.join(".github", "workflows", "deploy.yml"),
+                       os.path.join("actions", "build", "action.yml")], got
+
+    def test_the_command_is_offline_unsuppressed_and_writes_nothing(self, tmp_path):
+        base = self._tree(tmp_path)
+        run = tmp_path / "ev" / "20261023T000000Z"
+        ctx = squawk.RunContext(base, "repo", str(run), base)
+        ctx.raw_path = str(run / "raw" / "zizmor.json")
+        cmd, timeout = squawk.STAGES["zizmor"].build(ctx)
+        assert cmd[0] == "zizmor" and timeout == 300
+        for flag in ("--offline", "--no-config", "--no-ignores", "--no-exit-codes"):
+            assert flag in cmd, flag
+        assert cmd[cmd.index("--persona") + 1] == "auditor"
+        assert cmd[cmd.index("--format") + 1] == "json"
+        assert cmd[-1] == os.path.join(base, ".github", "workflows", "deploy.yml")
+        assert not (tmp_path / "ev").exists(), "the builder wrote nothing"
+        assert ctx.handed == squawk.Coverage(1, "workflow files", 0, 0, "")
+
+    # -- through the engine ------------------------------------------------- #
+
+    def _service(self):
+        return squawk.Service("t", "T", "code", "repo", ("zizmor",), "instant", "")
+
+    def test_a_tree_with_no_workflow_is_a_gap(self, tmp_path, monkeypatch):
+        ran = []
+        _patch_all(monkeypatch, "tool_path", lambda name: "/usr/bin/" + name)
+        _patch_all(monkeypatch, "run_cmd", lambda *a, **k: ran.append(a) or (0, "[]", ""))
+        (tmp_path / "app.py").write_text("print(1)\n")
+        out = squawk.execute_service(self._service(), str(tmp_path), str(tmp_path / "ev"),
+                                     str(tmp_path))
+        res = out["results"][0]
+        assert res.status == "gap", res
+        assert res.detail == "no workflow files to read — nothing to run against", res.detail
+        assert ran == [], "nothing was run"
+
+    def test_the_engine_counts_what_zizmor_read_and_seals_it(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        base = self._tree(repo)
+        log = " INFO audit: zizmor: completed %s/.github/workflows/deploy.yml\n" % base
+        _patch_all(monkeypatch, "tool_path", lambda name: "/usr/bin/" + name)
+        _patch_all(monkeypatch, "run_cmd", lambda cmd, cwd, timeout: (0, self._report(base), log))
+        root = tmp_path / "ev"
+        out = squawk.execute_service(self._service(), base, str(root), base)
+        res = out["results"][0]
+        assert res.status == "ok", res
+        assert res.detail == "3 finding(s) across 1 workflow files", res.detail
+        assert squawk.verify_root(str(root))["exit"] == 0
+
+    def test_against_the_real_zizmor(self, tmp_path):
+        """The measured behaviour, where zizmor is installed: the dangerous
+        trigger is found, a suppression comment does not hide it, and a second
+        run diffs to nothing."""
+        if not squawk.tool_path("zizmor"):
+            pytest.skip("zizmor is not installed here; the stage is checked against "
+                        "the real tool on a machine that has it")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        base = self._tree(repo)
+        wf = repo / ".github" / "workflows" / "deploy.yml"
+        wf.write_text(self.WORKFLOW.replace(
+            "  pull_request_target:",
+            "  pull_request_target: # zizmor: ignore[dangerous-triggers]"))
+        root = tmp_path / "ev"
+        out = squawk.execute_service(self._service(), base, str(root), base)
+        res = out["results"][0]
+        rules = {f.detail["rule"]: f for f in res.findings}
+        assert res.status == "ok" and "across 1 workflow files" in res.detail, res.detail
+        assert "dangerous-triggers" in rules and rules["dangerous-triggers"].detail["suppressed"]
+        assert {"excessive-permissions", "unpinned-uses", "secrets-outside-env"} <= set(rules)
+        again = squawk.execute_service(self._service(), base, str(root), base)
+        assert ({f.identity for f in again["results"][0].findings}
+                == {f.identity for f in res.findings}), "a second run diffs to nothing"
+
+    def test_it_is_registered_where_a_workflow_is_read(self):
+        sc = squawk.SCANNERS["zizmor"]
+        assert (sc.binary, sc.kind, sc.network) == ("zizmor", "iac", False)
+        for svc in ("preflight", "compliance"):
+            assert "zizmor" in squawk.SERVICES[svc].stages, svc
+        assert "zizmor" not in squawk.SERVICES["baggage"].stages
+
+    def test_its_retest_runs_the_same_audit_offline(self):
+        f = {"scanner": "zizmor", "identity": "excessive-permissions:.github/workflows/d.yml:ab",
+             "path": ".github/workflows/d.yml",
+             "detail": {"rule": "excessive-permissions", "line": 9}}
+        assert squawk.report.retest_for(f) == (
+            "zizmor --offline --no-ignores --persona auditor <repo>/.github/workflows/d.yml: "
+            "no excessive-permissions at line 9")
+
+
+
+class TestSchemathesis:
+    """Schemathesis through the registry (apiprobe): property-based testing of a
+    RUNNING API from its OpenAPI schema. Its JSON run report lists each failing
+    check with the operations it failed on; the operation count is the
+    denominator, and a check that is not a crash is a conformance finding."""
+
+    # Schemathesis 4.32.4 on a FastAPI target, 2026-10-24, trimmed to the keys
+    # the normalizer and coverage read.
+    REPORT = (
+        '{"schemathesis_version":"4.32.4","exit_code":1,"operations":{"total"'
+        ':8,"selected":8,"tested":8,"skipped":0,"errored":0},"test_cases":{"g'
+        'enerated":293,"unique_failures":8},"failures":[{"type":"AllowHeaderM'
+        'ismatch","code":"ST205","title":"Allow header mismatch","severity":"'
+        'medium","count":2,"operations":["OPTIONS /documents","OPTIONS /docum'
+        'ents/{document_id}"]},{"type":"UndefinedStatusCode","code":"ST103","'
+        'title":"Undocumented status code","severity":"medium","count":6,"ope'
+        'rations":["DELETE /documents/{document_id}","GET /documents/{documen'
+        't_id}","GET /documents/{document_id}/export","POST /search","PUT /do'
+        'cuments/{document_id}","Stateful tests"]}],"errors":[]}')
+
+    def test_the_real_report_reads_into_well_formed_findings(self):
+        got = {f.detail["rule"]: f for f in squawk.norm_schemathesis(self.REPORT, "/b")}
+        assert sorted(got) == ["ST103", "ST205"]
+        f = got["ST103"]
+        assert f.severity == "medium" and f.title == "Undocumented status code"
+        assert f.path == "" and f.detail["reference"].startswith("https://schemathesis")
+        assert "on 6 operation(s)" in f.detail["description"]
+        assert "DELETE /documents/{document_id}" in f.detail["evidence"]
+        assert all(":" in x.identity for x in got.values())
+
+    def test_a_clean_report_is_readable_and_a_wrong_shape_is_not(self):
+        clean = '{"operations":{"tested":8},"failures":[],"errors":[],"exit_code":0}'
+        assert squawk.report_unreadable("schemathesis", clean) is None
+        assert squawk.norm_schemathesis(clean, "/b") == []
+        why = squawk.report_unreadable("schemathesis", '{"results": []}')
+        assert why, why
+
+    def test_identity_is_stable_across_operation_order_and_differs_by_set(self):
+        import json as _json
+        base = {"operations": {"tested": 3},
+                "failures": [{"type": "x", "code": "ST103", "title": "Undocumented",
+                              "severity": "low", "count": 2,
+                              "operations": ["GET /a", "GET /b"]}],
+                "errors": [], "exit_code": 1}
+        a = squawk.norm_schemathesis(_json.dumps(base), "/b")[0]
+        base["failures"][0]["operations"] = ["GET /b", "GET /a"]        # reordered
+        b = squawk.norm_schemathesis(_json.dumps(base), "/b")[0]
+        assert a.identity == b.identity, "operation order is not identity"
+        base["failures"][0]["operations"] = ["GET /a", "GET /c"]        # different set
+        c = squawk.norm_schemathesis(_json.dumps(base), "/b")[0]
+        assert a.identity != c.identity, "a different operation set is a different finding"
+
+    def test_a_server_error_is_never_softened_below_high(self):
+        import json as _json
+        raw = _json.dumps({"operations": {"tested": 5},
+                           "failures": [{"type": "ServerError", "code": "ST500",
+                                         "title": "Server error", "severity": "medium",
+                                         "count": 3, "operations": ["GET /x"]}],
+                           "errors": [], "exit_code": 1})
+        assert squawk.norm_schemathesis(raw, "/b")[0].severity == "high"
+
+    def test_coverage_counts_operations_and_a_zero_is_a_gap(self):
+        import json as _json
+        full = _json.dumps({"operations": {"tested": 8, "skipped": 1},
+                            "failures": [], "errors": [{"x": 1}], "exit_code": 0})
+        cov = squawk.scanners._cov_schemathesis(full)
+        assert (cov.examined, cov.unit, cov.skipped, cov.errors) == (8, "API operations", 1, 1)
+        zero = _json.dumps({"operations": {"tested": 0}, "failures": [], "errors": []})
+        assert squawk.scanners._cov_schemathesis(zero).examined == 0
+        assert squawk.scanners._cov_schemathesis("{}").examined is None
+
+    def test_the_schema_url_appends_openapi_or_respects_a_given_schema(self):
+        assert squawk.stages.schema_url("http://h:8099") == "http://h:8099/openapi.json"
+        assert squawk.stages.schema_url("http://h:8099/") == "http://h:8099/openapi.json"
+        assert squawk.stages.schema_url("http://h/custom.yaml") == "http://h/custom.yaml"
+        assert squawk.stages.schema_url("http://h/openapi.json") == "http://h/openapi.json"
+
+    def test_the_command_is_pinned_and_writes_its_report(self, tmp_path):
+        run = tmp_path / "ev" / "20261024T000000Z"
+        ctx = squawk.RunContext("http://127.0.0.1:8099", "url", str(run),
+                                "http://127.0.0.1:8099")
+        ctx.raw_path = str(run / "raw" / "schemathesis.json")
+        cmd, _timeout = squawk.STAGES["schemathesis"].build(ctx)
+        assert cmd[:3] == ["schemathesis", "run", "http://127.0.0.1:8099/openapi.json"]
+        assert cmd[cmd.index("--checks") + 1] == "all"
+        assert cmd[cmd.index("--report") + 1] == "json"
+        # the report path is a bare name (cwd is the raw dir), not an absolute path
+        assert cmd[cmd.index("--report-json-path") + 1] == "schemathesis.json"
+        assert squawk.STAGES["schemathesis"].writes_report and squawk.STAGES["schemathesis"].cwd_raw
+        assert not (tmp_path / "ev").exists(), "the builder wrote nothing"
+
+    def _service(self):
+        return squawk.Service("t", "T", "web", "url", ("schemathesis",), "instant", "")
+
+    def test_the_engine_counts_operations_and_seals_the_report(self, tmp_path, monkeypatch):
+        def fake_run(cmd, cwd, timeout):
+            # schemathesis writes its report to the cwd (the raw dir); exit 1 = failures
+            open(__import__("os").path.join(cwd, "schemathesis.json"), "w").write(self.REPORT)
+            return 1, "", ""
+        _patch_all(monkeypatch, "tool_path", lambda name: "/usr/bin/" + name)
+        _patch_all(monkeypatch, "run_cmd", fake_run)
+        root = tmp_path / "ev"
+        out = squawk.execute_service(self._service(), "http://127.0.0.1:8099",
+                                     str(root), "http://127.0.0.1:8099")
+        res = out["results"][0]
+        assert res.status == "ok", res
+        assert res.detail == "2 finding(s) across 8 API operations", res.detail
+        assert squawk.verify_root(str(root))["exit"] == 0
+
+    def test_it_is_registered_in_apiprobe(self):
+        sc = squawk.SCANNERS["schemathesis"]
+        assert (sc.binary, sc.kind, sc.network) == ("schemathesis", "dast", True)
+        assert squawk.SERVICES["apiprobe"].stages == ("schemathesis",)
+        assert squawk.SERVICES["apiprobe"].scope == "url"
+
+    def test_its_retest_reruns_the_api_probe(self):
+        f = {"scanner": "schemathesis", "identity": "ST103:abc", "path": "",
+             "detail": {"rule": "ST103"}}
+        assert squawk.report.retest_for(f) == (
+            "squawk run apiprobe --target <url>: ST103 no longer reported")
+
+
+_AUTHZ_TEST_SCHEMA = {
+    "openapi": "3.0.0",
+    "paths": {
+        "/documents": {
+            "get": {},
+            "post": {"requestBody": {"content": {"application/json": {
+                "schema": {"$ref": "#/components/schemas/Create"}}}}},
+        },
+        "/documents/{document_id}": {"get": {}, "delete": {}},
+        "/health": {"get": {}},
+    },
+    "components": {"schemas": {"Create": {
+        "required": ["title", "body"],
+        "properties": {"title": {"type": "string"}, "body": {"type": "string"},
+                       "tenant_id": {"type": "string"}, "tags": {"type": "array"}}}}},
+}
+
+
+class TestObjectAuthzProbe:
+    """The object-authorization (BOLA) probe: seed a canary per identity, read
+    each under the other identity, report the cross-identity reads. OWASP API1.
+    The HTTP layer is stubbed so the orchestration is tested without a server."""
+
+    SCHEMA = _AUTHZ_TEST_SCHEMA
+
+    # -- the pure pieces ----------------------------------------------------- #
+
+    def test_resources_are_collections_with_create_and_read_by_id(self):
+        res = squawk.probes._authz_resources(self.SCHEMA)
+        assert len(res) == 1
+        r = res[0]
+        assert (r["collection"], r["item"], r["id_param"]) == (
+            "/documents", "/documents/{document_id}", "document_id")
+        assert r["list"] is not None and r["delete"] is not None
+        # /health has no id path and no create -> not a resource
+        assert all(x["item"] != "/health" for x in res)
+
+    def test_body_synthesis_resolves_the_ref_and_carries_the_marker(self):
+        op = self.SCHEMA["paths"]["/documents"]["post"]
+        body = squawk.probes._authz_body(op, self.SCHEMA, "MARK-123")
+        assert body == {"title": "MARK-123", "body": "MARK-123"}, "required strings get the marker"
+
+    def test_identities_come_from_the_env_else_a_default(self, monkeypatch):
+        monkeypatch.delenv("SQUAWK_AUTHZ_A", raising=False)
+        monkeypatch.delenv("SQUAWK_AUTHZ_B", raising=False)
+        ids, configured = squawk.probes._authz_headers()
+        assert configured is False and ids[0][1] == {"X-Tenant-Id": "squawk-authz-a"}
+        monkeypatch.setenv("SQUAWK_AUTHZ_A", "Authorization: Bearer aaa")
+        monkeypatch.setenv("SQUAWK_AUTHZ_B", "Authorization: Bearer bbb, X-Tenant-Id: b")
+        ids, configured = squawk.probes._authz_headers()
+        assert configured is True
+        assert ids[0][1] == {"Authorization": "Bearer aaa"}
+        assert ids[1][1] == {"Authorization": "Bearer bbb", "X-Tenant-Id": "b"}
+
+    def test_the_report_reads_into_one_finding_per_kind_and_endpoint(self):
+        import json as _json
+        raw = _json.dumps({"schema": "x", "tested": 4, "configured": True, "findings": [
+            {"kind": "cross-object-read", "endpoint": "GET /documents/{document_id}",
+             "reader": "A", "owner": "B", "status": 200},
+            {"kind": "cross-object-read", "endpoint": "GET /documents/{document_id}",
+             "reader": "B", "owner": "A", "status": 200},
+            {"kind": "cross-object-list", "endpoint": "GET /documents",
+             "reader": "A", "exposed": 1, "status": 200}]})
+        got = {f.detail["rule"]: f for f in squawk.norm_authz(raw, "/b")}
+        assert sorted(got) == ["cross-object-list", "cross-object-read"]
+        read = got["cross-object-read"]
+        assert read.severity == "high" and "read another's object" in read.title
+        assert read.identity == "cross-object-read:/documents/{document_id}", (
+            "no object id in identity")
+        assert "A/B" in read.detail["evidence"] or "A, B" in read.detail["evidence"]
+        assert "0xa1-broken-object-level" in read.detail["reference"]
+
+    def test_with_no_identity_configured_the_wording_says_so(self):
+        import json as _json
+        raw = _json.dumps({"schema": "x", "tested": 2, "configured": False, "findings": [
+            {"kind": "cross-object-read", "endpoint": "GET /d/{id}",
+             "reader": "A", "status": 200}]})
+        f = squawk.norm_authz(raw, "/b")[0]
+        assert "no scoping credential" in f.detail["description"]
+
+    def test_an_isolated_api_is_no_finding_but_still_counts_coverage(self):
+        import json as _json
+        raw = _json.dumps({"schema": "x", "tested": 6, "findings": [], "configured": True})
+        assert squawk.norm_authz(raw, "/b") == []
+        cov = squawk.scanners._cov_authz(raw)
+        assert (cov.examined, cov.unit) == (6, "cross-identity reads")
+
+    def test_zero_reads_is_a_gap_and_a_bad_shape_is_unreadable(self):
+        import json as _json
+        assert squawk.scanners._cov_authz(_json.dumps({"tested": 0})).examined == 0
+        assert squawk.scanners._cov_authz("{}").examined is None
+        assert squawk.report_unreadable("authz", _json.dumps({"schema": "x"})) is None
+        assert squawk.report_unreadable("authz", "[]")
+
+    # -- the probe, HTTP stubbed to a BOLA API ------------------------------- #
+
+    def _bola_server(self):
+        """A fake _authz_req: the schema, a create that stores, and a read/list
+        that returns any object regardless of the caller (the BOLA bug)."""
+        import json as _json
+        store = {}
+        counter = {"n": 0}
+
+        def fake(method, url, headers=None, body=None, timeout=8.0):
+            if url.endswith("/openapi.json"):
+                return 200, _json.dumps(self.SCHEMA)
+            if method == "POST" and url.endswith("/documents"):
+                counter["n"] += 1
+                oid = "doc-%03d" % counter["n"]
+                store[oid] = dict(body or {}, id=oid)
+                return 201, _json.dumps(store[oid])
+            if method == "GET" and "/documents/" in url:
+                oid = url.rsplit("/", 1)[-1]
+                return (200, _json.dumps(store[oid])) if oid in store else (404, "")
+            if method == "GET" and url.endswith("/documents"):
+                return 200, _json.dumps(list(store.values()))
+            if method == "DELETE" and "/documents/" in url:
+                store.pop(url.rsplit("/", 1)[-1], None)
+                return 204, ""
+            return 404, ""
+        return fake, store
+
+    def test_the_probe_finds_bola_and_cleans_up(self, monkeypatch):
+        fake, store = self._bola_server()
+        monkeypatch.setattr(squawk.probes, "_authz_req", fake)
+        monkeypatch.delenv("SQUAWK_AUTHZ_A", raising=False)
+        monkeypatch.delenv("SQUAWK_AUTHZ_B", raising=False)
+        ctx = squawk.RunContext("http://t.example", "url", "/run", "http://t.example")
+        out = squawk.probes.authz_probe(ctx)
+        import json as _json
+        data = _json.loads(out if isinstance(out, str) else out[0])
+        kinds = sorted({f["kind"] for f in data["findings"]})
+        assert kinds == ["cross-object-list", "cross-object-read"], data["findings"]
+        assert data["tested"] >= 2 and len(data["objects"]) == 2
+        assert store == {}, "the canaries are deleted after the probe"
+
+    def test_an_isolated_server_yields_no_finding(self, monkeypatch):
+        import json as _json
+        store = {}
+        counter = {"n": 0}
+
+        def fake(method, url, headers=None, body=None, timeout=8.0):
+            owner = (headers or {}).get("X-Tenant-Id")
+            if url.endswith("/openapi.json"):
+                return 200, _json.dumps(self.SCHEMA)
+            if method == "POST" and url.endswith("/documents"):
+                counter["n"] += 1
+                oid = "doc-%03d" % counter["n"]
+                store[oid] = dict(body or {}, id=oid, _owner=owner)
+                return 201, _json.dumps({k: v for k, v in store[oid].items() if k != "_owner"})
+            if method == "GET" and "/documents/" in url:          # isolated: only the owner
+                oid = url.rsplit("/", 1)[-1]
+                o = store.get(oid)
+                if o and o["_owner"] == owner:
+                    return 200, _json.dumps({k: v for k, v in o.items() if k != "_owner"})
+                return 404, ""
+            if method == "GET" and url.endswith("/documents"):    # isolated listing
+                mine = [o for o in store.values() if o["_owner"] == owner]
+                return 200, _json.dumps(
+                    [{k: v for k, v in o.items() if k != "_owner"} for o in mine])
+            if method == "DELETE":
+                store.pop(url.rsplit("/", 1)[-1], None)
+                return 204, ""
+            return 404, ""
+        monkeypatch.setattr(squawk.probes, "_authz_req", fake)
+        monkeypatch.setenv("SQUAWK_AUTHZ_A", "X-Tenant-Id: a")
+        monkeypatch.setenv("SQUAWK_AUTHZ_B", "X-Tenant-Id: b")
+        ctx = squawk.RunContext("http://t.example", "url", "/run", "http://t.example")
+        data = _json.loads(squawk.probes.authz_probe(ctx))
+        assert data["findings"] == [], "an API that scopes by identity has no BOLA finding"
+        assert data["tested"] >= 2, "it still tested the isolation"
+
+    def test_no_schema_is_a_gap(self, monkeypatch):
+        monkeypatch.setattr(squawk.probes, "_authz_req",
+                            lambda *a, **k: (404, ""))
+        ctx = squawk.RunContext("http://t.example", "url", "/run", "http://t.example")
+        out = squawk.probes.authz_probe(ctx)
+        assert isinstance(out, tuple) and out[1] == "gap" and "no OpenAPI schema" in out[2]
+
+    def test_it_is_registered_in_authprobe_and_retests(self):
+        sc = squawk.SCANNERS["authz"]
+        assert (sc.kind, sc.internal, sc.network) == ("dast", True, True)
+        assert squawk.SERVICES["authprobe"].stages == ("authz",)
+        assert squawk.SERVICES["authprobe"].scope == "url"
+        f = {"scanner": "authz", "identity": "cross-object-read:/d/{id}", "path": "/d/{id}",
+             "detail": {"rule": "cross-object-read"}}
+        assert squawk.report.retest_for(f) == (
+            "squawk run authprobe --target <url>: cross-object-read no longer reported")
+
+
+class TestAuthenticatedDastProbe:
+    """The authenticated-DAST (webauth) probe: log in to a running app with
+    credentials from the environment, then run the authenticated checks. A real
+    loopback server is served so the cookie flow is exercised through the socket
+    — a session cookie's flags cannot be read from a stub that never sets one."""
+
+    # -- a configurable login app, served on loopback ----------------------- #
+
+    @staticmethod
+    def _sign_flask_cookie(key, payload="eyJ1IjoxfQ", ts="abc"):
+        """Mint a cookie that squawk's stdlib _flask_session_key_matches accepts
+        for `key` — the signature covers 'payload.timestamp', so the payload body
+        is irrelevant to the check. Lets the tests avoid a flask dependency."""
+        import base64 as _b64
+        import hashlib as _hl
+        import hmac as _hm
+        value = (payload + "." + ts).encode()
+        derived = _hm.new(key.encode(), b"cookie-session", _hl.sha1).digest()
+        raw = _hm.new(derived, value, _hl.sha1).digest()
+        sig = _b64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+        return "%s.%s.%s" % (payload, ts, sig)
+
+    def _app(self, *, secure=False, leak=True, broken_path=True, always_cookie=False,
+             require_field=None, signed_key=None, header_gated=False, csrf=False):
+        import json as _json
+        import os as _os
+        from http.server import BaseHTTPRequestHandler
+        users = {"alice": "password1", "bob": "letmein"}
+        good = _json.dumps({"page": "dashboard", "note": "you are logged in"})
+        anon = _json.dumps({"page": "login"})
+        signed_cookie = self._sign_flask_cookie(signed_key) if signed_key else None
+        spoof_headers = ("x-forwarded-for", "x-real-ip", "x-originating-ip",
+                         "x-client-ip", "x-forwarded-host", "x-remote-addr", "x-remote-ip")
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _authed(self):
+                return "session=" in (self.headers.get("Cookie") or "")
+
+            def _reply(self, code, body=b""):
+                self.send_response(code)
+                self.end_headers()
+                if body:
+                    self.wfile.write(body if isinstance(body, bytes) else body.encode())
+
+            def do_GET(self):
+                if self.path == "/login" and csrf:             # issue a per-session CSRF token
+                    token = _os.urandom(8).hex()               # bound to the cookie it sets
+                    self.send_response(200)
+                    self.send_header("Set-Cookie", "pre=%s; Path=/" % token)
+                    self.end_headers()
+                    self.wfile.write((
+                        "<form method=post action=/login>"
+                        "<input type='hidden' name='csrf_token' value='%s'>"
+                        "<input name=username><input name=password type=password>"
+                        "</form>" % token).encode())
+                elif self.path == "/dashboard":                # protected: body differs
+                    self._reply(200, good if self._authed() else anon)
+                elif self.path == "/notes" and broken_path:    # broken: same either way
+                    self._reply(200, good)
+                elif self.path == "/internal" and header_gated:  # authz trusts a client header
+                    spoofed = any(self.headers.get(h) for h in spoof_headers)
+                    self._reply(200, good) if spoofed else self._reply(403, b"forbidden")
+                else:
+                    self._reply(404, b"missing")
+
+            def do_POST(self):
+                if self.path != "/login":
+                    self._reply(404)
+                    return
+                n = int(self.headers.get("Content-Length") or 0)
+                from urllib.parse import parse_qs
+                q = parse_qs(self.rfile.read(n).decode())
+                user = (q.get("username") or [""])[0]
+                pw = (q.get("password") or [""])[0]
+                if csrf:                                       # token must match the issued one
+                    cookie = self.headers.get("Cookie") or ""
+                    issued = ""
+                    for part in cookie.split(";"):
+                        if part.strip().startswith("pre="):
+                            issued = part.strip()[4:]
+                    if not issued or (q.get("csrf_token") or [""])[0] != issued:
+                        self._reply(403, b"missing or stale CSRF token")
+                        return
+                if require_field is not None:                  # a hidden field the form needs
+                    fname, fval = require_field
+                    if (q.get(fname) or [""])[0] != fval:
+                        self._reply(401, b"missing or wrong hidden field")
+                        return
+                if always_cookie:                              # cookie + 200 no matter what
+                    self.send_response(200)
+                    self.send_header("Set-Cookie", "session=anon; Path=/")
+                    self.end_headers()
+                    return
+                if users.get(user) == pw:
+                    self.send_response(302)
+                    val = signed_cookie if signed_cookie else ("tok-%s" % user)
+                    cookie = "session=%s; Path=/" % val
+                    if secure:
+                        cookie += "; HttpOnly; Secure; SameSite=Lax"
+                    self.send_header("Set-Cookie", cookie)
+                    self.send_header("Location", "/dashboard")
+                    self.end_headers()
+                elif user in users and leak:                   # known user -> distinct message
+                    self._reply(401, b"that password is wrong for this known account")
+                else:                                          # same for all when not leaking
+                    self._reply(401, b"login failed" if not leak else b"no such user")
+        return H
+
+    def _serve(self, **kw):
+        import socket
+        import threading
+        from http.server import ThreadingHTTPServer
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        srv = ThreadingHTTPServer(("127.0.0.1", port), self._app(**kw))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv, "http://127.0.0.1:%d" % port
+
+    def _run(self, monkeypatch, *, env, **appkw):
+        import json as _json
+        for k in list(os.environ):
+            if k.startswith("SQUAWK_WEBAUTH_"):
+                monkeypatch.delenv(k, raising=False)
+        for k, v in env.items():
+            monkeypatch.setenv(k, v)
+        srv, base = self._serve(**appkw)
+        try:
+            ctx = squawk.RunContext(base, "url", "/run", base)
+            out = squawk.probes.webauth_probe(ctx)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        if isinstance(out, tuple):
+            return out, None
+        return None, _json.loads(out)
+
+    # -- the config, from the environment ------------------------------------ #
+
+    def test_config_derives_login_from_target_and_reads_identities(self, monkeypatch):
+        for k in list(os.environ):
+            if k.startswith("SQUAWK_WEBAUTH_"):
+                monkeypatch.delenv(k, raising=False)
+        monkeypatch.setenv("SQUAWK_WEBAUTH_A", "alice:password1")
+        monkeypatch.setenv("SQUAWK_WEBAUTH_B", "bob:letmein")
+        cfg = squawk.probes._webauth_config("http://t.example/")
+        assert cfg["login"] == "http://t.example/login", "default path is /login"
+        assert cfg["identities"] == {"A": ("alice", "password1"), "B": ("bob", "letmein")}
+        monkeypatch.setenv("SQUAWK_WEBAUTH_PATH", "/auth/signin")
+        monkeypatch.setenv("SQUAWK_WEBAUTH_FIELDS", "email,pass")
+        cfg = squawk.probes._webauth_config("http://t.example")
+        assert cfg["login"] == "http://t.example/auth/signin"
+        assert (cfg["user_field"], cfg["pass_field"]) == ("email", "pass")
+        monkeypatch.setenv("SQUAWK_WEBAUTH_LOGIN", "http://t.example/custom")
+        assert squawk.probes._webauth_config("http://t.example")["login"] == \
+            "http://t.example/custom", "a full LOGIN url overrides target+PATH"
+
+    def test_no_identity_is_a_gap(self, monkeypatch):
+        out, _ = self._run(monkeypatch, env={})
+        assert out is not None and out[1] == "gap" and "SQUAWK_WEBAUTH_A" in out[2]
+
+    def test_a_login_that_never_takes_is_an_error(self, monkeypatch):
+        out, _ = self._run(monkeypatch, env={"SQUAWK_WEBAUTH_A": "alice:WRONG"})
+        assert out is not None and out[1] == "error", out
+
+    # -- the checks, against the live app ------------------------------------ #
+
+    def test_a_weak_login_app_raises_every_check(self, monkeypatch):
+        _, data = self._run(monkeypatch, env={
+            "SQUAWK_WEBAUTH_A": "alice:password1", "SQUAWK_WEBAUTH_B": "bob:letmein",
+            "SQUAWK_WEBAUTH_PATHS": "/dashboard,/notes"})
+        assert data is not None and data["tested"] == 5
+        checks = {f["check"] for f in data["findings"]}
+        assert checks == {"session-cookie-flags", "login-user-enumeration",
+                          "unauthenticated-access"}, data["findings"]
+        unauth = {f["where"] for f in data["findings"] if f["check"] == "unauthenticated-access"}
+        assert unauth == {"/notes"}, "the broken path is flagged, the protected one is not"
+
+    def test_a_hardened_login_app_is_clean(self, monkeypatch):
+        # A Secure cookie is stored by the jar but not sent back over plain http,
+        # so a protected-path check cannot run over loopback; the weak case above
+        # already proves a protected path is not flagged. Here: a cookie with
+        # every flag and a login that does not leak -> no finding.
+        _, data = self._run(monkeypatch, env={
+            "SQUAWK_WEBAUTH_A": "alice:password1", "SQUAWK_WEBAUTH_B": "bob:letmein"},
+            secure=True, leak=False, broken_path=False)
+        assert data is not None and data["tested"] == 5
+        assert data["findings"] == [], "flagged cookie and no enum -> nothing"
+
+    def test_the_check_registry_can_be_limited(self, monkeypatch):
+        _, data = self._run(monkeypatch, env={
+            "SQUAWK_WEBAUTH_A": "alice:password1",
+            "SQUAWK_WEBAUTH_CHECKS": "session-cookie-flags"})
+        assert data is not None and data["checks"] == ["session-cookie-flags"]
+        assert {f["check"] for f in data["findings"]} <= {"session-cookie-flags"}
+
+    # -- the report shape ----------------------------------------------------- #
+
+    def test_the_report_reads_into_one_finding_per_check_and_where(self):
+        import json as _json
+        raw = _json.dumps({"login": "http://x/login", "tested": 3, "findings": [
+            {"check": "session-cookie-flags", "detail": "cookie session is missing HttpOnly",
+             "severity": "medium", "where": "login"},
+            {"check": "unauthenticated-access", "detail": "/notes answers with no session",
+             "severity": "high", "where": "/notes"}]})
+        got = {f.detail["rule"]: f for f in squawk.norm_webauth(raw, "/b")}
+        assert sorted(got) == ["session-cookie-flags", "unauthenticated-access"]
+        assert got["unauthenticated-access"].severity == "high"
+        assert got["unauthenticated-access"].identity == "unauthenticated-access:/notes"
+        assert "A01" in got["unauthenticated-access"].detail["reference"]
+        assert "Session_Management" in got["session-cookie-flags"].detail["reference"]
+
+    def test_coverage_counts_checks_and_zero_is_a_gap(self):
+        import json as _json
+        cov = squawk.scanners._cov_webauth(_json.dumps({"tested": 3}))
+        assert (cov.examined, cov.unit) == (3, "authenticated checks")
+        assert squawk.scanners._cov_webauth(_json.dumps({"tested": 0})).examined == 0
+        assert squawk.scanners._cov_webauth("{}").examined is None
+
+    def test_it_is_registered_in_authdast_and_retests(self):
+        sc = squawk.SCANNERS["webauth"]
+        assert (sc.kind, sc.internal, sc.network) == ("dast", True, True)
+        assert squawk.SERVICES["authdast"].stages == ("webauth",)
+        assert squawk.SERVICES["authdast"].scope == "url"
+        f = {"scanner": "webauth", "identity": "unauthenticated-access:/notes",
+             "path": "/notes", "detail": {"rule": "unauthenticated-access"}}
+        assert squawk.report.retest_for(f) == (
+            "squawk run authdast --target <url>: unauthenticated-access no longer reported")
+
+    # -- regression: the review's findings must not come back ---------------- #
+
+    def test_a_login_url_on_another_host_is_refused(self, monkeypatch):
+        """The private-target rail gated --target; a SQUAWK_WEBAUTH_LOGIN pointing
+        at a different host (the metadata endpoint, say) must be refused, or the
+        probe connects somewhere nothing cleared."""
+        out, _ = self._run(monkeypatch, env={
+            "SQUAWK_WEBAUTH_A": "alice:password1",
+            "SQUAWK_WEBAUTH_LOGIN": "http://169.254.169.254/latest/login"})
+        assert out is not None and out[1] == "error", out
+        assert "not the --target host" in out[2]
+
+    def test_an_absolute_path_is_refused_from_paths(self):
+        """An absolute URL in SQUAWK_WEBAUTH_PATHS would escape the gated origin
+        via urljoin; it is dropped, only relative paths survive."""
+        import os as _os
+        for k in list(_os.environ):
+            if k.startswith("SQUAWK_WEBAUTH_"):
+                _os.environ.pop(k)
+        _os.environ["SQUAWK_WEBAUTH_PATHS"] = "/ok,http://evil.example/x,//evil2/y"
+        try:
+            cfg = squawk.probes._webauth_config("http://127.0.0.1:8080")
+        finally:
+            _os.environ.pop("SQUAWK_WEBAUTH_PATHS", None)
+        assert cfg["paths"] == ["/ok"]
+        assert cfg["dropped_paths"] == ["http://evil.example/x", "//evil2/y"]
+
+    def test_a_secure_cookie_over_http_does_not_fire_a_false_unauth_finding(self, monkeypatch):
+        """A Secure cookie is not sent over plain http, so the authed request to a
+        protected path carries no session — the check must SKIP that path, not
+        report a correctly-hardened app as broken access control."""
+        _, data = self._run(monkeypatch, env={
+            "SQUAWK_WEBAUTH_A": "alice:password1",
+            "SQUAWK_WEBAUTH_PATHS": "/notes"},        # /notes is "broken" in the stub
+            secure=True)
+        assert data is not None
+        unauth = [f for f in data["findings"] if f["check"] == "unauthenticated-access"]
+        assert unauth == [], "a session the probe could not carry is not a finding"
+
+    def test_a_cookie_set_regardless_of_credentials_is_not_authentication(self, monkeypatch):
+        """An app that sets a session cookie on every login (CSRF/anon cookie)
+        must not be read as authenticated when the credentials were wrong."""
+        out, _ = self._run(monkeypatch, env={"SQUAWK_WEBAUTH_A": "alice:password1"},
+                           always_cookie=True)
+        assert out is not None and out[1] == "error", out
+        assert "same with valid and invalid credentials" in out[2]
+
+    def test_a_check_that_raises_is_an_error_not_a_clean_check(self, monkeypatch):
+        """A check that raises is counted as an error and surfaced in coverage —
+        never swallowed into a clean zero (Squawk's own thesis)."""
+        monkeypatch.setitem(squawk.probes._WEBAUTH_CHECKS, "boom",
+                            lambda s, c: (_ for _ in ()).throw(RuntimeError("kaboom")))
+        _, data = self._run(monkeypatch, env={
+            "SQUAWK_WEBAUTH_A": "alice:password1", "SQUAWK_WEBAUTH_B": "bob:letmein"})
+        assert data is not None
+        assert "boom" in data["errors"] and "boom" not in data["checks"]
+        cov = squawk.scanners._cov_webauth(json.dumps(data))
+        assert cov.errors >= 1 and "could not run" in cov.note
+
+    def test_a_login_needing_a_hidden_field_cannot_authenticate_without_extra(self, monkeypatch):
+        """A login that needs a hidden field (an OAuth client_id, a CSRF token)
+        is not satisfied by username+password alone — the probe fails closed."""
+        out, _ = self._run(monkeypatch, env={"SQUAWK_WEBAUTH_A": "alice:password1"},
+                           require_field=("token", "canary"))
+        assert out is not None and out[1] == "error", out
+
+    def test_extra_static_fields_satisfy_a_hidden_field_login(self, monkeypatch):
+        """SQUAWK_WEBAUTH_EXTRA supplies the hidden fields, so the same login now
+        authenticates and the checks run (how authdast reaches an OAuth-style
+        form such as the target app's /oauth/authorize)."""
+        _, data = self._run(monkeypatch, env={
+            "SQUAWK_WEBAUTH_A": "alice:password1",
+            "SQUAWK_WEBAUTH_EXTRA": "token=canary"},
+            require_field=("token", "canary"))
+        assert data is not None and data["tested"] == 5
+        assert "A" in data["identities"], data["logins"]
+
+    def test_extra_is_parsed_and_credentials_win_over_it(self):
+        import os as _os
+        for k in list(_os.environ):
+            if k.startswith("SQUAWK_WEBAUTH_"):
+                _os.environ.pop(k)
+        _os.environ["SQUAWK_WEBAUTH_EXTRA"] = "client_id=acme-web,redirect_uri=http://h/cb"
+        try:
+            cfg = squawk.probes._webauth_config("http://h")
+        finally:
+            _os.environ.pop("SQUAWK_WEBAUTH_EXTRA", None)
+        assert cfg["extra"] == {"client_id": "acme-web", "redirect_uri": "http://h/cb"}
+
+    def test_a_dynamic_csrf_token_login_authenticates_by_scraping_the_form(self, monkeypatch):
+        """A login carrying a per-request anti-CSRF token (DVWA's user_token and
+        kin) cannot be satisfied by a static field: the token changes every
+        request and is bound to the session. The probe GETs the form through the
+        same opener, resubmits the hidden token, and so logs in and runs every
+        check — no SQUAWK_WEBAUTH_EXTRA needed."""
+        _, data = self._run(monkeypatch, env={"SQUAWK_WEBAUTH_A": "alice:password1"},
+                            csrf=True)
+        assert data is not None and data["tested"] == 5, data
+        assert "A" in data["identities"], data["logins"]
+
+    def test_form_hidden_fields_are_read_whatever_the_quoting(self):
+        """_webauth_form_hidden pulls name/value from hidden inputs regardless of
+        single, double or absent quotes and attribute order, and ignores visible
+        inputs."""
+        class _Op:
+            def __init__(self, body):
+                self._body = body
+
+            def open(self, *a, **k):
+                body = self._body
+
+                class _R:
+                    def getcode(self):
+                        return 200
+
+                    def read(self, *a):
+                        return body.encode()
+                    headers = type("H", (), {"get_all": lambda self, k: []})()
+                return _R()
+        html = ("<input type=\"hidden\" name=\"csrf_token\" value=\"abc123\">"
+                "<input name='authenticity_token' type='hidden' value='x/y+z=='>"
+                "<input type=hidden name=state value=bare>"
+                "<input type=text name=username value=visible>")
+        hidden = squawk.probes._webauth_form_hidden(_Op(html), "http://h/login")
+        assert hidden == {"csrf_token": "abc123",
+                          "authenticity_token": "x/y+z==",
+                          "state": "bare"}
+
+    def test_scraped_token_defers_to_extra_and_credentials(self, monkeypatch):
+        """Precedence: a scraped hidden field is only a default. An operator's
+        SQUAWK_WEBAUTH_EXTRA overrides it, and the credentials override all."""
+        posted = {}
+
+        def _fake_send(opener, url, method="GET", data=None, **kw):
+            if method == "POST":
+                posted.update(data)
+            return 302, "", []
+        monkeypatch.setattr(squawk.probes, "_webauth_send", _fake_send)
+        monkeypatch.setattr(squawk.probes, "_webauth_form_hidden",
+                            lambda opener, url: {"csrf_token": "scraped", "username": "wrong"})
+        cfg = {"login": "http://h/login", "method": "POST",
+               "user_field": "username", "pass_field": "password",
+               "extra": {"csrf_token": "operator"}}
+        squawk.probes._webauth_login(cfg, "alice", "password1")
+        assert posted["csrf_token"] == "operator"      # EXTRA wins over the scrape
+        assert posted["username"] == "alice"           # credentials win over both
+        assert posted["password"] == "password1"
+
+    # -- the two checks that cover the logic bugs a scanner cannot ----------- #
+
+    def test_flask_session_key_verifier_matches_only_the_right_key(self):
+        """The stdlib Flask/itsdangerous verifier accepts a cookie only under its
+        real signing key, and rejects a wrong key and malformed input."""
+        cookie = self._sign_flask_cookie("the-real-key")
+        assert squawk.probes._flask_session_key_matches(cookie, "the-real-key") is True
+        assert squawk.probes._flask_session_key_matches(cookie, "a-wrong-key") is False
+        assert squawk.probes._flask_session_key_matches("not-a-cookie", "the-real-key") is False
+        assert squawk.probes._flask_session_key_matches("a.b", "the-real-key") is False
+
+    def test_header_trust_check_catches_a_spoofable_authz_header(self, monkeypatch):
+        """A path denied anonymously but served when a client header is spoofed is
+        flagged, with the header named; a path denied regardless is not."""
+        _, data = self._run(monkeypatch, env={
+            "SQUAWK_WEBAUTH_A": "alice:password1",
+            "SQUAWK_WEBAUTH_PATHS": "/internal,/dashboard",
+            "SQUAWK_WEBAUTH_CHECKS": "header-trust-authz"},
+            header_gated=True)
+        assert data is not None
+        hits = [f for f in data["findings"] if f["check"] == "header-trust-authz"]
+        assert [f["where"] for f in hits] == ["/internal"], data["findings"]
+        assert "X-Forwarded-For" in hits[0]["detail"]
+
+    def test_header_trust_check_is_quiet_when_no_header_opens_a_path(self, monkeypatch):
+        """With no header-gated path, the check fires nothing (no false positive)."""
+        _, data = self._run(monkeypatch, env={
+            "SQUAWK_WEBAUTH_A": "alice:password1",
+            "SQUAWK_WEBAUTH_PATHS": "/internal",
+            "SQUAWK_WEBAUTH_CHECKS": "header-trust-authz"},
+            header_gated=False)
+        assert data is not None
+        assert [f for f in data["findings"] if f["check"] == "header-trust-authz"] == []
+
+    def test_weak_session_key_check_confirms_a_forgeable_cookie(self, monkeypatch):
+        """When the login cookie is signed with a supplied candidate key, the
+        check confirms it (critical) and never echoes the key value."""
+        _, data = self._run(monkeypatch, env={
+            "SQUAWK_WEBAUTH_A": "alice:password1",
+            "SQUAWK_WEBAUTH_SECRETS": "known-weak-key",
+            "SQUAWK_WEBAUTH_CHECKS": "weak-session-key"},
+            signed_key="known-weak-key")
+        assert data is not None
+        hits = [f for f in data["findings"] if f["check"] == "weak-session-key"]
+        assert len(hits) == 1 and hits[0]["severity"] == "critical", data["findings"]
+        assert "known-weak-key" not in hits[0]["detail"], "the key value must not reach the report"
+
+    def test_weak_session_key_check_is_quiet_when_the_key_is_not_known(self, monkeypatch):
+        """A cookie signed with a key that is neither supplied nor common is not
+        flagged — no false positive, and no echo of guesses."""
+        _, data = self._run(monkeypatch, env={
+            "SQUAWK_WEBAUTH_A": "alice:password1",
+            "SQUAWK_WEBAUTH_CHECKS": "weak-session-key"},
+            signed_key="S3cr3t-unguessable-9f3c2a-not-in-any-list")
+        assert data is not None
+        assert [f for f in data["findings"] if f["check"] == "weak-session-key"] == []

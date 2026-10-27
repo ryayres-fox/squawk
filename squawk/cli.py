@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from squawk.analysis import (
     comparable_runs,
@@ -25,10 +25,12 @@ from squawk.analysis import (
     verify_state,
 )
 from squawk.baselines import resolve_gh_repo, sync_baselines
+from squawk.checklist import grep_sweep
 from squawk.core import (
     DB_STALE_DAYS,
     DEFAULT_EVIDENCE,
     DEFAULT_PORT,
+    DISPOSITION_TEMPLATE,
     FEEDS_DIRNAME,
     LOG,
     NOTE_TEMPLATE,
@@ -38,10 +40,12 @@ from squawk.core import (
     SUPPORTING,
     ProfileError,
     __version__,
+    disposition_problems,
     env,
     evidence_writable,
     guard_host,
     human_seconds,
+    load_profile,
     mask_account,
     note_problems,
     parse_note,
@@ -49,16 +53,20 @@ from squawk.core import (
     resolve_repo,
     setup_logging,
     show_setting,
+    slug,
+    split_note_blocks,
     sync_root,
     tool_path,
     tool_version,
     vuln_db_ages,
 )
 from squawk.decisions import who
+from squawk.engagements import assign, engagements_path, load_engagements, unassign
 from squawk.engine import (
     execute_service,
     profile_for,
     stage_rows,
+    write_disposition,
     write_note,
 )
 from squawk.evidence import (
@@ -81,7 +89,16 @@ from squawk.installer import (
     run_installer,
 )
 from squawk.probes import self_audit_checks
-from squawk.report import report_markdown
+from squawk.report import (
+    AUDIENCES,
+    SHARE_FORMATS,
+    decision_for,
+    load_dispositions,
+    report_markdown,
+    today_utc,
+    tracked_keys,
+    write_share,
+)
 from squawk.retention import (
     DEFAULT_DROP_DAYS,
     DEFAULT_TRIM_DAYS,
@@ -93,6 +110,7 @@ from squawk.runtime import read_pid_file
 from squawk.sarif import sarif_document
 from squawk.service import cmd_install_service, cmd_status, cmd_stop, serve_web, start_daemon
 from squawk.stages import (
+    DOMAINS,
     SERVICES,
     ZAP_IMAGE,
     aws_identity,
@@ -571,7 +589,8 @@ def profile_lines(summ: dict) -> List[str]:
         return ["Profile : none — built-in values"]
     changed = summ.get("changed") or []
     extra = summ.get("extra_args") or {}
-    n = len(changed) + len(extra)
+    rules = summ.get("semgrep_rules") or []
+    n = len(changed) + len(extra) + (1 if rules else 0)
     lines = ["Profile : %s (%s) — %s" % (
         summ["path"], summ["source"],
         ("%d value(s) differ from the built-in" % n) if n
@@ -583,6 +602,9 @@ def profile_lines(summ: dict) -> List[str]:
     for tool, args in sorted(extra.items()):
         lines.append("  %-13s %-26s + %s   [scanners.%s]"
                      % (tool, "extra_args", " ".join(args), tool))
+    for r in rules:
+        lines.append("  %-13s %-26s + %s (%d rule file(s))   [scanners.semgrep]"
+                     % ("semgrep", "rules", r["path"], r["files"]))
     for note in summ.get("notes") or []:
         lines.append("  note: %s" % note)
     return lines
@@ -746,6 +768,57 @@ def _edit(text: str) -> Optional[str]:
             pass
 
 
+def _notes_from_file(args: argparse.Namespace, target: str) -> int:
+    """`note --from FILE`: every note block in the file, all or none.
+
+    Each block is checked before any is written. A file where one note is
+    incomplete records nothing and names every problem with its block number,
+    so a review handed over as many notes never lands half in the locker."""
+    try:
+        with open(os.path.expanduser(args.from_file), encoding="utf-8") as fh:
+            blocks = split_note_blocks(fh.read())
+    except OSError as exc:
+        sys.stderr.write("Cannot read %s: %s\n" % (args.from_file, exc.strerror or exc))
+        return 2
+    if not blocks:
+        sys.stderr.write("No note in %s: a note starts with a title: line.\n"
+                         % args.from_file)
+        return 2
+    parsed = [parse_note(b) for b in blocks]
+    bad: List[Tuple[int, str]] = []
+    seen: Dict[str, int] = {}
+    for n, fields in enumerate(parsed, 1):
+        title = (fields.get("title") or "").strip()
+        for problem in note_problems(fields):
+            bad.append((n, "block %d (%s): %s" % (n, title or "untitled", problem)))
+        key = slug(title)
+        if title and key in seen:
+            bad.append((n, "block %d repeats the title of block %d: one identity, "
+                           "one note" % (n, seen[key])))
+        seen.setdefault(key, n)
+    if bad:
+        sys.stderr.write("Not recorded — %d of %d note(s) in %s need fixing:\n"
+                         % (len({n for n, _ in bad}), len(blocks), args.from_file))
+        for _n, line in bad:
+            sys.stderr.write("  %s\n" % line)
+        sys.stderr.write("Nothing was written.\n")
+        return 2
+    root = args.evidence or env("EVIDENCE") or DEFAULT_EVIDENCE
+    print("Recording %d note(s) from %s" % (len(parsed), args.from_file))
+    for fields in parsed:
+        out = write_note(root, target, fields, attachments=args.attach,
+                         session=args.session)
+        print("  %s" % out["identity"])
+    if args.attach:
+        print("Attached to each: %s"
+              % ", ".join(os.path.basename(a) for a in args.attach))
+    if args.session:
+        print("Session  : %s" % args.session)
+    print("\nThese are findings recorded by hand. None is a scan: nothing was "
+          "enumerated.")
+    return 0
+
+
 def cmd_note(args: argparse.Namespace) -> int:
     """Record a finding an operator found, as a sealed run.
 
@@ -765,6 +838,8 @@ def cmd_note(args: argparse.Namespace) -> int:
     if missing:
         sys.stderr.write("No such file: %s\n" % ", ".join(missing))
         return 2
+    if args.from_file:
+        return _notes_from_file(args, target)
 
     head = ("# target: %s\n# session: %s\n"
             % (target, args.session or "(none)"))
@@ -800,6 +875,188 @@ def cmd_note(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_disposition(args: argparse.Namespace) -> int:
+    """`disposition SESSION --from FILE`: decisions about the session's
+    findings, as one sealed run, all or none.
+
+    Every block is checked before anything is written, and each must name a
+    finding the session holds, by the ID the report and its CSV print: a
+    decision about a finding that does not exist is a record of nothing.
+    With no --from, the decisions in force and the template."""
+    root = args.evidence or env("EVIDENCE") or DEFAULT_EVIDENCE
+    session = (args.disposition or "").strip()
+    if not session:
+        sys.stderr.write("A decision belongs to a session: which engagement it is about.\n"
+                         "  squawk disposition thm-blue --from decisions.txt\n")
+        return 2
+    try:
+        known = tracked_keys(root, session)
+        policy = load_profile(root).remediation()
+    except ValueError as exc:
+        sys.stderr.write("Refused: %s.\n" % exc)
+        return 2
+    if not args.from_file:
+        # Every decision run in the root: one recorded in an earlier session
+        # on the same target still applies to the finding here.
+        decided, unreadable = load_dispositions(
+            sorted(list_runs(root), key=lambda m: str(m.get("run_id") or "")))
+        shown = 0
+        for fid, k in sorted(known.items()):
+            d = decision_for(decided, [(t, i) for t in k["targets"] for i in k["identities"]])
+            if d:
+                shown += 1
+                print("  %-14s by %s%s · run %s\n    %s" % (
+                    d.get("state"), d.get("by"),
+                    " until %s" % d["expires"] if d.get("expires") else "", d.get("run"), fid))
+        if not shown:
+            print("No decision recorded about the findings in session %r." % session)
+        for rid in unreadable:
+            print("  run %s: its decisions could not be read; squawk verify says why" % rid)
+        print("\nRecord decisions with: squawk disposition %s --from FILE\n"
+              "The file, one block per decision, separated by ---:\n" % session)
+        sys.stdout.write(DISPOSITION_TEMPLATE)
+        return 0
+    try:
+        with open(os.path.expanduser(args.from_file), encoding="utf-8") as fh:
+            blocks = split_note_blocks(fh.read())
+    except OSError as exc:
+        sys.stderr.write("Cannot read %s: %s\n" % (args.from_file, exc.strerror or exc))
+        return 2
+    parsed = [parse_note(b) for b in blocks]
+    parsed = [f for f in parsed if any((v or "").strip() for v in f.values())]
+    if not parsed:
+        sys.stderr.write("No decision in %s: a decision starts with a finding: line.\n"
+                         % args.from_file)
+        return 2
+    today = today_utc()
+    bad: List[str] = []
+    seen: Dict[str, int] = {}
+    for n, fields in enumerate(parsed, 1):
+        fid = (fields.get("finding") or "").strip()
+        for problem in disposition_problems(fields, today, policy["accept_max_days"][0]):
+            bad.append("block %d: %s" % (n, problem))
+        if fid and fid not in known:
+            bad.append("block %d: no finding %r in session %r; the IDs are the report's "
+                       "ID lines and the CSV's id column" % (n, fid, session))
+        if fid in seen:
+            bad.append("block %d decides the same finding as block %d: one decision "
+                       "per finding per file" % (n, seen[fid]))
+        seen.setdefault(fid, n)
+    if bad:
+        sys.stderr.write("Not recorded — %d problem(s) in %s:\n" % (len(bad), args.from_file))
+        for line in bad:
+            sys.stderr.write("  %s\n" % line)
+        sys.stderr.write("Nothing was written.\n")
+        return 2
+    out = write_disposition(root, session, parsed, known)
+    print("Recorded %s decision(s) for session %s" % (out["decisions"], session))
+    print("  Run      : %s" % out["run_dir"])
+    for fields in parsed:
+        print("  %-14s %s" % (fields["state"].strip().lower(), fields["finding"].strip()))
+    print("\nEach is sealed with the evidence. A later decision about the same finding "
+          "replaces\nit in the report; this one stays on record.")
+    return 0
+
+
+def _share_report(args: argparse.Namespace, root: str, session: str) -> int:
+    """`report SESSION --share --out DIR`: the copy somebody else can be handed.
+
+    Redacted and de-duplicated (squawk/report.py, plan 14), written to files
+    rather than stdout so the Markdown and the page always travel together, and
+    never into the evidence root."""
+    if not args.out:
+        sys.stderr.write("--share writes files: name a directory with --out.\n"
+                         "  squawk report %s --share --out ~/reports\n" % session)
+        return 2
+    try:
+        paths, model = write_share(root, session, os.path.expanduser(args.out),
+                                   args.format, verify=verify_state(root),
+                                   audience=args.audience)
+    except ValueError as exc:
+        sys.stderr.write("Refused: %s.\n" % exc)
+        return 2
+    except RuntimeError as exc:
+        sys.stderr.write("No PDF: %s.\n" % exc)
+        return 1
+    if not model["runs"]:
+        sys.stderr.write("No run carries the session tag %r; the files say so.\n" % session)
+    for path in paths:
+        print("wrote %s" % path)
+    print("%d distinct finding(s), %d recorded by the reviewer, from %d run(s). "
+          "Local paths, the user and host names and email addresses are removed."
+          % (model["distinct"], len(model["reviewer"]), model["runs"]))
+    return 0
+
+
+def cmd_engagements(args: argparse.Namespace) -> int:
+    """List or edit the target→engagement mapping the web UI groups and scopes
+    by. The mapping assigns existing targets without re-scanning; a run's own
+    `--engagement` tag is the fallback when a target is unmapped."""
+    root = args.evidence or env("EVIDENCE") or DEFAULT_EVIDENCE
+    items = list(args.engagements or [])
+    action = (items[0] if items else "list").lower()
+    rest = items[1:]
+    if action == "list":
+        assignments = load_engagements(root).get("assignments") or []
+        if not assignments:
+            print("No engagements mapped in %s." % engagements_path(root))
+            print('Assign one:  squawk engagements assign "Acme web app" acme-*')
+            return 0
+        print("Engagements in %s:" % engagements_path(root))
+        for a in assignments:
+            print("  %-28s %s" % (a.get("engagement", ""), " ".join(a.get("match") or [])))
+        return 0
+    if action == "assign":
+        if len(rest) < 2:
+            sys.stderr.write("usage: squawk engagements assign NAME PATTERN [PATTERN ...]\n")
+            return 2
+        try:
+            assign(root, rest[0], rest[1:])
+        except ValueError as exc:
+            sys.stderr.write("engagements: %s\n" % exc)
+            return 2
+        print("Assigned to %s: %s" % (rest[0], " ".join(rest[1:])))
+        return 0
+    if action == "unassign":
+        if not rest:
+            sys.stderr.write("usage: squawk engagements unassign PATTERN [PATTERN ...]\n")
+            return 2
+        unassign(root, rest)
+        print("Removed: %s" % " ".join(rest))
+        return 0
+    sys.stderr.write("engagements: unknown action %r (use list, assign, unassign)\n" % action)
+    return 2
+
+
+def cmd_greps(args: argparse.Namespace) -> int:
+    """The manual-review grep sweep — a backup to the scanners, grouped by the
+    checklist's coverage areas. Every hit is a line to read, not a finding."""
+    items = list(args.greps or [])
+    if not items:
+        sys.stderr.write("usage: squawk greps DIR [AREA]\n")
+        return 2
+    target = items[0]
+    area = " ".join(items[1:]) or None
+    if not os.path.isdir(target):
+        sys.stderr.write("not a directory: %s\n" % target)
+        return 2
+    total = 0
+    for name, hits in grep_sweep(target, area):
+        total += len(hits)
+        print("\n=== %s ===" % name)
+        if not hits:
+            print("  (no hits — read the code anyway; grep misses what it has no pattern for)")
+            continue
+        last = None
+        for label, rel, line_no, text in hits:
+            if label != last:
+                print("  * %s" % label)
+                last = label
+            print("    %s:%d: %s" % (rel, line_no, text))
+    print("\n%d line(s) to look at. A hit is a place to LOOK, not a finding." % total)
+    return 0
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     """One engagement as markdown on stdout.
 
@@ -814,6 +1071,8 @@ def cmd_report(args: argparse.Namespace) -> int:
             "  squawk report thm-blue --evidence ~/squawk-work\n"
             "Tag runs and notes with --session NAME as you go.\n")
         return 2
+    if args.share:
+        return _share_report(args, root, session)
     text, count = report_markdown(root, session, verify=verify_state(root))
     sys.stdout.write(text)
     if not text.endswith("\n"):
@@ -913,6 +1172,9 @@ def cmd_verify(args: argparse.Namespace) -> int:
                 print("  %s  %s %s by %s" % (r["at"], what, r["run_id"], r["by"] or "?"))
         led = report["ledger"]
         print("\nDecisions ledger: %s — %s" % (led["state"], led["detail"]))
+        chk = report.get("checklist") or {}
+        if chk:
+            print("Checklist ledger: %s — %s" % (chk["state"], chk["detail"]))
         print("\n%s" % report["summary"])
         print("\nWhat this proves: no file in a verified run changed since the run "
               "wrote it,\nand each run proves the one before it existed. What it does "
@@ -998,7 +1260,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", nargs="+", metavar="ARG",
                    help="config show SERVICE [TARGET]: the effective profile, "
                         "without running anything")
-    p.add_argument("--port", type=int, default=DEFAULT_PORT, help="web UI port")
+    # No parser default, on purpose: `stop` has to tell a port the operator
+    # typed from the built-in one, and a default is indistinguishable from
+    # typing it. main() fills in DEFAULT_PORT for everything that serves.
+    p.add_argument("--port", type=int, default=None,
+                   help="web UI port (default %d)" % DEFAULT_PORT)
     p.add_argument("--host", default="127.0.0.1", help="loopback only")
     p.add_argument("--gh-repo", help="owner/name for GitHub baselines")
     p.add_argument("--doctor", action="store_true", help="preflight and exit")
@@ -1026,9 +1292,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--note", action="store_true",
                    help="record a finding you found yourself: opens $EDITOR "
                         "with a template, writes it as a sealed run")
-    p.add_argument("--session", default="", metavar="NAME",
-                   help="the engagement this run or note belongs to, so a "
-                        "report can be compiled from it later")
+    p.add_argument("--from", dest="from_file", metavar="FILE",
+                   help="with note: record every note in FILE without opening an "
+                        "editor (fenced blocks starting with title:, or blocks "
+                        "separated by ---); all or none. With disposition: every "
+                        "decision in FILE, blocks separated by ---; all or none")
+    p.add_argument("--disposition", nargs="?", const="", metavar="SESSION",
+                   help="record decisions about a session's findings (in progress, "
+                        "fixed, risk accepted, false positive) from --from FILE, as "
+                        "a sealed run; with no --from, list the decisions and print "
+                        "the template")
+    p.add_argument("--session", "--engagement", dest="session", default="", metavar="NAME",
+                   help="the engagement this run or note belongs to (also groups "
+                        "it in the web UI), so a report can be compiled from it later")
+    p.add_argument("--engagements", nargs="*", default=None, metavar="ARG",
+                   help="map targets to engagements for the web UI (no re-scan): "
+                        "`engagements` lists the mapping; `engagements assign NAME "
+                        "PATTERN...` adds target globs (e.g. acme-*); `engagements "
+                        "unassign PATTERN...` removes them")
+    p.add_argument("--greps", nargs="*", default=None, metavar="DIR",
+                   help="manual-review grep sweep, a backup to the scanners, over a "
+                        "directory: `greps DIR [AREA]`. High recall — a hit is a "
+                        "line to read, not a finding. Pairs with the Checklist page")
     p.add_argument("--attach", action="append", default=[], metavar="FILE",
                    help="with note: a file to copy into the run and hash into "
                         "its digest (repeatable). A screenshot that can be "
@@ -1037,6 +1322,21 @@ def build_parser() -> argparse.ArgumentParser:
                    help="compile the runs and notes carrying this session tag "
                         "into one markdown report on stdout, with what each "
                         "service did NOT cover stated before the findings")
+    p.add_argument("--share", action="store_true",
+                   help="with report: write the copy somebody else can be handed, "
+                        "with local paths, user and host names and email addresses "
+                        "removed and each finding listed once, to --out")
+    p.add_argument("--out", metavar="DIR",
+                   help="with report --share: the directory for the report files "
+                        "(refused inside the evidence root)")
+    p.add_argument("--format", choices=SHARE_FORMATS, default="both",
+                   help="with report --share: md, html, both (default), pdf, or "
+                        "csv (every finding as a row). pdf needs headless Chromium")
+    p.add_argument("--audience", choices=AUDIENCES, default="engineer",
+                   help="with report --share: engineer (default: every finding with "
+                        "its location and evidence) or executive (what an attacker "
+                        "can do, the reviewer's findings, what was not covered; "
+                        "html or pdf)")
     p.add_argument("--sarif", nargs="?", const="", metavar="RUN",
                    help="print one run as SARIF 2.1.0 on stdout (default: the "
                         "newest run). A scanner that read nothing is an "
@@ -1074,11 +1374,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def list_services() -> int:
-    print("Services:\n")
-    for s in SERVICES.values():
-        print("  %-11s %-18s %-6s %s" % (s.key, s.label, s.scope, s.rough_time))
-        print("              tools: %s" % ", ".join(s.stages))
-        print("              not covered: %s\n" % s.not_covered)
+    titles = {
+        "web": "Web / network", "code": "Code & supply chain", "cloud": "Cloud",
+        "ai": "AI", "host": "Host (the machine squawk runs on)",
+    }
+    print("Services, by domain:\n")
+    for domain in DOMAINS:
+        in_domain = [s for s in SERVICES.values() if s.domain == domain]
+        if not in_domain:
+            continue
+        print("%s:" % titles.get(domain, domain))
+        for s in in_domain:
+            print("  %-11s %-18s %-6s %s" % (s.key, s.label, s.scope, s.rough_time))
+            print("              tools: %s" % ", ".join(s.stages))
+            print("              not covered: %s\n" % s.not_covered)
     return 0
 
 
@@ -1092,6 +1401,9 @@ SUBCOMMANDS = {
     "sarif": ["--sarif"],
     "note": ["--note"],
     "report": ["--report"],
+    "disposition": ["--disposition"],
+    "engagements": ["--engagements"],
+    "greps": ["--greps"],
 }
 
 
@@ -1112,6 +1424,17 @@ def _translate_argv(argv: Optional[List[str]]) -> List[str]:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(_translate_argv(argv))
+    # Whether a port was TYPED is a fact only the parser knows, and it is the
+    # fact `stop` needs: the port is a check there, and a check that was never
+    # asked for must not run. With a parser default, `stop --evidence X` on a
+    # server at any other port arrived carrying 8787 as if somebody had typed
+    # it, and was refused -- the field check failed 29 of 85 that way, every
+    # later section talking to the server the first one could not stop
+    # (2026-10-09). The four unit tests for the check called cmd_stop directly
+    # and never saw the parser.
+    port_typed = args.port is not None
+    if not port_typed:
+        args.port = DEFAULT_PORT
 
     # The floor, said on every command rather than only in `doctor`. Below it
     # a run still completed and wrote evidence that looked exactly like
@@ -1138,8 +1461,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_status(root0)
     if args.stop:
         # The port is a check, not a selector -- see cmd_stop. Passed through
-        # only when the operator typed one.
-        return cmd_stop(root0, port=args.port if args.port else None)
+        # only when the operator typed one, which `args.port` alone cannot say.
+        return cmd_stop(root0, port=args.port if port_typed else None)
     if args.install_service:
         return cmd_install_service(args, root0)
     if args.restart:
@@ -1192,6 +1515,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_note(args)
     if args.report is not None:
         return cmd_report(args)
+    if args.disposition is not None:
+        return cmd_disposition(args)
+    if args.engagements is not None:
+        return cmd_engagements(args)
+    if args.greps is not None:
+        return cmd_greps(args)
     if args.sarif is not None:
         return cmd_sarif(args)
     if args.verify:
@@ -1222,11 +1551,16 @@ __all__ = [
     'SUBCOMMANDS',
     '_compare_lines',
     '_edit',
+    '_notes_from_file',
     '_raw_of',
+    '_share_report',
     '_short',
     '_translate_argv',
     'build_parser',
     'cmd_config',
+    'cmd_disposition',
+    'cmd_engagements',
+    'cmd_greps',
     'cmd_intel',
     'cmd_note',
     'cmd_prune',

@@ -359,12 +359,41 @@ zap_active_spider_minutes = 30    # -m on zap-full-scan; built-in 10
 
 [scanners.semgrep]
 extra_args = ["--config", "p/owasp-top-ten"]   # appended to the built-in command
+rules = ["~/rules/semgrep"]       # your own rule files, a file or a directory
+
+[remediation]                     # days to fix, from the first run that saw it
+critical = 15                     # built-ins: 15, 30, 90, 180, kev 14
+accept_max_days = 365             # the longest a risk acceptance may run
 ```
 
 The settings are `stage_timeout` (seconds), `zap_spider_minutes` (the live
 probe's `-m`), `zap_active_spider_minutes` and `zap_startup_wait` (the
 active probe's `-m` and `-T`, both minutes), `zap_memory_mb` (below), and
-under `[scanners.<tool>]` only, `extra_args`.
+under `[scanners.<tool>]` only, `extra_args`; under `[scanners.semgrep]`
+only, `rules`. `[remediation]` takes `critical`, `high`, `medium`, `low`,
+`kev` and `accept_max_days`, each a whole number of days.
+
+**`[remediation]` — the deadlines in a report.** Each finding is due a
+number of days after the first sealed run on its target that reported it:
+by severity, or the `kev` window for a known exploited vulnerability when
+that is sooner. Info and unrated findings have none. The built-ins are 15
+and 30 days for critical and high, from the proposed HIPAA Security Rule
+(45 CFR 164.308(a)(4)(ii)(C), not final); 90 and 180 for medium and low,
+FedRAMP's long-standing windows; and 14 for a known exploited one, from CISA
+BOD 26-04. The rule in force sets no deadline, so every report prints each
+window with where it came from, and says when a value was set here instead.
+
+**`rules` — your own semgrep rules.** A list of local `.yml` or `.yaml`
+files, or directories holding them (walked, hidden directories skipped).
+Every service that runs semgrep runs them beside its registry rules. Each
+run copies them into `raw/own-rules/`, records each file's sha256, and runs
+semgrep from beside the copy, so a finding is named `own-rules.<rule id>` on
+any machine. semgrep names a local rule by its path from wherever it was
+started, and pointed at the files where they live, the same rule was
+`Security.semgrep.rules.<id>` from one directory and
+`home.<you>.Security.semgrep.rules.<id>` from another. The profile is
+refused at load when a path is missing, is a URL (a registry pack goes in
+`extra_args`), holds no rule file, or two files share a name.
 
 **`zap_memory_mb` — ZAP's Java heap.** ZAP's launcher takes **a quarter** of
 the memory it believes it has as its heap, and in a container it reads the

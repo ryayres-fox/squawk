@@ -387,7 +387,7 @@ def _fixture_service(monkeypatch, tool, produce, shape=None, coverage=None):
     monkeypatch.setitem(squawk.STAGES, tool, squawk.StageSpec(
         tool, "fixture", None, internal=produce))
     monkeypatch.setitem(squawk.SERVICES, tool, squawk.Service(
-        tool, "Fixture %s" % tool, "host", (tool,), "instant",
+        tool, "Fixture %s" % tool, "host", "host", (tool,), "instant",
         "a fixture, registered by a test"))
     if shape is not None:
         monkeypatch.setitem(squawk.REPORT_SHAPES, tool, shape)

@@ -1,5 +1,6 @@
 """Reading each scanner's output: report shapes, coverage extractors, and the normalizers."""
 
+import hashlib
 import json
 import os
 import re
@@ -26,11 +27,26 @@ REPORT_SHAPES: Dict[str, Tuple[str, ...]] = {
     "gitleaks": (),
     "semgrep": ("results", "errors", "paths"),
     "bandit": ("results", "metrics", "errors"),
-    "checkov": ("results", "summary", "check_type"),
+    # `resource_count` is the flat summary checkov writes, alone, on a tree
+    # with nothing it parses (measured 2026-10-22, checkov 3.3.26). Reading
+    # that as unreadable turned "examined zero resources" into an error.
+    "checkov": ("results", "summary", "check_type", "resource_count"),
+    # A bare list of findings, `[]` when clean (hadolint 2.15.1).
+    "hadolint": (),
+    # The same, from zizmor 1.31.1.
+    "zizmor": (),
+    "dockle": ("summary", "details", "image"),       # dockle 0.4.15
+    "osv-scanner": ("results", "experimental_config"),   # osv-scanner 2.7.0
+    # One JSON object per line, nothing when clean (trufflehog 3.99.2), read
+    # after `scrub_trufflehog`, which is what adds `SecretSHA256`.
+    "trufflehog": ("SourceMetadata", "DetectorName", "SecretSHA256"),
     "trivy": ("Results", "SchemaVersion", "ArtifactName"),
     "syft": ("artifacts", "source", "descriptor"),
     "grype": ("matches", "descriptor", "source"),
     "zap": ("site", "@version", "@generated"),
+    "authz": ("schema",),
+    "webauth": ("login", "findings"),
+    "schemathesis": ("operations", "failures", "exit_code"),
     "awscli": ("Findings",),   # securityhub get-findings: one top-level key
     # The inventory writes its own report, so the shape is ours: what was
     # read, what could not be, and the resources themselves.
@@ -47,6 +63,11 @@ REPORT_SHAPES: Dict[str, Tuple[str, ...]] = {
 }
 
 
+# Reports written as JSON Lines, one object per line, which no single
+# `json.loads` reads. The shape check reads the first line of these.
+JSON_LINES: Tuple[str, ...] = ("trufflehog",)
+
+
 def report_unreadable(tool: str, raw: str) -> Optional[str]:
     """Why this report could not be understood, or None if it could.
 
@@ -60,6 +81,8 @@ def report_unreadable(tool: str, raw: str) -> Optional[str]:
     text = (raw or "").strip()
     if not text:
         return None                       # emptiness is judged elsewhere
+    if tool in JSON_LINES:
+        text = text.splitlines()[0]
     try:
         data = json.loads(text)
     except (json.JSONDecodeError, ValueError):
@@ -91,6 +114,19 @@ def _cov_semgrep(raw: str, stdout: str = "", stderr: str = "") -> Coverage:
                     len(d.get("errors") or []), note)
 
 
+def _cov_zizmor(raw: str, stdout: str = "", stderr: str = "") -> Coverage:
+    """What zizmor read, from its log on stderr: a `completed <path>` line for
+    each input it audited and a `failed to parse input` warning for each it
+    could not (zizmor 1.31.1). Its JSON names neither. With no log line at all
+    the count the stage handed it stands (engine._apply_coverage)."""
+    done = len(re.findall(r"\bcompleted \S", stderr or ""))
+    failed = len(re.findall(r"failed to parse input", stderr or ""))
+    if not done and not failed:
+        return NO_COVERAGE
+    return Coverage(done, "workflow files", 0, failed,
+                    "no workflow could be parsed" if not done else "")
+
+
 def _cov_bandit(raw: str, stdout: str = "", stderr: str = "") -> Coverage:
     d = _report(raw, dict)
     metrics = d.get("metrics") if isinstance(d.get("metrics"), dict) else {}
@@ -104,6 +140,8 @@ def _cov_checkov(raw: str, stdout: str = "", stderr: str = "") -> Coverage:
     total = None
     for block in _checkov_blocks(raw):
         summ = block.get("summary")
+        if not isinstance(summ, dict) and "resource_count" in block:
+            summ = block          # the empty-tree shape: the summary IS the report
         if isinstance(summ, dict) and isinstance(summ.get("resource_count"), int):
             total = (total or 0) + summ["resource_count"]
     return Coverage(total, "resources", 0, 0,
@@ -176,6 +214,68 @@ def _cov_asff(raw: str, stdout: str = "", stderr: str = "") -> Coverage:
 
 
 _ZAP_TOTAL_URLS = re.compile(r"^Total of (\d+) URLs", re.M)
+
+
+#: Schemathesis names each failure by a stable check code; this is where its
+#: documentation describes them.
+_SCHEMATHESIS_DOCS = "https://schemathesis.readthedocs.io/en/stable/reference/checks.html"
+#: Its severities, mapped to Squawk's. A server error (an unhandled 5xx) is the
+#: one that matters most, so it is never softened below high.
+_SCHEMATHESIS_SEV = {"critical": "critical", "high": "high", "medium": "medium",
+                     "low": "low", "warning": "low", "info": "info"}
+
+
+def _cov_schemathesis(raw: str, stdout: str = "", stderr: str = "") -> Coverage:
+    """How much of the API Schemathesis tested: the operations it exercised out
+    of the schema, with the ones it could not reach counted as skipped and the
+    ones that errored as errors. The schema's operation set is the denominator,
+    so a run that tested two of twenty operations never reads as a clean API."""
+    d = _report(raw, dict)
+    ops = d.get("operations") if isinstance(d.get("operations"), dict) else {}
+    tested = ops.get("tested")
+    skipped = ops.get("skipped")
+    if not isinstance(tested, int):
+        return NO_COVERAGE
+    return Coverage(tested, "API operations",
+                    skipped if isinstance(skipped, int) else 0,
+                    len(d.get("errors") or []),
+                    "no operation was tested" if tested == 0 else "")
+
+
+#: BOLA severities. A cross-identity read of an object is the finding; it is
+#: high on its own, and the reviewer escalates it with the data's sensitivity.
+_AUTHZ_SEV = {"cross-object-read": "high", "cross-object-list": "high"}
+
+
+def _cov_authz(raw: str, stdout: str = "", stderr: str = "") -> Coverage:
+    """How many cross-identity reads the probe made: the denominator for a BOLA
+    run. Zero means it found no object to test, which is a gap, not a pass."""
+    d = _report(raw, dict)
+    tested = d.get("tested")
+    if not isinstance(tested, int):
+        return NO_COVERAGE
+    note = "" if tested else (d.get("note") or "no cross-identity read was made")
+    return Coverage(tested, "cross-identity reads", 0, 0, note)
+
+
+def _cov_webauth(raw: str, stdout: str = "", stderr: str = "") -> Coverage:
+    """How many authenticated checks the probe ran: the denominator for an
+    authenticated-DAST run. A check that RAISED is counted as an error, not a
+    clean check, so a run whose checks all failed does not read as a clean zero.
+    Zero tested with no errors means it could not log in or had nothing to run."""
+    d = _report(raw, dict)
+    tested = d.get("tested")
+    if not isinstance(tested, int):
+        return NO_COVERAGE
+    errs = d.get("errors")
+    nerr = len(errs) if isinstance(errs, list) else 0
+    if nerr:
+        note = "%d check(s) could not run: %s" % (nerr, ", ".join(str(e) for e in errs))
+    elif not tested:
+        note = "no authenticated check ran (login failed or none configured)"
+    else:
+        note = ""
+    return Coverage(tested, "authenticated checks", 0, nerr, note)
 
 
 def _cov_zap(raw: str, stdout: str = "", stderr: str = "") -> Coverage:
@@ -682,7 +782,8 @@ def _cov_cloudcontain(raw: str, stdout: str = "", stderr: str = "") -> Coverage:
     for _region, per in (data.get("regional") or {}).items():
         if not isinstance(per, dict):
             continue
-        examined += len(_rows(per.get("eks"))) + len(_rows(per.get("ecs")))
+        examined += (len(_rows(per.get("eks"))) + len(_rows(per.get("ecs")))
+                     + len(_rows_or_empty(per.get("ecs_clusters"))))
         errors += len(per.get("unreadable") or [])
     enabled = data.get("regions_enabled") or []
     read = data.get("regions_read") or []
@@ -932,11 +1033,124 @@ def _cov_recon(raw: str, stdout: str = "", stderr: str = "") -> Coverage:
     return Coverage(answered, "probe(s) answered", 0, 0, note)
 
 
+def _cov_ai_garak(raw: str, stdout: str = "", stderr: str = "") -> Coverage:
+    """What the garak red-team actually covered: the probe families that ran.
+
+    A finding count from garak cannot tell a model that resisted everything from
+    a scan that only reached one of the four families before garak died. The
+    denominator is the families requested; `examined` is the families that
+    produced eval records, `skipped` is the ones that produced none. The probe
+    itself records all three in its payload, so this reads them rather than
+    re-parsing garak's report."""
+    data = _report(raw, dict)
+    requested = _rows_or_empty(data.get("requested"))
+    if not requested:
+        return NO_COVERAGE            # an older reading, without the family lists
+    ran = _rows_or_empty(data.get("families_ran"))
+    missing = _rows_or_empty(data.get("families_missing"))
+    note = "ran %s" % (", ".join(ran) or "none")
+    if missing:
+        note += " · no results from %s" % ", ".join(missing)
+    rc = data.get("garak_rc")
+    if isinstance(rc, int) and rc != 0:
+        note += " · garak exited rc=%d" % rc
+    return Coverage(len(ran), "probe families", len(missing), 0, note)
+
+
+def _json_lines(raw: str) -> List[dict]:
+    """The JSON objects in a JSON Lines text, skipping anything else."""
+    rows: List[dict] = []
+    for line in (raw or "").splitlines():
+        try:
+            d = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(d, dict):
+            rows.append(d)
+    return rows
+
+
+def _cov_trufflehog(raw: str, stdout: str = "", stderr: str = "") -> Coverage:
+    """What trufflehog read, from its own `finished scanning` log line on
+    stderr: bytes, over how many chunks."""
+    for d in reversed(_json_lines(stderr)):
+        if d.get("msg") == "finished scanning" and isinstance(d.get("bytes"), int):
+            chunks = d.get("chunks")
+            note = ("%d chunk(s)" % chunks) if isinstance(chunks, int) and chunks else ""
+            if not d["bytes"]:
+                note = "nothing was read — an empty tree, or everything in it was excluded"
+            return Coverage(d["bytes"], "bytes", 0, 0, note)
+    return NO_COVERAGE
+
+
+_DOCKLE_LEVELS = ("fatal", "warn", "info", "skip", "pass")
+
+
+def _cov_dockle(raw: str, stdout: str = "", stderr: str = "") -> Coverage:
+    """The checks dockle ran, from its own summary: every level it counts,
+    with `skip` as what it did not run.
+
+    An empty report is zero, not unknown: dockle writes its summary on every
+    run that finished, clean or not, so nothing on stdout means the report
+    went somewhere else or nowhere."""
+    if not (raw or "").strip():
+        return Coverage(0, "checks", 0, 0, "dockle wrote no report")
+    summ = _report(raw, dict).get("summary")
+    if not isinstance(summ, dict):
+        return NO_COVERAGE
+    counts: Dict[str, int] = {}
+    for k in _DOCKLE_LEVELS:
+        v = summ.get(k)
+        if not isinstance(v, int) or isinstance(v, bool):
+            return NO_COVERAGE
+        counts[k] = v
+    skipped = counts["skip"]
+    return Coverage(sum(counts.values()) - skipped, "checks", skipped, 0,
+                    "%d passed" % counts["pass"])
+
+
+_OSV_FILTERED = re.compile(r"Filtered (\d+) vulnerabilit(?:y|ies) from output")
+
+
+def _osv_packages(raw: str) -> Tuple[Optional[int], int]:
+    """Distinct packages across the report's sources, and how many sources.
+    None when the report has no `results` to count."""
+    results = _report(raw, dict).get("results")
+    if not isinstance(results, list):
+        return None, 0
+    seen = set()
+    for res in _rows(results):
+        for p in _rows(res.get("packages")):
+            pkg = _obj(p.get("package"))
+            seen.add((pkg.get("ecosystem"), pkg.get("name"), pkg.get("version")))
+    return len(seen), len(_rows(results))
+
+
+def _cov_osv_scanner(raw: str, stdout: str = "", stderr: str = "") -> Coverage:
+    """Packages resolved, from the report itself (`--all-packages`), across
+    the lockfiles and manifests it found. What the target's own
+    `osv-scanner.toml` filtered out is said only on stderr, so it is read from
+    there and named, rather than left to look like a clean package."""
+    n, sources = _osv_packages(raw)
+    if n is None:
+        return NO_COVERAGE
+    notes = ["%d source(s)" % sources] if sources else ["no lockfile or manifest found"]
+    filtered = _OSV_FILTERED.search(stderr or "")
+    if filtered:
+        notes.append("%s filtered out by the target's own osv-scanner.toml"
+                     % filtered.group(1))
+    return Coverage(n, "packages", 0, 0, " · ".join(notes))
+
+
 COVERAGE: Dict[str, Callable[..., Coverage]] = {
+    "garak": _cov_ai_garak,
     "gitleaks": _cov_gitleaks,
     "recon": _cov_recon,
     "selfaudit": _cov_selfaudit,
     "skillaudit": _cov_skillaudit,
+    "schemathesis": _cov_schemathesis,
+    "authz": _cov_authz,
+    "webauth": _cov_webauth,
     "zap": _cov_zap,
     "awscli": _cov_asff,
     "cloudinv": _cov_cloudinv,
@@ -954,6 +1168,10 @@ COVERAGE: Dict[str, Callable[..., Coverage]] = {
     "checkov": _cov_checkov,
     "trivy": _cov_trivy,
     "syft": _cov_syft,
+    "trufflehog": _cov_trufflehog,
+    "dockle": _cov_dockle,
+    "osv-scanner": _cov_osv_scanner,
+    "zizmor": _cov_zizmor,
 }
 
 
@@ -997,11 +1215,23 @@ def stage_coverage(tool: str, raw: str, stdout: str = "",
 
 
 def norm_gitleaks(raw: str, base: str) -> List[Finding]:
+    """gitleaks's findings, keyed by its own Fingerprint.
+
+    In git mode the Fingerprint is `commit:file:rule:line` with the file
+    relative to the repository. With `--no-git` it is `file:rule:line` with
+    the file as gitleaks was handed it, which is absolute: the same tree
+    scanned from two directories gave two identities, and every finding read
+    as new. That prefix is rewritten to the path relative to the target, and
+    nothing else about the Fingerprint changes (found 2026-10-23)."""
     out: List[Finding] = []
     for f in _rows(_report(raw, list)):
         rule = f.get("RuleID") or f.get("Rule") or "secret"
-        rel = _rel(f.get("File", ""), base)
-        fp = f.get("Fingerprint") or "%s:%s:%s" % (rule, rel, f.get("StartLine", ""))
+        file_ = str(f.get("File") or "")
+        rel = _rel(file_, base)
+        fp = str(f.get("Fingerprint") or "")
+        if fp and os.path.isabs(file_) and fp.startswith(file_ + ":"):
+            fp = rel + fp[len(file_):]
+        fp = fp or "%s:%s:%s" % (rule, rel, f.get("StartLine", ""))
         out.append(Finding("gitleaks", fp, "high",
                            "secret: %s" % rule, rel))
     return out
@@ -1183,6 +1413,322 @@ def norm_bandit(raw: str, base: str) -> List[Finding]:
     return out
 
 
+# What is kept of a trufflehog result. Everything else is dropped before the
+# output is written anywhere: `Raw`, `RawV2` and `SecretParts` are the secret
+# itself, and `StructuredData` and most of `ExtraData` are parts of it or the
+# account it opens. trufflehog has no redaction flag (3.99.2), so the runner
+# scrubs the output before the raw report is written, and the secret survives
+# only as a hash, which is what the identity needs.
+_TRUFFLEHOG_KEEP = ("SourceType", "SourceName", "DetectorType", "DetectorName",
+                    "DetectorDescription", "DecoderName", "Verified")
+
+
+def _obj(value) -> dict:
+    """`value` if it is a JSON object, else an empty one."""
+    return value if isinstance(value, dict) else {}
+
+
+def _secret_hash(secret: str) -> str:
+    return hashlib.sha256(secret.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def scrub_trufflehog(text: str) -> str:
+    """trufflehog's JSON Lines with every copy of the secret removed.
+
+    A line that is not a JSON object is not passed through: it could hold
+    anything, so it becomes a marker that says a line was there, which the
+    shape check then reports as unreadable rather than as a clean run."""
+    out: List[str] = []
+    for n, line in enumerate((text or "").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            d = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            d = None
+        if not isinstance(d, dict):
+            out.append(json.dumps({"SquawkUnreadableLine": n, "bytes": len(line)}))
+            continue
+        kept = {k: d[k] for k in _TRUFFLEHOG_KEEP if k in d}
+        meta = _obj(d.get("SourceMetadata"))
+        data = _obj(meta.get("Data"))
+        fs = _obj(data.get("Filesystem"))
+        kept["SourceMetadata"] = {"Data": {"Filesystem": {
+            k: fs[k] for k in ("file", "line") if k in fs}}}
+        secret = d.get("Raw") or d.get("RawV2") or ""
+        # An already scrubbed line keeps its hash: scrubbing twice is a no-op.
+        kept["SecretSHA256"] = (_secret_hash(str(secret)) if secret
+                                else str(d.get("SecretSHA256") or ""))
+        extra = d.get("ExtraData")
+        if isinstance(extra, dict) and isinstance(extra.get("rotation_guide"), str):
+            kept["ExtraData"] = {"rotation_guide": extra["rotation_guide"]}
+        out.append(json.dumps(kept, sort_keys=True))
+    return "".join(line + "\n" for line in out)
+
+
+def norm_trufflehog(raw: str, base: str) -> List[Finding]:
+    """trufflehog's findings, read from the scrubbed report.
+
+    The identity is the detector, the path and a hash of the secret (plan
+    05): the same key moved to another line is the same finding, a rotated
+    key in the same place is a new one, and the secret is in neither."""
+    out: List[Finding] = []
+    seen: Dict[str, int] = {}
+    for d in _json_lines(raw):
+        detector = d.get("DetectorName")
+        if not isinstance(detector, str) or not detector:
+            continue
+        meta = _obj(d.get("SourceMetadata"))
+        data = _obj(meta.get("Data"))
+        fs = _obj(data.get("Filesystem"))
+        rel = _rel(str(fs.get("file") or ""), base)
+        line = fs.get("line", "")
+        anchor = str(d.get("SecretSHA256") or "") or "line%s" % line
+        ident = "%s:%s:%s" % (detector, rel, anchor)
+        n = seen.get(ident, 0) + 1
+        seen[ident] = n
+        if n > 1:
+            ident = "%s:%d" % (ident, n)
+        extra = _obj(d.get("ExtraData"))
+        out.append(Finding("trufflehog", ident, "high", "secret: %s" % detector, rel,
+                           {"description": str(d.get("DetectorDescription") or ""),
+                            "evidence": EVIDENCE_WITHHELD,
+                            "remediation": "Rotate it at the provider first, then "
+                                           "remove it from the tree and its history",
+                            "reference": str(extra.get("rotation_guide") or ""),
+                            "rule": detector, "line": line,
+                            "verified": bool(d.get("Verified")),
+                            "decoder": str(d.get("DecoderName") or "")}))
+    return out
+
+
+def _cvss_severity(score) -> str:
+    """A CVSS base score as a severity, by the bands CVSS itself names."""
+    try:
+        s = float(score)
+    except (TypeError, ValueError):
+        return "unknown"
+    if s >= 9.0:
+        return "critical"
+    if s >= 7.0:
+        return "high"
+    if s >= 4.0:
+        return "medium"
+    return "low" if s > 0 else "unknown"
+
+
+def _osv_fixed(vuln: dict, name: str) -> List[str]:
+    """The versions an advisory says fix this package, in its own order. A
+    `GIT` range's fix is a commit hash, which is not a version anyone can
+    upgrade to by name, so only version ranges are read."""
+    fixed: List[str] = []
+    for aff in _rows(vuln.get("affected")):
+        if str(_obj(aff.get("package")).get("name") or "").lower() != name.lower():
+            continue
+        for rng in _rows(aff.get("ranges")):
+            if rng.get("type") == "GIT":
+                continue
+            for ev in _rows(rng.get("events")):
+                f = ev.get("fixed")
+                if isinstance(f, str) and f not in fixed:
+                    fixed.append(f)
+    return fixed
+
+
+def norm_osv_scanner(raw: str, base: str) -> List[Finding]:
+    """One finding per advisory group per package version.
+
+    osv-scanner lists the same advisory under each database's id (a PYSEC
+    and a GHSA for one flaw) and groups them; a group is one finding. The id
+    is the CVE among the group's aliases when there is one, so the KEV and
+    EPSS lookups find it, and the group's first id otherwise. A package that
+    appears both in a manifest and in its resolved dependencies is reported
+    once."""
+    out: List[Finding] = []
+    seen = set()
+    for res in _rows(_report(raw, dict).get("results")):
+        src = _obj(res.get("source"))
+        rel = _rel(str(src.get("path") or ""), base)
+        resolved = src.get("type") != "lockfile"
+        for p in _rows(res.get("packages")):
+            pkg = _obj(p.get("package"))
+            name, ver = str(pkg.get("name") or ""), str(pkg.get("version") or "")
+            eco = str(pkg.get("ecosystem") or "")
+            vulns = {str(v.get("id")): v for v in _rows(p.get("vulnerabilities"))}
+            for g in _rows(p.get("groups")):
+                ids = [str(i) for i in (g.get("ids") or []) if isinstance(i, str)]
+                aliases = [str(a) for a in (g.get("aliases") or []) if isinstance(a, str)]
+                if not ids or not name:
+                    continue
+                cves = sorted(a for a in aliases + ids if a.upper().startswith("CVE-"))
+                vid = cves[0] if cves else ids[0]
+                ident = "%s:%s:%s:%s" % (vid, eco, name, ver)
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                vuln = next((vulns[i] for i in ids if i in vulns), {})
+                fixed = _osv_fixed(vuln, name)
+                summary = " ".join(str(vuln.get("summary") or "").split())
+                out.append(Finding(
+                    "osv-scanner", ident, _cvss_severity(g.get("max_severity")),
+                    "%s in %s %s" % (vid, name, ver), rel,
+                    {"description": summary,
+                     "remediation": ("Upgrade %s to %s" % (name, " or ".join(fixed[:3]))
+                                     if fixed else ""),
+                     "evidence": "%s %s (%s), %s %s" % (
+                         name, ver, eco, "resolved from" if resolved else "named in", rel),
+                     "reference": "https://osv.dev/vulnerability/%s" % ids[0],
+                     "aliases": sorted(set(aliases + ids)),
+                     "cvss": str(g.get("max_severity") or ""),
+                     "rule": vid}))
+    return out
+
+
+# dockle's levels. PASS and SKIP are counted, not reported.
+_DOCKLE_SEV = {"FATAL": "high", "WARN": "medium", "INFO": "low"}
+
+
+def image_name(ref: str) -> str:
+    """An image reference without its tag or digest: the identity is the
+    image, not the build of it a run happened to read."""
+    name = (ref or "").split("@", 1)[0]
+    if ":" in name.rsplit("/", 1)[-1]:
+        name = name.rsplit(":", 1)[0]
+    return name
+
+
+def norm_dockle(raw: str, base: str) -> List[Finding]:
+    """dockle's findings, one per checkpoint it flagged, its alerts as the
+    evidence. The identity is the checkpoint and the image name (plan 05)."""
+    out: List[Finding] = []
+    data = _report(raw, dict)
+    image = image_name(str(data.get("image") or ""))
+    for r in _rows(data.get("details")):
+        code = str(r.get("code") or "")
+        level = str(r.get("level") or "").upper()
+        if not code or level not in _DOCKLE_SEV:
+            continue
+        title = " ".join(str(r.get("title") or "").split())
+        alerts = [" ".join(str(a).split()) for a in (r.get("alerts") or [])
+                  if isinstance(a, (str, int, float))]
+        out.append(Finding("dockle", "%s:%s" % (code, image), _DOCKLE_SEV[level],
+                           _title(title or code), image,
+                           {"description": title,
+                            "remediation": title,
+                            "evidence": evidence_for("\n".join(alerts), code, title),
+                            "alerts": len(alerts),
+                            "reference": "https://github.com/goodwithtech/dockle/"
+                                         "blob/master/CHECKPOINT.md#%s" % code.lower(),
+                            "rule": code, "level": level}))
+    return out
+
+
+# hadolint's own levels. `style` is formatting, not a weakness.
+_HADOLINT_SEV = {"error": "high", "warning": "medium", "info": "low",
+                 "style": "info"}
+
+
+def _hadolint_reference(code: str) -> str:
+    if code.startswith("DL"):
+        return "https://github.com/hadolint/hadolint/wiki/%s" % code
+    if code.startswith("SC"):
+        return "https://www.shellcheck.net/wiki/%s" % code
+    return ""
+
+
+def norm_hadolint(raw: str, base: str) -> List[Finding]:
+    """hadolint's findings, one per rule and line.
+
+    The identity carries a hash of the offending line's text, not its number
+    (plan 05): a comment added above a finding moves its line, and a finding
+    keyed on the number would read as fixed and new at once. Two identical
+    lines that break one rule in one file are told apart by order."""
+    out: List[Finding] = []
+    seen: Dict[str, int] = {}
+    for r in _rows(_report(raw, list)):
+        code = str(r.get("code") or "rule")
+        rel = _rel(str(r.get("file") or ""), base)
+        line = r.get("line", "")
+        text = _source_line(base, rel, line)
+        anchor = (hashlib.sha256(" ".join(text.split()).encode("utf-8"))
+                  .hexdigest()[:12] if text else "line%s" % line)
+        ident = "%s:%s:%s" % (code, rel, anchor)
+        n = seen.get(ident, 0) + 1
+        seen[ident] = n
+        if n > 1:
+            ident = "%s:%d" % (ident, n)
+        msg = " ".join(str(r.get("message") or "").split())
+        level = str(r.get("level") or "").lower()
+        out.append(Finding("hadolint", ident,
+                           _HADOLINT_SEV.get(level, norm_severity(level)),
+                           _title(msg or code), rel,
+                           {"description": msg,
+                            "remediation": msg if code.startswith("DL") else "",
+                            "evidence": text,
+                            "reference": _hadolint_reference(code),
+                            "rule": code, "line": line, "level": level}))
+    return out
+
+
+# zizmor's severities, `Informational` and `Unknown` included (1.31.1).
+_ZIZMOR_SEV = {"high": "high", "medium": "medium", "low": "low",
+               "informational": "info", "unknown": "unknown"}
+
+
+def norm_zizmor(raw: str, base: str) -> List[Finding]:
+    """zizmor's findings, one per audit and place in a workflow.
+
+    The identity hashes the flagged source text (zizmor's `feature`), not its
+    line, the way hadolint's does: a step added above a finding must not make
+    it new. Two places with the same text under one audit are told apart by
+    order. A finding the workflow suppresses with `# zizmor: ignore[...]`,
+    reported because the stage runs with --no-ignores, keeps its severity and
+    says it was suppressed, with the comment that did it."""
+    out: List[Finding] = []
+    seen: Dict[str, int] = {}
+    for r in _rows(_report(raw, list)):
+        audit = str(r.get("ident") or "audit")
+        locs = [x for x in r.get("locations") or [] if isinstance(x, dict)]
+        prim = next((x for x in locs if (x.get("symbolic") or {}).get("kind") == "Primary"),
+                    locs[0] if locs else {})
+        sym = prim.get("symbolic") or {}
+        con = prim.get("concrete") or {}
+        local = (sym.get("key") or {}).get("Local") or {}
+        rel = _rel(str(local.get("verbatim_path") or local.get("given_path") or ""), base)
+        row = ((con.get("location") or {}).get("start_point") or {}).get("row")
+        line = row + 1 if isinstance(row, int) and not isinstance(row, bool) else ""
+        feature = str(con.get("feature") or "")
+        anchor = (hashlib.sha256(" ".join(feature.split()).encode("utf-8"))
+                  .hexdigest()[:12] if feature.strip() else "line%s" % line)
+        ident = "%s:%s:%s" % (audit, rel, anchor)
+        n = seen.get(ident, 0) + 1
+        seen[ident] = n
+        if n > 1:
+            ident = "%s:%d" % (ident, n)
+        det = r.get("determinations") or {}
+        desc = " ".join(str(r.get("desc") or "").split())
+        note = " ".join(str(sym.get("annotation") or "").split())
+        fixes = [str(f["title"]) for f in r.get("fixes") or []
+                 if isinstance(f, dict) and f.get("title")]
+        suppressed = " ".join(str(c) for c in con.get("comments") or []) \
+            if r.get("ignored") else ""
+        out.append(Finding(
+            "zizmor", ident,
+            _ZIZMOR_SEV.get(str(det.get("severity") or "").lower(), "unknown"),
+            # zizmor writes its descriptions in lower case.
+            _title((desc[:1].upper() + desc[1:]) if desc else audit)
+            + (" (suppressed in the workflow)" if r.get("ignored") else ""),
+            rel,
+            {"description": "; ".join(x for x in (desc, note) if x),
+             "remediation": fixes[0] if fixes else "",
+             "evidence": feature, "reference": str(r.get("url") or ""),
+             "rule": audit, "line": line,
+             "confidence": str(det.get("confidence") or ""),
+             "persona": str(det.get("persona") or ""),
+             "suppressed": suppressed}))
+    return out
+
+
 def norm_checkov(raw: str, base: str) -> List[Finding]:
     out: List[Finding] = []
     for block in _checkov_blocks(raw):
@@ -1223,6 +1769,27 @@ def norm_checkov(raw: str, base: str) -> List[Finding]:
     return out
 
 
+# What trivy's `Status` means for whoever has to act on it. Most of an
+# image's advisories are its base distribution's and carry no fixed version:
+# on a review image 27 of 3,509 did. "No fix" is still an answer, and a
+# different one from "the distribution will not fix it".
+_TRIVY_STATUS = {
+    "affected": "No fixed version released yet",
+    "fix_deferred": "The distribution has deferred a fix",
+    "will_not_fix": ("The distribution will not fix this; remove or replace the "
+                     "package if it is reachable"),
+    "end_of_life": "The package is end of life; replace it",
+    "under_investigation": "The distribution is still investigating",
+}
+
+
+def _trivy_fix(v: dict) -> str:
+    fixed = str(v.get("FixedVersion") or "")
+    if fixed:
+        return "Upgrade %s to %s" % (v.get("PkgName", ""), fixed)
+    return _TRIVY_STATUS.get(str(v.get("Status") or ""), "")
+
+
 def _trivy_findings(raw: str, base: str) -> List[Finding]:
     out: List[Finding] = []
     data = _report(raw, dict)
@@ -1236,13 +1803,24 @@ def _trivy_findings(raw: str, base: str) -> List[Finding]:
             ident = "%s:%s:%s" % (vid, pkg, ver)
             out.append(Finding("trivy", ident, sev,
                                "%s in %s %s" % (vid, pkg, ver),
-                               _rel(target, base)))
+                               _rel(target, base),
+                               {"description": str(v.get("Title") or ""),
+                                "remediation": _trivy_fix(v),
+                                "reference": str(v.get("PrimaryURL") or ""),
+                                "package": pkg, "installed": ver,
+                                "fixed_in": str(v.get("FixedVersion") or ""),
+                                "state": str(v.get("Status") or "")}))
         for m in _rows(res.get("Misconfigurations")):
             mid = m.get("ID", "MISC")
             sev = norm_severity(m.get("Severity"))
             ident = "%s:%s" % (mid, _rel(target, base))
             out.append(Finding("trivy", ident, sev,
-                               _title(m.get("Title") or mid), _rel(target, base)))
+                               _title(m.get("Title") or mid), _rel(target, base),
+                               {"description": str(m.get("Message") or m.get("Description")
+                                                   or ""),
+                                "remediation": str(m.get("Resolution") or ""),
+                                "reference": str(m.get("PrimaryURL") or ""),
+                                "rule": str(mid)}))
         for s in _rows(res.get("Secrets")):
             rid = s.get("RuleID", "secret")
             ident = "%s:%s:%s" % (rid, _rel(target, base), s.get("StartLine", ""))
@@ -1322,6 +1900,30 @@ def norm_skillaudit(raw: str, base: str) -> List[Finding]:
     return out
 
 
+def norm_ai_garak(raw: str, base: str) -> List[Finding]:
+    """Each garak probe the app failed to resist becomes a finding, its severity
+    set by the attack-success rate. A probe garak resisted entirely (0 through)
+    is not a finding. The identity is the probe name, so the same weakness on a
+    reverted-snapshot target stays one row."""
+    out: List[Finding] = []
+    data = _report(raw, dict)
+    target = str(data.get("target") or "")
+    for pr in _rows(data.get("probes")):
+        succeeded = int(pr.get("succeeded") or 0)
+        if succeeded <= 0:
+            continue
+        rate = float(pr.get("rate") or 0.0)
+        sev = "high" if rate >= 0.5 else "medium" if rate >= 0.2 else "low"
+        probe = str(pr.get("probe") or "")
+        lo, hi = pr.get("ci_low"), pr.get("ci_high")
+        ci = (" [%.0f%%, %.0f%%]" % (lo * 100, hi * 100)
+              if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) else "")
+        title = ("garak %s -- %.0f%% attack success (%d of %d)%s"
+                 % (probe, rate * 100, succeeded, int(pr.get("total") or 0), ci))
+        out.append(Finding("garak", "ai:prompt-injection:%s" % probe, sev, title, target))
+    return out
+
+
 def norm_selfaudit(raw: str, base: str) -> List[Finding]:
     """Only non-ok checks become findings. An "unknown" is reported as a finding
     too, at a lower severity: not knowing is a smaller problem than a confirmed
@@ -1359,6 +1961,116 @@ def _text(html_ish):
     for a, b in (("&lt;", "<"), ("&gt;", ">"), ("&amp;", "&"), ("&quot;", chr(34))):
         txt = txt.replace(a, b)
     return re.sub(r"\n{3,}", "\n\n", txt).strip()
+
+
+def norm_schemathesis(raw: str, base: str) -> List[Finding]:
+    """Schemathesis's JSON run report -> Findings, one per failing check.
+
+    A failure aggregates the operations where a check failed, with the check's
+    own code, title and severity. The identity is the code plus a hash of the
+    operations it failed on, so the same check failing on the same operations
+    diffs as one finding, and a different set diffs apart. The operations carry
+    no host, so a target served at another address diffs as the same finding."""
+    out: List[Finding] = []
+    data = _report(raw, dict)
+    for f in _rows(data.get("failures")):
+        code = str(f.get("code") or f.get("type") or "check")
+        ops = sorted(str(o) for o in (f.get("operations") or []) if o)
+        anchor = (hashlib.sha256("\n".join(ops).encode("utf-8")).hexdigest()[:12]
+                  if ops else "all")
+        ident = "%s:%s" % (code, anchor)
+        title = " ".join(str(f.get("title") or code).split())
+        sev = _SCHEMATHESIS_SEV.get(str(f.get("severity") or "").lower(), "medium")
+        # An unhandled server error is the finding that matters most; keep it at least high.
+        if "servererror" in str(f.get("type") or "").lower() and sev in ("medium", "low", "info"):
+            sev = "high"
+        count = f.get("count")
+        where = ", ".join(ops[:6]) + ("" if len(ops) <= 6 else ", +%d more" % (len(ops) - 6))
+        out.append(Finding(
+            "schemathesis", ident, sev, title, "",
+            {"description": "%s: on %s operation(s)%s" % (
+                title, count if isinstance(count, int) else len(ops),
+                " (" + where + ")" if where else ""),
+             "evidence": where,
+             "reference": _SCHEMATHESIS_DOCS,
+             "rule": code, "operations": ops}))
+    return out
+
+
+def norm_authz(raw: str, base: str) -> List[Finding]:
+    """The BOLA probe's JSON -> Findings, one per (kind, endpoint). A cross-read
+    that succeeded under an identity that did not create the object is the
+    finding; the identity is the kind and the endpoint, never the ephemeral
+    object id, so two runs diff as the same finding."""
+    out: List[Finding] = []
+    data = _report(raw, dict)
+    configured = bool(data.get("configured"))
+    by: Dict[Tuple[str, str], List[dict]] = {}
+    for f in _rows(data.get("findings")):
+        if isinstance(f, dict) and f.get("kind") and f.get("endpoint"):
+            by.setdefault((str(f["kind"]), str(f["endpoint"])), []).append(f)
+    for (kind, endpoint), group in sorted(by.items()):
+        readers = sorted({str(g.get("reader")) for g in group if g.get("reader")})
+        title = ("One identity can read another's object by its ID"
+                 if kind == "cross-object-read"
+                 else "A listing exposes objects created under another identity")
+        how = ("no identity was configured, so this is a read with no scoping "
+               "credential (set SQUAWK_AUTHZ_A/B to test tenant isolation)"
+               if not configured else
+               "read under identity %s an object created under another" % "/".join(readers))
+        out.append(Finding(
+            "authz", "%s:%s" % (kind, endpoint.split(" ", 1)[-1]), "high",
+            title, endpoint.split(" ", 1)[-1],
+            {"description": "%s (%s): %s" % (title, endpoint, how),
+             "evidence": "readers that succeeded: %s" % ", ".join(readers),
+             "reference": "https://owasp.org/API-Security/editions/2023/en/"
+                          "0xa1-broken-object-level-authorization/",
+             "rule": kind}))
+    return out
+
+
+#: Each authenticated check names the standard a reviewer cites for it.
+_WEBAUTH_REF = {
+    "session-cookie-flags":
+        "https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html",
+    "login-user-enumeration":
+        "https://owasp.org/www-project-web-security-testing-guide/stable/"
+        "4-Web_Application_Security_Testing/03-Identity_Management_Testing/"
+        "04-Testing_for_Account_Enumeration_and_Guessable_User_Account",
+    "unauthenticated-access": "https://owasp.org/Top10/A01_2021-Broken_Access_Control/",
+    "header-trust-authz": "https://owasp.org/Top10/A01_2021-Broken_Access_Control/",
+    "weak-session-key":
+        "https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html",
+}
+#: A short title per check, so a finding reads on its own in the report.
+_WEBAUTH_TITLE = {
+    "session-cookie-flags": "A session cookie is missing a security flag",
+    "login-user-enumeration": "The login tells a known username from an unknown one",
+    "unauthenticated-access": "A protected path is reachable with no session",
+    "header-trust-authz": "A protected path is reachable by spoofing a client header",
+    "weak-session-key": "The session cookie is signed with a weak or known key",
+}
+
+
+def norm_webauth(raw: str, base: str) -> List[Finding]:
+    """The authenticated-DAST probe's JSON -> Findings, one per (check, where).
+    The identity is the check and where it was found, never a token or cookie
+    value, so two runs diff as the same finding."""
+    out: List[Finding] = []
+    data = _report(raw, dict)
+    for f in _rows(data.get("findings")):
+        if not (isinstance(f, dict) and f.get("check")):
+            continue
+        check = str(f["check"])
+        where = str(f.get("where") or "")
+        title = _WEBAUTH_TITLE.get(check, check)
+        out.append(Finding(
+            "webauth", "%s:%s" % (check, where), norm_severity(f.get("severity")),
+            title, where,
+            {"description": str(f.get("detail") or title),
+             "reference": _WEBAUTH_REF.get(check, ""),
+             "rule": check}))
+    return out
 
 
 def norm_zap(raw: str, base: str) -> List[Finding]:
@@ -1458,6 +2170,13 @@ def rule_of(finding: dict) -> str:
     return parts[0] or ident
 
 
+#: Run on a stage's output before it is written anywhere or parsed, for a
+#: scanner whose report carries what Squawk must not keep.
+SCRUBBERS: Dict[str, Callable[[str], str]] = {
+    "trufflehog": scrub_trufflehog,
+}
+
+
 NORMALIZERS: Dict[str, Callable[[str, str], List[Finding]]] = {
     "awscli": norm_asff,
     "cloudinv": norm_cloudinv,
@@ -1474,12 +2193,21 @@ NORMALIZERS: Dict[str, Callable[[str, str], List[Finding]]] = {
     "semgrep": norm_semgrep,
     "bandit": norm_bandit,
     "checkov": norm_checkov,
+    "hadolint": norm_hadolint,
+    "zizmor": norm_zizmor,
+    "dockle": norm_dockle,
+    "osv-scanner": norm_osv_scanner,
+    "trufflehog": norm_trufflehog,
     "trivy": norm_trivy,
     "syft": norm_syft,
     "grype": norm_grype,
+    "schemathesis": norm_schemathesis,
+    "authz": norm_authz,
+    "webauth": norm_webauth,
     "zap": norm_zap,
     "recon": norm_recon,
     "skillaudit": norm_skillaudit,
+    "garak": norm_ai_garak,
     "selfaudit": norm_selfaudit,
     "correlation": lambda raw, base: [],
 }
@@ -1490,19 +2218,35 @@ __all__ = [
     'CREDENTIAL_MARKERS',
     'CREDENTIAL_RULES',
     'EVIDENCE_WITHHELD',
+    'JSON_LINES',
     'NORMALIZERS',
     'REPORT_SHAPES',
+    'SCRUBBERS',
     '_ANSI',
     '_ASFF_SEV',
+    '_AUTHZ_SEV',
+    '_DOCKLE_LEVELS',
+    '_DOCKLE_SEV',
     '_GITLEAKS_BYTES',
     '_GITLEAKS_COMMITS',
+    '_HADOLINT_SEV',
+    '_OSV_FILTERED',
     '_QUOTED',
     '_REDACTED_EVIDENCE',
+    '_SCHEMATHESIS_DOCS',
+    '_SCHEMATHESIS_SEV',
+    '_TRIVY_STATUS',
+    '_TRUFFLEHOG_KEEP',
+    '_WEBAUTH_REF',
+    '_WEBAUTH_TITLE',
     '_ZAP_CONF',
     '_ZAP_RISK',
     '_ZAP_TOTAL_URLS',
+    '_ZIZMOR_SEV',
     '_checkov_blocks',
+    '_cov_ai_garak',
     '_cov_asff',
+    '_cov_authz',
     '_cov_bandit',
     '_cov_checkov',
     '_cov_cloudanalyzer',
@@ -1515,28 +2259,45 @@ __all__ = [
     '_cov_cloudinv',
     '_cov_cloudorg',
     '_cov_cloudstore',
+    '_cov_dockle',
     '_cov_gitleaks',
+    '_cov_osv_scanner',
     '_cov_recon',
+    '_cov_schemathesis',
     '_cov_selfaudit',
     '_cov_semgrep',
     '_cov_skillaudit',
     '_cov_syft',
     '_cov_trivy',
+    '_cov_trufflehog',
+    '_cov_webauth',
     '_cov_zap',
+    '_cov_zizmor',
+    '_cvss_severity',
+    '_hadolint_reference',
+    '_json_lines',
+    '_obj',
+    '_osv_fixed',
+    '_osv_packages',
     '_real_evidence',
     '_region_notes',
     '_regional_errors',
     '_regions_answered',
     '_rows_or_empty',
+    '_secret_hash',
     '_source_line',
     '_text',
     '_title',
     '_trivy_findings',
+    '_trivy_fix',
     'evidence_for',
     'function_count',
+    'image_name',
     'is_credential_rule',
     'message_for',
+    'norm_ai_garak',
     'norm_asff',
+    'norm_authz',
     'norm_bandit',
     'norm_checkov',
     'norm_cloudanalyzer',
@@ -1549,16 +2310,24 @@ __all__ = [
     'norm_cloudinv',
     'norm_cloudorg',
     'norm_cloudstore',
+    'norm_dockle',
     'norm_gitleaks',
     'norm_grype',
+    'norm_hadolint',
+    'norm_osv_scanner',
     'norm_recon',
+    'norm_schemathesis',
     'norm_selfaudit',
     'norm_semgrep',
     'norm_skillaudit',
     'norm_syft',
     'norm_trivy',
+    'norm_trufflehog',
+    'norm_webauth',
     'norm_zap',
+    'norm_zizmor',
     'report_unreadable',
     'rule_of',
+    'scrub_trufflehog',
     'stage_coverage',
 ]

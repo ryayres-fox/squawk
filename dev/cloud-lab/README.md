@@ -5,6 +5,10 @@ weakness. It is the cloud counterpart of [`../lab-targets.py`](../lab-targets.py
 a cloud service with no account it is known to find something in is a service
 nobody can say ran right.
 
+Before there is an account, [`../moto-lab`](../moto-lab) plants the same
+estate in Moto, a local AWS emulator, for free. A run there finds bugs early;
+it cannot validate a stage for a release, and its report says so.
+
 `terraform apply` plants it in a **dedicated test account**. Then
 
     ./dev/lab-targets.py check --only cloud \
