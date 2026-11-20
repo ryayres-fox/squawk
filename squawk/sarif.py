@@ -32,6 +32,7 @@ __all__ = [
     '_correlation_results',
     '_driver',
     '_invocation',
+    '_located',
     '_result_for',
     '_rules_for',
     '_scanner_runs',
@@ -65,6 +66,18 @@ def _artifact_location(path: str) -> Dict[str, Any]:
     what a stable identity already guarantees; an absolute path or a URL is
     passed through as a URI so a DAST finding still points somewhere."""
     return {"uri": path or "unknown"}
+
+
+def _located(man: Dict[str, Any], finding: Dict[str, Any]) -> Dict[str, Any]:
+    """The finding with a location a SARIF reader can use. A web finding's
+    path (`/metrics`) is read by code-scanning tools as a file in the
+    repository; for a url-scope run it becomes the full URL, which is a valid
+    absolute URI and says where the finding is."""
+    path = str(finding.get("path") or "")
+    target = str(man.get("target") or "")
+    if man.get("scope") == "url" and path.startswith("/") and "://" in target:
+        return dict(finding, path=target.rstrip("/") + path)
+    return finding
 
 
 def _result_for(finding: Dict[str, Any], rule_index: int) -> Dict[str, Any]:
@@ -202,7 +215,7 @@ def _scanner_runs(man: Dict[str, Any],
         for f in mine:
             detail = f.get("detail") or {}
             rid = detail.get("rule") or f.get("identity") or "squawk"
-            results.append(_result_for(f, index.get(rid, 0)))
+            results.append(_result_for(_located(man, f), index.get(rid, 0)))
         runs.append({
             "tool": {"driver": _driver(tool, rules)},
             "invocations": [_invocation(row)],

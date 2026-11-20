@@ -490,6 +490,38 @@ def stage_zap_active(ctx: RunContext) -> Tuple[List[str], int]:
              *args], 5400)
 
 
+# What nuclei may run, fixed here and nowhere else. Tags that prove a known
+# CVE, a misconfiguration or an exposure; never the tags that fuzz, flood or
+# change state; medium and above, because info and low are inventory, not
+# findings. Measured on a synthetic target in 2026-10: these loaded 4,735
+# templates and left its data unchanged.
+NUCLEI_TAGS = "cve,misconfig,exposure"
+NUCLEI_EXCLUDED_TAGS = "dos,fuzz,intrusive"
+NUCLEI_SEVERITY = "medium,high,critical"
+NUCLEI_RATE = "50"
+
+
+def stage_nuclei(ctx: RunContext) -> Tuple[List[str], int]:
+    # nuclei sends crafted requests, so it is a url service behind
+    # dast_target_ok, never part of the passive liveprobe. What is NOT passed
+    # matters as much as what is: no `-code` (templates that run code on this
+    # machine are refused without it), no `-headless`, no `-dast` (its fuzzing
+    # mode); `-ni` so no template calls out to an interaction server; `-duc` so
+    # it does not reach for updates mid-run. `-or` keeps request and response
+    # bodies out of the report. `-stats -sj` print a JSON stats line on stderr
+    # every few seconds; the last one is the denominator (templates, requests,
+    # errors). Cloud upload is set aside through SCANNER_ENV_IGNORED.
+    # The widening options are also switched off explicitly, so a config file
+    # that turned one on is overridden on the command line as well as refused
+    # before the stage starts (TOOL_PREFLIGHT).
+    return (["nuclei", "-u", ctx.target, "-tags", NUCLEI_TAGS,
+             "-etags", NUCLEI_EXCLUDED_TAGS, "-severity", NUCLEI_SEVERITY,
+             "-code=false", "-esc=false", "-headless=false", "-dast=false",
+             "-dashboard=false",
+             "-ni", "-duc", "-or", "-nc", "-rl", NUCLEI_RATE,
+             "-stats", "-sj", "-jsonl", "-o", ctx.raw_path], 2400)
+
+
 def stage_securityhub(ctx: RunContext) -> Tuple[List[str], int]:
     # Read the findings the account already holds, as the identity in the AWS
     # credential chain. No credential touches argv (credential rule 1): the
@@ -590,6 +622,7 @@ STAGES: Dict[str, StageSpec] = {
     "grype": StageSpec("grype", "cve", stage_grype, requires="sbom"),
     "schemathesis": StageSpec("schemathesis", "apifuzz", stage_schemathesis,
                               writes_report=True, cwd_raw=True),
+    "nuclei": StageSpec("nuclei", "templates", stage_nuclei, writes_report=True),
     "zap-baseline": StageSpec("zap", "baseline", stage_zap_baseline,
                               writes_report=True),
     "zap-active": StageSpec("zap", "active", stage_zap_active,
@@ -724,6 +757,18 @@ SERVICES: Dict[str, Service] = {
         "business logic are not tested — their absence here is a coverage "
         "limit, not a clean result. The URL count on the run says how much of "
         "the app it reached. Point it at a target you own on a private network."),
+    "cveprobe": Service(
+        "cveprobe", "Known-vulnerability probe", "web", "url", ("nuclei",),
+        "~5-10min", "Sends nuclei's public templates for known CVEs, "
+        "misconfigurations and exposures at a RUNNING app and reports the ones "
+        "it can prove, medium severity and up. It is not a fuzzer: templates "
+        "tagged fuzz, dos or intrusive are excluded, as are headless, code and "
+        "out-of-band (interaction-server) templates, so blind and second-order "
+        "flaws, business logic and anything no template describes are not "
+        "tested, and info or low results are not reported. The template and "
+        "request counts on the run say how much was sent. nuclei's own "
+        "~/.config/nuclei/config.yaml can narrow what loads; the run records it "
+        "when it does. Point it at a private target you own."),
     "apiprobe": Service(
         "apiprobe", "API probe", "web", "url", ("schemathesis",),
         "~2-15min", "Property-based testing of a RUNNING API from its OpenAPI "
@@ -1030,6 +1075,10 @@ __all__ = [
     'DOMAINS',
     'HADOLINT_CONFIG',
     'NOTE_SERVICE',
+    'NUCLEI_EXCLUDED_TAGS',
+    'NUCLEI_RATE',
+    'NUCLEI_SEVERITY',
+    'NUCLEI_TAGS',
     'READ_ONLY_POLICIES',
     'SERVICES',
     'STAGES',
@@ -1071,6 +1120,7 @@ __all__ = [
     'stage_gitleaks',
     'stage_grype',
     'stage_hadolint',
+    'stage_nuclei',
     'stage_osv_scanner',
     'stage_recon',
     'stage_schemathesis',

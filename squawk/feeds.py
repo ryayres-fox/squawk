@@ -1,5 +1,6 @@
 """Exploitability: CISA KEV and FIRST EPSS, cached with provenance, and the priority ranking."""
 
+import calendar
 import hashlib
 import json
 import os
@@ -259,7 +260,12 @@ def rank_run(findings: List[dict], feeds: dict) -> dict:
 
 
 __all__ = [
+    'ATTACK_FILE',
+    'ATTACK_URL',
+    'CAPEC_URL',
+    'CWE_FILE',
     'CWE_URL',
+    'DERIVE_LEVELS',
     'EPSS_HOT',
     'EPSS_URL',
     'FEED_STALE_DAYS',
@@ -274,12 +280,18 @@ __all__ = [
     '_CVSS_WORDS',
     '_fetch_feed',
     '_intel_path',
+    '_parse_attack_bundle',
+    '_parse_capec_zip',
+    '_parse_cwe_zip',
     '_parse_epss',
     '_parse_kev',
     '_parse_nvd',
     '_parse_osv',
+    '_write_json_atomic',
     'cve_of',
     'cvss_words',
+    'cwes_of',
+    'derive_techniques',
     'epss_top',
     'estate_cves',
     'exploitability',
@@ -290,9 +302,13 @@ __all__ = [
     'kev_by_vendor',
     'kev_ransomware',
     'kev_recent',
+    'load_attack',
+    'load_cwe',
     'load_feeds',
     'load_intel',
     'rank_run',
+    'update_attack',
+    'update_cwe',
     'update_feeds',
 ]
 
@@ -343,6 +359,319 @@ def load_intel(root: str, cve: str) -> Optional[dict]:
     except (OSError, ValueError):
         return None
     return doc if isinstance(doc, dict) else None
+
+
+CWE_FILE = "cwe.json"
+
+
+def _write_json_atomic(path: str, doc: dict) -> None:
+    """Write `doc` to `path` through a temporary file and a rename, so a full
+    disk or a write cut short leaves the previous file whole. Raises OSError,
+    which the caller turns into a gap line."""
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _parse_cwe_zip(blob: bytes) -> Dict[str, dict]:
+    """{"CWE-79": {"name", "level"}} from MITRE's CWE catalogue (the zipped CSV
+    of view 1000). `level` is the weakness abstraction: Pillar, Class, Base or
+    Variant. Anything that is not that zip parses to nothing, never a guess."""
+    import csv
+    import io
+    import zipfile
+    try:
+        with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+            names = [n for n in zf.namelist() if n.endswith(".csv")]
+            if not names:
+                return {}
+            text = zf.read(names[0]).decode("utf-8-sig", "replace")
+    except (zipfile.BadZipFile, OSError, ValueError):
+        return {}
+    csv.field_size_limit(max(csv.field_size_limit(), 10_000_000))
+    out: Dict[str, dict] = {}
+    for row in csv.DictReader(io.StringIO(text)):
+        cid = str(row.get("CWE-ID") or "").strip()
+        if cid.isdigit():
+            out["CWE-" + cid] = {"name": str(row.get("Name") or "").strip(),
+                                 "level": str(row.get("Weakness Abstraction") or "").strip()}
+    return out
+
+
+def update_cwe(root: str) -> Tuple[bool, List[str]]:
+    """Fetch MITRE's CWE catalogue into <evidence>/feeds/cwe.json: each id's name
+    and abstraction level, with where it came from, when, its size and the
+    sha256 of the bytes fetched. A failed or empty fetch writes nothing, so an
+    older catalogue stays rather than being replaced by a blank one."""
+    fdir = os.path.join(root, FEEDS_DIRNAME)
+    try:
+        os.makedirs(fdir, exist_ok=True)
+    except OSError as exc:
+        return False, ["  gap  cwe   cannot create %s: %s" % (fdir, exc)]
+    blob, err = _fetch_feed(CWE_URL)
+    if blob is None:
+        LOG.warning("GAP feed cwe fetch failed: %s", err)
+        return False, ["  gap  cwe   fetch failed: %s" % err]
+    weaknesses = _parse_cwe_zip(blob)
+    if not weaknesses:
+        LOG.warning("GAP feed cwe parsed to 0 entries")
+        return False, ["  gap  cwe   fetched but parsed to 0 entries"]
+    digest = hashlib.sha256(blob).hexdigest()
+    doc = {"fetched_at": time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
+           "url": CWE_URL, "sha256": digest,
+           "bytes": len(blob), "entries": len(weaknesses), "weaknesses": weaknesses}
+    try:
+        _write_json_atomic(os.path.join(fdir, CWE_FILE), doc)
+    except OSError as exc:
+        LOG.warning("GAP feed cwe cannot write: %s", exc)
+        return False, ["  gap  cwe   cannot write %s: %s" % (CWE_FILE, exc)]
+    LOG.info("feed cwe refreshed: %d entries sha256=%s", len(weaknesses), digest[:16])
+    return True, ["  ok   cwe   %d entries, %d bytes, sha256 %s"
+                  % (len(weaknesses), len(blob), digest[:16])]
+
+
+def load_cwe(root: str) -> Optional[dict]:
+    """The cached CWE catalogue record, or None when it has not been fetched (or
+    cannot be read): a name the page cannot look up is shown as not fetched."""
+    try:
+        with open(os.path.join(root, FEEDS_DIRNAME, CWE_FILE), encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict) or not isinstance(doc.get("weaknesses"), dict):
+        return None
+    return doc
+
+
+def cwes_of(finding: dict, root: str) -> Tuple[List[str], str]:
+    """The CWE ids a finding names, and where they came from: "scanner" when the
+    finding carries one itself (ZAP's cweid, Bandit's issue_cwe), "nvd" when it
+    is a CVE whose NVD record is cached, "" when neither. ZAP writes -1 or 0 for
+    "no CWE"; those are not weaknesses."""
+    raw = (finding.get("detail") or {}).get("cwe")
+    vals = raw if isinstance(raw, list) else [raw]
+    own = []
+    for val in vals:
+        # The whole number, sign included: "-1" is ZAP's "no CWE", and reading
+        # the digits alone turned it into CWE-1. "CWE-79: ..." (Semgrep's form)
+        # and a bare 79 both read as CWE-79.
+        m = re.match(r"\s*(?:CWE-)?(-?\d+)", str(val if val is not None else ""), re.I)
+        if m and int(m.group(1)) > 0 and "CWE-%d" % int(m.group(1)) not in own:
+            own.append("CWE-%d" % int(m.group(1)))
+    if own:
+        return own, "scanner"
+    cve = cve_of(finding)
+    detail = load_intel(root, cve) if cve else None
+    nvd = [c for c in (detail or {}).get("cwe") or []
+           if isinstance(c, str) and re.fullmatch(r"CWE-\d+", c)]
+    return (nvd, "nvd") if nvd else ([], "")
+
+
+CAPEC_URL = "https://capec.mitre.org/data/csv/1000.csv.zip"
+ATTACK_URL = ("https://raw.githubusercontent.com/mitre-attack/attack-stix-data/"
+              "master/enterprise-attack/enterprise-attack.json")
+ATTACK_FILE = "attack.json"
+# A CWE at these levels is specific enough to say which attack patterns use it.
+# A Pillar or Class (CWE-693 Protection Mechanism Failure) maps to everything:
+# measured on a lab estate, it gave a missing security header six techniques,
+# T1611 Escape to Host among them.
+DERIVE_LEVELS = ("Base", "Variant")
+
+
+def _parse_capec_zip(blob: bytes) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+    """({"CWE-359": ["CAPEC-200", ...]}, {"CAPEC-200": ["T1005", ...]}) from
+    MITRE's CAPEC catalogue (zipped CSV of view 1000). The id column is
+    literally `'ID`. "Related Weaknesses" holds bare CWE numbers between `::`;
+    "Taxonomy Mappings" holds `TAXONOMY NAME:ATTACK:ENTRY ID:1005:...` parts.
+    Anything that is not that zip parses to two empty maps."""
+    import csv
+    import io
+    import zipfile
+    try:
+        with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+            names = [n for n in zf.namelist() if n.endswith(".csv")]
+            if not names:
+                return {}, {}
+            text = zf.read(names[0]).decode("utf-8-sig", "replace")
+    except (zipfile.BadZipFile, OSError, ValueError):
+        return {}, {}
+    csv.field_size_limit(max(csv.field_size_limit(), 10_000_000))
+    c2p: Dict[str, List[str]] = {}
+    p2t: Dict[str, List[str]] = {}
+    for row in csv.DictReader(io.StringIO(text)):
+        num = str(row.get("'ID") or row.get("ID") or "").strip()
+        # A pattern MITRE has withdrawn links nothing: following it would
+        # derive a technique through a link MITRE no longer stands behind.
+        if not num.isdigit() or str(row.get("Status") or "").strip() in (
+                "Deprecated", "Obsolete"):
+            continue
+        cap = "CAPEC-" + num
+        for cwe in re.findall(r"\d+", row.get("Related Weaknesses") or ""):
+            c2p.setdefault("CWE-" + cwe, [])
+            if cap not in c2p["CWE-" + cwe]:
+                c2p["CWE-" + cwe].append(cap)
+        for part in (row.get("Taxonomy Mappings") or "").split("::"):
+            m = re.search(r"TAXONOMY NAME:ATTACK:ENTRY ID:(\d{4}(?:\.\d{3})?)", part)
+            if m and "T" + m.group(1) not in p2t.setdefault(cap, []):
+                p2t[cap].append("T" + m.group(1))
+        if cap in p2t and not p2t[cap]:
+            del p2t[cap]
+    return c2p, p2t
+
+
+def _parse_attack_bundle(blob: bytes) -> Tuple[Dict[str, dict], str]:
+    """({"T1005": {"name", "tactics", "status"}}, "20.1") from the Enterprise
+    ATT&CK STIX bundle. `status` is "revoked", "deprecated" or "current": CAPEC
+    still names some techniques ATT&CK has since retired, and those must be
+    named as retired, not counted."""
+    try:
+        doc = json.loads(blob.decode("utf-8", "replace"))
+    except ValueError:
+        return {}, ""
+    objs = doc.get("objects") if isinstance(doc, dict) else None
+    if not isinstance(objs, list):
+        return {}, ""
+    techs: Dict[str, dict] = {}
+    version = ""
+    for obj in objs:
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") == "x-mitre-collection":
+            version = str(obj.get("x_mitre_version") or version)
+        if obj.get("type") != "attack-pattern":
+            continue
+        tid = next((str(r.get("external_id")) for r in obj.get("external_references") or []
+                    if isinstance(r, dict) and r.get("source_name") == "mitre-attack"), "")
+        if not re.fullmatch(r"T\d{4}(?:\.\d{3})?", tid):
+            continue
+        status = ("revoked" if obj.get("revoked") else
+                  "deprecated" if obj.get("x_mitre_deprecated") else "current")
+        rank = {"current": 2, "deprecated": 1, "revoked": 0}
+        if tid in techs and rank[techs[tid]["status"]] >= rank[status]:
+            continue          # an id seen twice keeps its most current entry
+        phases = [k for k in obj.get("kill_chain_phases") or [] if isinstance(k, dict)]
+        techs[tid] = {"name": str(obj.get("name") or ""),
+                      "tactics": [str(k.get("phase_name")) for k in phases
+                                  if k.get("kill_chain_name") == "mitre-attack"],
+                      "status": status}
+    return techs, version
+
+
+def update_attack(root: str) -> Tuple[bool, List[str]]:
+    """Fetch MITRE's CAPEC catalogue (the CWE -> attack pattern -> ATT&CK links)
+    and the Enterprise ATT&CK bundle (names, tactics, retired or not), and cache
+    what the Intel page needs in <evidence>/feeds/attack.json with each source's
+    URL, size, sha256 and entry count. About 55 MB, so it is opt-in
+    (`squawk feeds --attack`). Both or nothing: a mapping without the technique
+    status, or the reverse, would count techniques it cannot vouch for."""
+    fdir = os.path.join(root, FEEDS_DIRNAME)
+    try:
+        os.makedirs(fdir, exist_ok=True)
+    except OSError as exc:
+        return False, ["  gap  attack cannot create %s: %s" % (fdir, exc)]
+    lines: List[str] = []
+    capec_blob, err = _fetch_feed(CAPEC_URL)
+    if capec_blob is None:
+        return False, ["  gap  capec  fetch failed: %s" % err]
+    c2p, p2t = _parse_capec_zip(capec_blob)
+    if not p2t:
+        return False, ["  gap  capec  fetched but no ATT&CK mappings parsed"]
+    attack_blob, err = _fetch_feed(ATTACK_URL, timeout=300)
+    if attack_blob is None:
+        return False, ["  gap  attack fetch failed: %s" % err]
+    techs, version = _parse_attack_bundle(attack_blob)
+    if not techs:
+        return False, ["  gap  attack fetched but parsed to 0 techniques"]
+    sources: Dict[str, Dict[str, Any]] = {
+        "capec": {"url": CAPEC_URL, "bytes": len(capec_blob),
+                  "sha256": hashlib.sha256(capec_blob).hexdigest(), "entries": len(p2t)},
+        "attack": {"url": ATTACK_URL, "bytes": len(attack_blob),
+                   "sha256": hashlib.sha256(attack_blob).hexdigest(),
+                   "entries": len(techs), "version": version}}
+    doc = {"fetched_at": time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
+           "sources": sources,
+           "cwe_to_capec": c2p, "capec_to_tech": p2t, "techniques": techs}
+    try:
+        _write_json_atomic(os.path.join(fdir, ATTACK_FILE), doc)
+    except OSError as exc:
+        LOG.warning("GAP feed attack cannot write: %s", exc)
+        return False, ["  gap  attack cannot write %s: %s" % (ATTACK_FILE, exc)]
+    for key in ("capec", "attack"):
+        src = sources[key]
+        lines.append("  ok   %-6s %d entries, %d bytes, sha256 %s%s"
+                     % (key, src["entries"], src["bytes"], src["sha256"][:16],
+                        " (ATT&CK %s)" % version if key == "attack" and version else ""))
+    LOG.info("feed attack refreshed: %d CAPEC with ATT&CK, %d techniques, ATT&CK %s",
+             len(p2t), len(techs), version or "?")
+    return True, lines
+
+
+def load_attack(root: str) -> Optional[dict]:
+    """The cached CAPEC and ATT&CK record, or None when not fetched or unreadable."""
+    try:
+        with open(os.path.join(root, FEEDS_DIRNAME, ATTACK_FILE), encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict) or not all(isinstance(doc.get(k), dict) for k in (
+            "sources", "cwe_to_capec", "capec_to_tech", "techniques")):
+        return None
+    return doc
+
+
+def derive_techniques(cwes: List[str], levels: Dict[str, dict], attack: dict
+                      ) -> Tuple[str, Dict[str, List[str]], List[str], List[str], List[str]]:
+    """What a finding's CWEs say about ATT&CK, through MITRE's CAPEC links.
+
+    Returns (outcome, {technique: [CWE ...]}, retired ids, ids missing from
+    ATT&CK, and the CWEs that explain the outcome). Retired means ATT&CK marks
+    the technique revoked or deprecated; missing means the bundle does not carry
+    the id at all (a Mobile or ICS technique, say), which is a different
+    statement. The explaining CWEs are only those that fit the outcome: the
+    specific ones for "no-route", the unlisted ones for "unlisted", the broad
+    ones for "too-broad". Outcome is
+    "derived" when a Base or Variant CWE reaches a current technique,
+    "too-broad" when only Pillar or Class CWEs were named, "unlisted" when a
+    named CWE is not in the catalogue (so its level is unknown), "no-route"
+    when a specific CWE reaches nothing current in MITRE's data, and "no-cwe"
+    when there is nothing to follow. Every derived technique is MITRE's statement
+    that the weakness is used in that technique, not an observed attack."""
+    if not cwes:
+        return "no-cwe", {}, [], [], []
+    specific = [c for c in cwes if (levels.get(c) or {}).get("level") in DERIVE_LEVELS]
+    if not specific:
+        unlisted = [c for c in cwes if c not in levels]
+        if unlisted:
+            return "unlisted", {}, [], [], unlisted
+        return "too-broad", {}, [], [], list(cwes)
+    techs = attack.get("techniques") or {}
+    found: Dict[str, List[str]] = {}
+    retired: List[str] = []
+    missing: List[str] = []
+    for cwe in specific:
+        for cap in (attack.get("cwe_to_capec") or {}).get(cwe, []):
+            for tid in (attack.get("capec_to_tech") or {}).get(cap, []):
+                status = (techs.get(tid) or {}).get("status")
+                if status == "current":
+                    if cwe not in found.setdefault(tid, []):
+                        found[tid].append(cwe)
+                elif status is None:
+                    if tid not in missing:
+                        missing.append(tid)
+                elif tid not in retired:
+                    retired.append(tid)
+    if found:
+        return "derived", found, retired, missing, []
+    return "no-route", {}, retired, missing, specific
 
 
 def _parse_osv(doc: dict) -> dict:
@@ -530,6 +859,34 @@ def intel_provenance(root: str) -> List[dict]:
                 "state": "ok" if cached else "not fetched",
                 "age_days": None, "entries": len(cached) or None,
                 "url": "", "sha256": ""})
+    # MITRE publishes the CWE catalogue a few times a year, so it is stale at
+    # 120 days, not at the week that suits KEV.
+    cat = load_cwe(root) or {}
+    cwe_age = None
+    if cat.get("fetched_at"):
+        try:
+            t = time.strptime(str(cat["fetched_at"]), "%Y%m%dT%H%M%SZ")
+            cwe_age = max(0, int((time.time() - calendar.timegm(t)) // 86400))
+        except (ValueError, OverflowError):
+            cwe_age = None
+    out.append({"source": "MITRE CWE", "state": "ok" if cat else "not fetched",
+                "age_days": cwe_age, "entries": cat.get("entries"),
+                "url": cat.get("url", ""), "sha256": cat.get("sha256", ""),
+                "stale_days": 120})
+    att = load_attack(root) or {}
+    src = (att.get("sources") or {}).get("attack") or {}
+    att_age = None
+    if att.get("fetched_at"):
+        try:
+            t = time.strptime(str(att["fetched_at"]), "%Y%m%dT%H%M%SZ")
+            att_age = max(0, int((time.time() - calendar.timegm(t)) // 86400))
+        except (ValueError, OverflowError):
+            att_age = None
+    out.append({"source": "MITRE CAPEC + ATT&CK%s" % (" %s" % src["version"]
+                                                     if src.get("version") else ""),
+                "state": "ok" if att else "not fetched", "age_days": att_age,
+                "entries": src.get("entries"), "url": src.get("url", ""),
+                "sha256": src.get("sha256", ""), "stale_days": 120})
     return out
 
 

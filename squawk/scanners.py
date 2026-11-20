@@ -24,6 +24,8 @@ from squawk.probes import AST10
 # never notice. An empty tuple means the report is a bare JSON list, where an
 # empty list is a legitimate clean answer.
 REPORT_SHAPES: Dict[str, Tuple[str, ...]] = {
+    # JSON Lines: one object per match; no lines at all is a clean run.
+    "nuclei": ("template-id", "matched-at", "info"),
     "gitleaks": (),
     "semgrep": ("results", "errors", "paths"),
     "bandit": ("results", "metrics", "errors"),
@@ -65,7 +67,7 @@ REPORT_SHAPES: Dict[str, Tuple[str, ...]] = {
 
 # Reports written as JSON Lines, one object per line, which no single
 # `json.loads` reads. The shape check reads the first line of these.
-JSON_LINES: Tuple[str, ...] = ("trufflehog",)
+JSON_LINES: Tuple[str, ...] = ("trufflehog", "nuclei")
 
 
 def report_unreadable(tool: str, raw: str) -> Optional[str]:
@@ -276,6 +278,38 @@ def _cov_webauth(raw: str, stdout: str = "", stderr: str = "") -> Coverage:
     else:
         note = ""
     return Coverage(tested, "authenticated checks", 0, nerr, note)
+
+
+def _cov_nuclei(raw: str, stdout: str = "", stderr: str = "") -> Coverage:
+    """What a nuclei run sent: templates loaded and requests made.
+
+    `-stats -sj` prints a JSON line on stderr every few seconds; the LAST one
+    carries the run's totals (`templates`, `requests`, `errors`, `matched`).
+    Templates are the denominator: a run that loaded 1,079 because nuclei's
+    own config excluded the CVE templates, and one that loaded 4,996, both
+    print "0 findings", and only this says which looked. No stats line (an
+    older report, a run killed before its first tick) is unknown, never 0."""
+    last = None
+    for line in (stderr or "").splitlines():
+        line = line.strip()
+        if line.startswith("{") and '"templates"' in line:
+            try:
+                doc = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(doc, dict):
+                last = doc
+    if last is None:
+        return Coverage(None, "templates", 0, 0, "")
+
+    def num(key: str) -> int:
+        try:
+            return int(str(last.get(key, "0")))
+        except ValueError:
+            return 0
+    return Coverage(num("templates"), "templates", 0, 0,
+                    "%d request(s) of %d planned, %d error(s), %d match(es)"
+                    % (num("requests"), num("total"), num("errors"), num("matched")))
 
 
 def _cov_zap(raw: str, stdout: str = "", stderr: str = "") -> Coverage:
@@ -1151,6 +1185,7 @@ COVERAGE: Dict[str, Callable[..., Coverage]] = {
     "schemathesis": _cov_schemathesis,
     "authz": _cov_authz,
     "webauth": _cov_webauth,
+    "nuclei": _cov_nuclei,
     "zap": _cov_zap,
     "awscli": _cov_asff,
     "cloudinv": _cov_cloudinv,
@@ -2073,6 +2108,76 @@ def norm_webauth(raw: str, base: str) -> List[Finding]:
     return out
 
 
+def norm_nuclei(raw: str, base: str) -> List[Finding]:
+    """nuclei JSON Lines -> Findings, one per template match.
+
+    The identity is the template id, the matched PATH (not the host, so a
+    target re-addressed between runs diffs as the same finding) and the
+    matcher name when a template has several. A CVE template's id is the CVE
+    itself, so `cve_of` reads it and KEV, EPSS and the watchlist apply. The
+    template's CWE ids travel in `detail.cwe` for the Intel page. The template
+    path is left out: it is a path on the scanning machine."""
+    out: List[Finding] = []
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict) or not row.get("template-id"):
+            continue
+        info: dict = row["info"] if isinstance(row.get("info"), dict) else {}
+        cls: dict = info["classification"] if isinstance(info.get("classification"), dict) else {}
+        tid = str(row["template-id"])
+        at = str(row.get("matched-at") or row.get("host") or "")
+        parsed = urlparse(at if "://" in at else "http://" + at)
+        path = (parsed.path or "/") + ("?" + parsed.query if parsed.query else "")
+        matcher = str(row.get("matcher-name") or "")
+        ident = "%s:%s%s" % (tid.upper() if tid.upper().startswith("CVE-") else tid, path,
+                             ":" + matcher if matcher else "")
+        def as_list(v: object) -> List[str]:
+            # nuclei gives a list, but a single value can come as a string;
+            # iterating that string would split it into letters.
+            if isinstance(v, list):
+                return [str(x).strip() for x in v if x not in (None, "")]
+            return [p.strip() for p in str(v).split(",") if p.strip()] if v else []
+        refs = as_list(info.get("reference"))
+        # The template's public page is how a reader checks what it tests; the
+        # template's path on the scanning machine is never kept.
+        turl = str(row.get("template-url") or "")
+        if turl.startswith("https://") and turl not in refs:
+            refs.append(turl)
+        det = {"description": _title(info.get("description"), 600),
+               "reference": "\n".join(refs[:5]),
+               "cwe": [c.upper() for c in as_list(cls.get("cwe-id"))],
+               "cve": [c.upper() for c in as_list(cls.get("cve-id"))],
+               "tags": as_list(info.get("tags")),
+               "template": tid, "matcher": matcher, "type": str(row.get("type") or ""),
+               "matched_at": path,
+               # What a template extracted can be a secret (an exposure
+               # template reading /.env); the count is kept, the values never.
+               "extracted_count": len(as_list(row.get("extracted-results"))),
+               # Where, in full: the identity leaves the host out so a
+               # re-addressed target diffs as the same finding, but the reader
+               # acting on it needs the URL that answered.
+               "url": at,
+               "evidence": "template %s matched %s%s" % (
+                   tid, at, " (matcher %s)" % matcher if matcher else ""),
+               "cvss": str(cls.get("cvss-score") or ""),
+               "cvss_vector": str(cls.get("cvss-metrics") or ""),
+               "rule": tid}
+        curl = str(row.get("curl-command") or "").strip()
+        if curl:
+            # The exact request nuclei sent: how an engineer confirms the
+            # finding, and later confirms the fix, without running nuclei.
+            det["reproduce"] = _title(curl, 800)
+        out.append(Finding("nuclei", ident, norm_severity(info.get("severity")),
+                           _title(info.get("name") or tid), path, det))
+    return out
+
+
 def norm_zap(raw: str, base: str) -> List[Finding]:
     """OWASP ZAP baseline JSON -> Findings. The identity key uses the request
     PATH and parameter, NOT the host — a target VM served at a different
@@ -2172,7 +2277,33 @@ def rule_of(finding: dict) -> str:
 
 #: Run on a stage's output before it is written anywhere or parsed, for a
 #: scanner whose report carries what Squawk must not keep.
+def scrub_nuclei(text: str) -> str:
+    """nuclei's JSON Lines with every extracted value withheld. Exposure
+    templates extract what they read, and that can be a key or a password; the
+    count stays so the finding still says something was extracted. A line that
+    is not a JSON object becomes a marker, as for trufflehog."""
+    out: List[str] = []
+    for n, line in enumerate((text or "").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            d = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            d = None
+        if not isinstance(d, dict):
+            out.append(json.dumps({"SquawkUnreadableLine": n, "bytes": len(line)}))
+            continue
+        vals = d.get("extracted-results")
+        if vals:
+            count = len(vals) if isinstance(vals, list) else 1
+            d["extracted-results"] = ["<%d value%s, withheld by squawk>"
+                                      % (count, "" if count == 1 else "s")]
+        out.append(json.dumps(d))
+    return "\n".join(out) + ("\n" if out else "")
+
+
 SCRUBBERS: Dict[str, Callable[[str], str]] = {
+    "nuclei": scrub_nuclei,
     "trufflehog": scrub_trufflehog,
 }
 
@@ -2204,6 +2335,7 @@ NORMALIZERS: Dict[str, Callable[[str, str], List[Finding]]] = {
     "schemathesis": norm_schemathesis,
     "authz": norm_authz,
     "webauth": norm_webauth,
+    "nuclei": norm_nuclei,
     "zap": norm_zap,
     "recon": norm_recon,
     "skillaudit": norm_skillaudit,
@@ -2261,6 +2393,7 @@ __all__ = [
     '_cov_cloudstore',
     '_cov_dockle',
     '_cov_gitleaks',
+    '_cov_nuclei',
     '_cov_osv_scanner',
     '_cov_recon',
     '_cov_schemathesis',
@@ -2314,6 +2447,7 @@ __all__ = [
     'norm_gitleaks',
     'norm_grype',
     'norm_hadolint',
+    'norm_nuclei',
     'norm_osv_scanner',
     'norm_recon',
     'norm_schemathesis',
@@ -2328,6 +2462,7 @@ __all__ = [
     'norm_zizmor',
     'report_unreadable',
     'rule_of',
+    'scrub_nuclei',
     'scrub_trufflehog',
     'stage_coverage',
 ]
