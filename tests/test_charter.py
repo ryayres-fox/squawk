@@ -2440,18 +2440,14 @@ class TestThePageFollowsTheWindow:
         narrow = self.CSS.split("@media(max-width:900px)")[1].split("}}")[0]
         assert ".cols-3" not in narrow and ".cols-4" not in narrow
 
-    def test_the_wall_uses_the_whole_strip(self):
-        """The page went full width and the clock strip did not: `flex:none`
-        left ten content-sized cells packed at one end, so on a wide window the
-        strip stopped around two thirds across with nothing after it.
-
-        A percentage basis fills it by construction — eight cells of 12.5% is
-        the whole width — and centring puts the leftover at both edges rather
-        than all of it at one."""
-        strip = _css_rule(self.CSS, ".clocks")
-        assert "justify-content:center" in strip, strip
+    def test_each_clock_has_its_own_width(self):
+        """Fifteen clocks filled the strip with a percentage basis. Five spread
+        the same way sit one per fifth of a 3,416px screen, far apart and hard
+        to read. Each cell has a width of its own, in rem, and the row is
+        centred."""
+        assert "justify-content:center" in _css_rule(self.CSS, ".clocks")
         rule = _css_rule(self.CSS, ".clocks .clk")
-        assert "12.5%" in rule, "the cells do not span the strip: %s" % rule
+        assert "%" not in rule and "rem" in rule.split("flex:")[1], rule
 
     def test_a_clock_cell_still_refuses_to_shrink_below_its_label(self):
         """The older bug: a cell narrower than its widest line clipped the
@@ -2500,24 +2496,14 @@ class TestThePageFollowsTheWindow:
         assert "overflow-x:auto" not in strip, \
             "a wrapped wall needs no sideways scrollbar, and one hides clocks"
 
-    def test_the_row_length_is_chosen_and_never_left_to_the_width(self):
-        """The fault the third attempt fixed. `auto-fit` picks the column count
-        from the window alone, and with fifteen clocks the count decides
-        everything: eight gives 8+7, seven gives 7+7+1. A window a little
-        narrower than the operator's put one clock alone on a row.
-
-        8, 6 and 4 are the counts that strand nobody at fifteen OR at sixteen —
-        the script adds a sixteenth when the reader's zone is not already on the
-        wall, so both have to hold. 2, 3, 5 and 7 each leave a lone clock at one
-        count or the other."""
-        css = self.CSS
-        assert "auto-fit" not in _css_rule(css, ".clocks"), \
-            "the width is choosing the row length again"
-        for basis, per in (("12.5%", 8), ("16.666%", 6), ("25%", 4)):
-            assert basis in css, "no rule gives %d per row" % per
-            for count in (15, 16):
-                assert count % per != 1, \
-                    "%d per row strands one clock at %d" % (per, count)
+    def test_a_narrow_window_shrinks_the_cells_before_it_wraps_them(self):
+        """At 760px five cells at the wide basis wrapped four and one, leaving
+        London alone on a row. Below 820px the basis drops so the five still
+        share one row (checked in Chromium at 760px)."""
+        narrow = self.CSS.split("@media(max-width:820px){.clocks .clk{")[1].split("}")[0]
+        basis = float(narrow.split("flex-basis:")[1].split("rem")[0])
+        assert basis * 5 * 16 < 760 - 232 + 200, "five cells do not fit a 760px window"
+        assert basis < 10.5
 
     def test_the_short_row_is_centred_rather_than_left_with_a_hole(self):
         """Fifteen is odd, so no two-row split is even and no arithmetic makes
@@ -2526,33 +2512,36 @@ class TestThePageFollowsTheWindow:
         assert "justify-content:center" in _css_rule(self.CSS, ".clocks")
 
     def test_a_cell_cannot_grow_into_the_gap(self):
-        """`flex:0 0` on purpose. A cell allowed to grow would fill the short
-        row and undo the centring, which is the raggedness this started as."""
+        """`flex:0 1` on purpose: a cell may shrink to fit, never grow. One
+        allowed to grow would fill the row and undo the centring."""
         rule = _css_rule(self.CSS, ".clocks .clk")
-        assert "flex:0 0" in rule, rule
+        assert "flex:0 1" in rule, rule
 
     def test_a_sticky_element_below_the_wall_clears_a_wrapped_one(self):
-        """The strip's height is not one number any more. Too much gap is a
-        smaller fault than a column sitting under the clocks."""
+        """The strip is one row for the five, but the server's and the reader's
+        zones can make it seven, and a narrow window wraps it. A fixed one-row
+        offset let the sticky column slide under the second row. The script
+        sets `--clocks-h` from the height drawn, on load and on every resize;
+        the stylesheet's value is the one-row height for a page without the
+        script."""
         root = _css_rule(self.CSS, ":root")
-        height = int(root.split("--clocks-h:")[1].split("px")[0])
-        assert height >= 80, \
-            "--clocks-h is a single row's height and the strip wraps: %d" % height
+        assert int(root.split("--clocks-h:")[1].split("px")[0]) >= 64
+        js = squawk.web.CLOCK_JS
+        assert "setProperty('--clocks-h',w.offsetHeight+'px')" in js
+        assert "addEventListener('resize',fit)" in js
 
-    def test_fifteen_clocks_still_cannot_push_the_page_sideways(self):
-        """`overflow-x:auto` was the guard while the strip was one flex row: it
-        kept the overflow inside the strip instead of widening the page. Cells
-        sized as a percentage of the strip cannot exceed it, so the guard is the
-        basis and the scrollbar is gone — one that never appears beats one that
-        hides clocks behind it.
+    def test_the_clocks_still_cannot_push_the_page_sideways(self):
+        """No scrollbar on the strip: it wraps. A cell can shrink below its
+        basis (`flex:0 1`) and to nothing (`min-width:0`), so no single clock
+        is wider than the strip on a phone.
 
         `live-check.py` measures the rendered width of every route at 1240,
         1000, 800 and 640px and asserts none scrolls sideways. That is the
         behavioural check; this keeps the mechanism honest."""
         strip = _css_rule(self.CSS, ".clocks")
-        assert "overflow-x" not in strip, strip
-        assert "%" in _css_rule(self.CSS, ".clocks .clk"), \
-            "a cell not sized against the strip can exceed it"
+        assert "overflow-x" not in strip and "flex-wrap:wrap" in strip, strip
+        rule = _css_rule(self.CSS, ".clocks .clk")
+        assert "min-width:0" in rule and "flex:0 1" in rule, rule
 
     def test_wide_content_still_scrolls_inside_its_own_card(self):
         """The other half of fitting the screen: a table wider than the window

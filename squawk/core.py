@@ -14,7 +14,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Dict, List, Mapping, NamedTuple, Optional, Tuple
+from typing import Callable, Dict, List, Mapping, NamedTuple, Optional, Tuple
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -723,6 +723,10 @@ SCANNERS: Dict[str, Scanner] = {
                             "OpenAPI schema (Schemathesis): generated requests "
                             "to every operation, checking conformance, "
                             "unhandled 5xx errors, and schema validity"),
+    "nuclei": Scanner("nuclei", "nuclei", "dast", ("-version",), True,
+                      "known CVEs, misconfigurations and exposures a public "
+                      "template can prove on a RUNNING app (ProjectDiscovery "
+                      "nuclei; non-intrusive tags only, nothing calls out)"),
     "zap": Scanner("zap", "docker", "dast", ("--version",), True,
                    "dynamic testing of a RUNNING app (OWASP ZAP, via its Docker "
                    "image unless zap-baseline.py / zap-full-scan.py are on PATH)"),
@@ -820,7 +824,7 @@ SUPPORTING = {
 
 DB_STALE_DAYS = 7          # vulnerability data is published daily
 STALE_SCAN_DAYS = 7        # the overview's own words: a week with no scan is a gap
-__version__ = "0.10.0"
+__version__ = "0.12.0"
 PID_FILENAME = "squawk.pid"      # under the evidence root; who is serving, where
 SERVE_LOG = "squawk-serve.log"   # stdout/stderr of a background (--daemon) server
 ABORT_SWEEP_AGE = 3 * 3600       # an unfinished run older than this is recorded aborted
@@ -1082,7 +1086,13 @@ def tool_version(sc: Scanner) -> Optional[str]:
         out = subprocess.run([path, *sc.version_args], capture_output=True,
                              text=True, timeout=30)
         text = (out.stdout or out.stderr or "").strip().splitlines()
-        return text[0].strip() if text else "(installed)"
+        if not text:
+            return "(installed)"
+        # nuclei prints its version as a coloured log line on stderr:
+        # "[INF] Nuclei Engine Version: v3.11.1". The colour codes and the
+        # level tag are not the version.
+        first = re.sub(r"\x1b\[[0-9;]*m", "", text[0]).strip()
+        return re.sub(r"^\[(?:INF|WRN|ERR|DBG)\]\s*", "", first) or "(installed)"
     except Exception:
         return "(installed)"
 
@@ -1256,11 +1266,128 @@ def _is_aws(cmd: List[str]) -> bool:
 # child of these scanners runs without them, and the run records which were
 # set and set aside.
 SCANNER_ENV_IGNORED: Dict[str, Tuple[str, ...]] = {
+    # nuclei uploads its results to ProjectDiscovery's cloud when these say so
+    # (measured, 0.x and 3.x). A finding about a target leaving the machine is
+    # the thing Squawk exists not to do (PRODUCT rule 6).
+    "nuclei": ("PDCP_API_KEY", "PDCP_TEAM_ID", "PDCP_API_SERVER",
+               "ENABLE_CLOUD_UPLOAD", "PDCP_DASHBOARD_URL"),
     "dockle": ("DOCKLE_IGNORES", "DOCKLE_ACCEPT_KEYS", "DOCKLE_REJECT_KEYS",
                "DOCKLE_ACCEPT_FILES", "DOCKLE_REJECT_FILES",
                "DOCKLE_ACCEPT_FILE_EXTENSIONS", "DOCKLE_REJECT_FILE_EXTENSIONS",
                "DOCKLE_EXIT_CODE", "DOCKLE_EXIT_LEVEL", "DOCKLE_OUTPUT_FORMAT",
                "DOCKLE_OUTPUT_FILE"),
+}
+
+
+# Keys in nuclei's own config.yaml that change which templates run. `-config`
+# with another file does not stop nuclei reading this one (measured: an
+# `exclude-templates: [http/cves/]` there took a run from 4,787 templates to
+# 1,079 either way), so it cannot be pinned the way hadolint's is; it is named.
+NUCLEI_NARROWING_KEYS: Tuple[str, ...] = (
+    "exclude-templates", "exclude-tags", "exclude-id", "exclude-severity",
+    "exclude-type", "exclude-matchers", "templates", "template-id", "workflows",
+    "tags", "severity", "type", "author", "include-tags", "include-templates",
+    "template-condition", "template-url", "workflow-url")
+
+# Keys that would WIDEN a run past what Squawk passes, or send results out.
+# Squawk passes `-code=false` and the like, but whether nuclei obeys the flag
+# or its config could not be measured without letting a code template run on
+# this machine, so a config that sets one of these to anything but false is
+# refused, not trusted.
+NUCLEI_WIDENING_KEYS: Tuple[str, ...] = (
+    "code", "enable-self-contained", "headless", "dast", "fuzz", "dashboard",
+    "cloud-upload", "dashboard-upload", "interactsh-server", "interactsh-url",
+    "interactsh-token", "enable-pprof", "dast-server")
+
+
+def _nuclei_config_dir(home: Optional[str] = None) -> str:
+    """Where nuclei reads its configuration: `$XDG_CONFIG_HOME/nuclei` when that
+    is set (measured, 3.11.1), else `~/.config/nuclei`."""
+    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    base = xdg or os.path.join(home or os.path.expanduser("~"), ".config")
+    return os.path.join(base, "nuclei")
+
+
+def _nuclei_config_keys(home: Optional[str] = None) -> Dict[str, str]:
+    """Top-level keys in nuclei's config.yaml and the value on their line, read
+    as plain lines so a malformed file is still read."""
+    keys: Dict[str, str] = {}
+    try:
+        with open(os.path.join(_nuclei_config_dir(home), "config.yaml"),
+                  encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if not line.strip() or line.lstrip().startswith("#") or line[:1] in " \t-":
+                    continue
+                key, _sep, value = line.partition(":")
+                keys.setdefault(key.strip(), value.split("#", 1)[0].strip().strip("'\""))
+    except OSError:
+        pass
+    return keys
+
+
+def nuclei_config_refusal(home: Optional[str] = None) -> str:
+    """Why Squawk will not run nuclei under this configuration, or "". A key
+    that widens the run (code, headless, dast) or sends results out (the
+    dashboard, an interaction server) set to anything but false."""
+    keys = _nuclei_config_keys(home)
+    on = [k for k in NUCLEI_WIDENING_KEYS
+          if k in keys and keys[k].lower() not in ("false", "no", "0", "")]
+    if not on:
+        return ""
+    return ("refused: nuclei's own %s turns on %s, which runs more than Squawk "
+            "allows or sends results out; remove %s from it to run this service"
+            % (os.path.join(_nuclei_config_dir(home), "config.yaml"), ", ".join(on),
+               "those keys" if len(on) > 1 else "that key"))
+
+
+def nuclei_config_narrowing(home: Optional[str] = None) -> List[str]:
+    """What in nuclei's own configuration changes which templates a run loads:
+    each narrowing key set in `~/.config/nuclei/config.yaml`, and a
+    `.nuclei-ignore` in the same directory (where nuclei reads it from, not the
+    templates directory). Empty when nothing narrows. Read as plain lines, not
+    YAML, so a malformed file is still reported rather than skipped."""
+    cdir = _nuclei_config_dir(home)
+    found = ["config.yaml sets %s" % key for key in _nuclei_config_keys(home)
+             if key in NUCLEI_NARROWING_KEYS]
+    # nuclei writes this file itself and rewrites it when it refreshes its
+    # templates, so its being there says nothing: what it excludes is the note.
+    tags: List[str] = []
+    files: List[str] = []
+    section = ""
+    try:
+        with open(os.path.join(cdir, ".nuclei-ignore"), encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                text = line.split("#", 1)[0].rstrip()
+                if not text.strip():
+                    continue
+                if not line[:1].isspace() and text.endswith(":"):
+                    section = text[:-1].strip()
+                elif text.strip().startswith("- "):
+                    item = text.strip()[2:].strip().strip("'\"")
+                    if section == "tags":
+                        tags.append(item)
+                    elif section == "files":
+                        files.append(item)
+    except OSError:
+        return found
+    if tags or files:
+        cves = sum(1 for f in files if "/cves/" in f)
+        found.append(".nuclei-ignore excludes %d tag(s)%s and %d template file(s)%s"
+                     % (len(tags), " (%s)" % ", ".join(tags) if tags else "", len(files),
+                        ", %d of them a CVE template" % cves if cves else ""))
+    return found
+
+
+#: Per tool, what its own configuration changes about the run, read when the
+#: stage starts and recorded with it.
+TOOL_CONFIG_NOTES: Dict[str, Callable[[], List[str]]] = {
+    "nuclei": nuclei_config_narrowing,
+}
+
+#: Per tool, a check run just before it starts: a reason it must not run under
+#: this machine's configuration, or "".
+TOOL_PREFLIGHT: Dict[str, Callable[[], str]] = {
+    "nuclei": nuclei_config_refusal,
 }
 
 
@@ -2298,6 +2425,8 @@ __all__ = [
     'NOTE_SECTIONS',
     'NOTE_TEMPLATE',
     'NO_COVERAGE',
+    'NUCLEI_NARROWING_KEYS',
+    'NUCLEI_WIDENING_KEYS',
     'OWN_RULES_DIR',
     'PID_FILENAME',
     'PROFILE_FILE',
@@ -2321,6 +2450,8 @@ __all__ = [
     'TEST_DIRS',
     'TEST_PREFIXES',
     'TEST_SUFFIXES',
+    'TOOL_CONFIG_NOTES',
+    'TOOL_PREFLIGHT',
     '_ACCESS_KEY',
     '_ACCOUNT_ID',
     '_BARE_KEY',
@@ -2348,6 +2479,8 @@ __all__ = [
     '_kill_group',
     '_looks_secret',
     '_mode_of',
+    '_nuclei_config_dir',
+    '_nuclei_config_keys',
     '_osv_db_age',
     '_osv_db_dir',
     '_rel',
@@ -2382,6 +2515,8 @@ __all__ = [
     'mask_key_id',
     'norm_severity',
     'note_problems',
+    'nuclei_config_narrowing',
+    'nuclei_config_refusal',
     'parse_note',
     'parse_toml',
     'profile_path',

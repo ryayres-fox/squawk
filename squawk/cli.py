@@ -38,6 +38,7 @@ from squawk.core import (
     SCANNERS,
     SEVERITY_ORDER,
     SUPPORTING,
+    TOOL_CONFIG_NOTES,
     ProfileError,
     __version__,
     disposition_problems,
@@ -60,7 +61,14 @@ from squawk.core import (
     tool_version,
     vuln_db_ages,
 )
-from squawk.decisions import who
+from squawk.decisions import (
+    current_watchlist,
+    is_cve_id,
+    load_watch_events,
+    record_watch,
+    watch_path,
+    who,
+)
 from squawk.engagements import assign, engagements_path, load_engagements, unassign
 from squawk.engine import (
     execute_service,
@@ -81,6 +89,8 @@ from squawk.feeds import (
     feed_ages,
     fetch_intel,
     intel_dir,
+    update_attack,
+    update_cwe,
     update_feeds,
 )
 from squawk.installer import (
@@ -153,6 +163,11 @@ def doctor(args: argparse.Namespace) -> int:
         if ver:
             any_scanner = True
             print("  ok   %-9s %s" % (name, ver))
+            # A tool whose own configuration changes what it runs, read the
+            # same way the run reads it, so the doctor and the run agree.
+            narrowing = TOOL_CONFIG_NOTES.get(name)
+            for note in (narrowing() if narrowing else []):
+                print("  note %-9s %s: it changes which checks run" % (name, note))
         else:
             print("  gap  %-9s not found — install it (%s)" % (name, sc.contributes))
 
@@ -1028,6 +1043,65 @@ def cmd_engagements(args: argparse.Namespace) -> int:
     return 2
 
 
+def cmd_watch(args: argparse.Namespace) -> int:
+    """List, add to or take from the CVE watchlist. Every change is a new chained
+    line in the evidence root; nothing is edited, so `watch` with no action also
+    says how many changes the list has seen."""
+    root = args.evidence or env("EVIDENCE") or DEFAULT_EVIDENCE
+    items = list(args.watch or [])
+    action = (items[0] if items else "list").lower()
+    rest = items[1:]
+    problems: List[str] = []
+    if action == "list":
+        if rest:
+            sys.stderr.write("usage: squawk watch [list]  (list takes no arguments)\n")
+            return 2
+        watched = current_watchlist(root, problems)
+        for msg in problems:
+            sys.stderr.write("watch: %s\n" % msg)
+        if not watched:
+            print("Nothing on the watchlist in %s." % watch_path(root))
+            print('Add one:  squawk watch add CVE-2021-44228 --reason "log4shell"')
+            return 1 if problems else 0
+        changes = len(load_watch_events(root))
+        print("Watching %d CVE(s) in %s (%d %schange(s) recorded):"
+              % (len(watched), watch_path(root), changes,
+                 "readable " if problems else ""))
+        for cve, ev in watched.items():
+            print("  %-18s since %s by %s%s" % (cve, ev.get("at", ""), ev.get("who", ""),
+                                               "  · %s" % ev["reason"] if ev.get("reason") else ""))
+        return 1 if problems else 0
+    if action in ("add", "remove"):
+        if len(rest) != 1:
+            sys.stderr.write("usage: squawk watch %s CVE [--reason TEXT]\n" % action)
+            return 2
+        cve = rest[0].strip().upper()
+        # The id is checked before the list is read: `remove log4j` used to
+        # answer "not on the watchlist" and exit 0, as if it were a real id.
+        if not is_cve_id(cve):
+            sys.stderr.write("watch: not a CVE id: %r (expected CVE-YYYY-NNNN)\n" % cve)
+            return 2
+        on_list = cve in current_watchlist(root, problems)
+        for msg in problems:
+            sys.stderr.write("watch: %s\n" % msg)
+        if action == "add" and on_list:
+            print("%s is already on the watchlist; nothing written." % cve)
+            return 0
+        if action == "remove" and not on_list:
+            print("%s is not on the watchlist; nothing written." % cve)
+            return 0
+        try:
+            record_watch(root, cve, "watch" if action == "add" else "unwatch",
+                         reason=args.reason or "")
+        except ValueError as exc:
+            sys.stderr.write("watch: %s\n" % exc)
+            return 2
+        print("%s %s the watchlist." % (cve, "added to" if action == "add" else "taken off"))
+        return 0
+    sys.stderr.write("watch: unknown action %r (use list, add, remove)\n" % action)
+    return 2
+
+
 def cmd_greps(args: argparse.Namespace) -> int:
     """The manual-review grep sweep — a backup to the scanners, grouped by the
     checklist's coverage areas. Every hit is a line to read, not a finding."""
@@ -1175,6 +1249,9 @@ def cmd_verify(args: argparse.Namespace) -> int:
         chk = report.get("checklist") or {}
         if chk:
             print("Checklist ledger: %s — %s" % (chk["state"], chk["detail"]))
+        wl = report.get("watchlist") or {}
+        if wl:
+            print("Watchlist: %s — %s" % (wl["state"], wl["detail"]))
         print("\n%s" % report["summary"])
         print("\nWhat this proves: no file in a verified run changed since the run "
               "wrote it,\nand each run proves the one before it existed. What it does "
@@ -1271,6 +1348,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--intel", action="store_true",
                    help="with feeds: also fetch per-CVE detail (OSV and NVD) for "
                         "every CVE in the estate")
+    p.add_argument("--attack", action="store_true",
+                   help="with feeds: also fetch MITRE's CAPEC catalogue and Enterprise "
+                        "ATT&CK (about 55 MB) for the derived technique table")
     p.add_argument("--refetch", action="store_true",
                    help="with feeds --intel: re-fetch detail already cached")
     p.add_argument("--feeds", action="store_true",
@@ -1310,6 +1390,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "`engagements` lists the mapping; `engagements assign NAME "
                         "PATTERN...` adds target globs (e.g. acme-*); `engagements "
                         "unassign PATTERN...` removes them")
+    p.add_argument("--watch", nargs="*", default=None, metavar="ARG",
+                   help="the CVE watchlist the Intel page flags: `watch` lists it; "
+                        "`watch add CVE [--reason TEXT]` adds one; `watch remove CVE "
+                        "[--reason TEXT]` takes one off. Append-only and chained; "
+                        "`squawk verify` checks it")
+    p.add_argument("--reason", default="", metavar="TEXT",
+                   help="with watch add or remove: why, recorded with the entry")
     p.add_argument("--greps", nargs="*", default=None, metavar="DIR",
                    help="manual-review grep sweep, a backup to the scanners, over a "
                         "directory: `greps DIR [AREA]`. High recall — a hit is a "
@@ -1404,6 +1491,7 @@ SUBCOMMANDS = {
     "disposition": ["--disposition"],
     "engagements": ["--engagements"],
     "greps": ["--greps"],
+    "watch": ["--watch"],
 }
 
 
@@ -1435,6 +1523,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     port_typed = args.port is not None
     if not port_typed:
         args.port = DEFAULT_PORT
+    # `--reason` is recorded only by `watch add|remove`. Any other command would
+    # take it and drop it, and the operator would believe it was kept.
+    # The feed flags only mean something to `feeds`; anywhere else they would
+    # be taken and dropped, and /intel would keep saying "not fetched".
+    for flag, given in (("--attack", args.attack), ("--intel", args.intel),
+                        ("--refetch", args.refetch)):
+        if given and not args.feeds:
+            sys.stderr.write("%s goes with `squawk feeds`; nothing else fetches\n" % flag)
+            return 2
+    if args.reason and args.watch is None:
+        sys.stderr.write("--reason goes with `squawk watch add|remove CVE`; "
+                         "nothing else records it\n")
+        return 2
 
     # The floor, said on every command rather than only in `doctor`. Below it
     # a run still completed and wrote evidence that looked exactly like
@@ -1496,6 +1597,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("Exploitability feeds -> %s" % os.path.join(froot, FEEDS_DIRNAME))
         ok, lines = update_feeds(froot)
         print("\n".join(lines))
+        # The CWE catalogue rides with the feeds: one 0.6 MB file that names
+        # every weakness the Intel page counts.
+        cwe_ok, cwe_lines = update_cwe(froot)
+        print("\n".join(cwe_lines))
+        ok = ok and cwe_ok
+        if args.attack:
+            att_ok, att_lines = update_attack(froot)
+            print("\n".join(att_lines))
+            ok = ok and att_ok
         if args.intel:
             ok = cmd_intel(froot, force=args.refetch) and ok
         return 0 if ok else 1
@@ -1519,6 +1629,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_disposition(args)
     if args.engagements is not None:
         return cmd_engagements(args)
+    if args.watch is not None:
+        return cmd_watch(args)
     if args.greps is not None:
         return cmd_greps(args)
     if args.sarif is not None:
@@ -1568,6 +1680,7 @@ __all__ = [
     'cmd_run',
     'cmd_sarif',
     'cmd_verify',
+    'cmd_watch',
     'doctor',
     'inventory_lines',
     'list_services',

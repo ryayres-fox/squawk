@@ -10,6 +10,7 @@ field must never be rendered as a measurement.
 import argparse
 import builtins
 import datetime
+import hashlib
 import importlib.util
 import inspect
 import json
@@ -3786,6 +3787,38 @@ class TestChecklist:
         assert os.path.join("root", *A._CHECKLIST_LEDGER) == self.C.ledger_path("root")
         assert A._CHECKLIST_STATES == self.C.CHECK_STATES
 
+    def test_every_function_that_writes_a_chain_has_a_verifier(self, tmp_path):
+        """The test below is a list someone keeps,
+        so the next chained file could again be written and never walked. This
+        one finds every function in the package that calls `append_chained` and
+        fails on any that `verify_root` does not report. A new chained file
+        fails here until its verifier is wired in and named below."""
+        import ast
+        pkg = os.path.dirname(squawk.core.__file__)
+        writers = set()
+        for name in sorted(os.listdir(pkg)):
+            if not name.endswith(".py"):
+                continue
+            with open(os.path.join(pkg, name), encoding="utf-8") as fh:
+                tree = ast.parse(fh.read())
+            for fn in ast.walk(tree):
+                if isinstance(fn, ast.FunctionDef) and fn.name != "append_chained":
+                    for call in ast.walk(fn):
+                        if not isinstance(call, ast.Call):
+                            continue
+                        callee = getattr(call.func, "id", getattr(call.func, "attr", ""))
+                        if callee == "append_chained":
+                            writers.add("%s.%s" % (name[:-3], fn.name))
+        verified_by = {"decisions.record_decision": "ledger",
+                       "decisions.record_watch": "watchlist",
+                       "checklist.record_check": "checklist",
+                       "evidence.record_prune": "retention"}
+        assert writers == set(verified_by), \
+            "a chained file with no verifier: %s" % sorted(writers - set(verified_by))
+        report = squawk.verify_root(str(tmp_path))
+        for key in verified_by.values():
+            assert key in report, "verify_root does not walk %s" % key
+
     def test_verify_root_covers_every_chained_ledger(self, tmp_path):
         # The gap this closes: a chained ledger was written but no verifier read
         # it. verify_root must cover every append_chained ledger. A new one is
@@ -3795,6 +3828,9 @@ class TestChecklist:
         report = squawk.verify_root(root)
         assert "ledger" in report and "checklist" in report
         assert report["checklist"]["present"] and report["checklist"]["state"] == "ok"
+        squawk.record_watch(root, "CVE-2021-44228", by="ana")
+        report = squawk.verify_root(root)
+        assert report["watchlist"]["present"] and report["watchlist"]["state"] == "ok"
 
     def test_a_tampered_checklist_tick_is_caught(self, tmp_path):
         # A chain cannot vouch for its own last line; the recorded verify closes
@@ -4545,6 +4581,867 @@ class TestThreatIntel:
         assert code == 200 and "Traceback" not in body, "the page is unreachable"
         assert code2 == 200 and "Traceback" not in body2, "the feed view has no route"
         assert "href='/intel'" in body and ">Intel<" in body, "not in the nav"
+
+
+class TestWatchlist:
+    """Plan 06, step 6: CVEs the operator wants flagged whenever they appear.
+    Human input, so it is kept like a decision: append-only, chained, checked
+    by `squawk verify`, and shown on /intel with where each CVE is present."""
+
+    def _estate(self, tmp_path):
+        return TestThreatIntel._estate(self, tmp_path)
+
+    def test_the_last_line_for_a_cve_wins_and_nothing_is_edited(self, tmp_path):
+        root = str(tmp_path)
+        squawk.record_watch(root, "cve-2021-44228", reason="log4shell", by="ana")
+        squawk.record_watch(root, "CVE-2021-44228", "unwatch", by="ana")
+        assert squawk.current_watchlist(root) == {}, "an unwatch did not take it off"
+        squawk.record_watch(root, "CVE-2021-44228", reason="back on", by="bo")
+        now = squawk.current_watchlist(root)
+        assert list(now) == ["CVE-2021-44228"] and now["CVE-2021-44228"]["reason"] == "back on"
+        assert [e["action"] for e in squawk.load_watch_events(root)] == \
+            ["watch", "unwatch", "watch"], "the history was not kept line by line"
+
+    @pytest.mark.parametrize("cve,action,reason", [
+        ("log4j", "watch", ""), ("CVE-21-1", "watch", ""),
+        ("CVE-2021-44228", "ignore", ""), ("CVE-2021-44228", "watch", "x" * 2001)])
+    def test_a_bad_entry_raises_and_writes_nothing(self, tmp_path, cve, action, reason):
+        root = str(tmp_path)
+        with pytest.raises(ValueError):
+            squawk.record_watch(root, cve, action, reason=reason)
+        assert not os.path.exists(squawk.watch_path(root))
+
+    def test_verify_root_reports_the_watchlist_and_catches_an_edit(self, tmp_path):
+        root = str(tmp_path)
+        squawk.record_watch(root, "CVE-2021-44228", by="ana")
+        squawk.record_watch(root, "CVE-2022-22965", by="ana")
+        report = squawk.verify_root(root)
+        assert report["watchlist"]["present"] and report["watchlist"]["state"] == "ok"
+        path = squawk.watch_path(root)
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+        lines[0] = lines[0].replace("CVE-2021-44228", "CVE-2021-44229")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.writelines(lines)
+        report = squawk.verify_root(root)
+        assert report["watchlist"]["state"] == "broken"
+        assert report["status"] == "failed" and report["exit"] != 0
+        assert "the watchlist broken" in report["summary"]
+
+    def test_an_edited_last_line_is_caught_by_the_recorded_verify(self, tmp_path):
+        # A chain cannot vouch for its own last line; the saved verify's head does.
+        root = str(tmp_path)
+        squawk.record_watch(root, "CVE-2021-44228", by="ana")
+        squawk.evidence.save_verify(root, squawk.verify_root(root))
+        path = squawk.watch_path(root)
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text.replace('"watch"', '"unwatch"'))
+        assert squawk.current_watchlist(root) == {}, "the edit should have un-watched it"
+        assert squawk.verify_root(root)["watchlist"]["state"] == "broken", \
+            "a CVE was silently taken off the watchlist and verify said ok"
+
+    def test_the_page_shows_where_each_watched_cve_is(self, tmp_path):
+        root = self._estate(tmp_path)
+        squawk.record_watch(root, "CVE-2021-44228", reason="log4shell", by="ana")
+        squawk.record_watch(root, "CVE-2099-0001", by="ana")
+        html = squawk.view_intel(root)            # no feeds: the section still shows
+        block = html.split("On your watchlist")[1]
+        assert "1 of 2 watched CVE(s) are present" in block
+        hit = block.split("CVE-2021-44228")[2].split("</tr>")[0]
+        assert "present</b> in 1 target" in hit and "app" in hit, \
+            "the target the watched CVE is in is not named"
+        miss = block.split("CVE-2099-0001")[2].split("</tr>")[0]
+        assert "not in what you have scanned" in miss
+        assert "log4shell" in block
+
+    def test_no_watchlist_leaves_the_page_as_it_was(self, tmp_path):
+        assert "On your watchlist" not in squawk.view_intel(self._estate(tmp_path))
+
+    def test_a_damaged_line_is_named_on_the_page(self, tmp_path):
+        root = self._estate(tmp_path)
+        squawk.record_watch(root, "CVE-2021-44228", by="ana")
+        with open(squawk.watch_path(root), "a", encoding="utf-8") as fh:
+            fh.write("{not json\n")
+        html = squawk.view_intel(root)
+        assert "watchlist line 2 does not parse" in html
+
+    def test_the_cve_drawer_says_it_is_watched(self, tmp_path):
+        root = self._estate(tmp_path)
+        assert "On your watchlist" not in squawk.view_intel(root, "CVE-2021-44228")
+        squawk.record_watch(root, "CVE-2021-44228", reason="log4shell", by="ana")
+        page = squawk.view_intel(root, "CVE-2021-44228")
+        assert "On your watchlist</b> since" in page and "log4shell" in page
+
+    def _ns(self, root, *watch, reason=""):
+        return argparse.Namespace(evidence=root, watch=list(watch), reason=reason)
+
+    def test_cli_add_list_remove_and_its_exit_codes(self, tmp_path, capsys):
+        root = str(tmp_path)
+        cmd = squawk.cli.cmd_watch
+        assert cmd(self._ns(root)) == 0                                   # empty list
+        assert cmd(self._ns(root, "add", "CVE-2021-44228", reason="log4shell")) == 0
+        assert cmd(self._ns(root, "add", "CVE-2021-44228")) == 0          # already on
+        assert len(squawk.load_watch_events(root)) == 1, "a duplicate add wrote a line"
+        capsys.readouterr()
+        assert cmd(self._ns(root)) == 0
+        out = capsys.readouterr().out
+        assert "CVE-2021-44228" in out and "log4shell" in out and "1 change(s)" in out
+        assert cmd(self._ns(root, "add", "log4j")) == 2
+        assert cmd(self._ns(root, "add")) == 2
+        assert cmd(self._ns(root, "frobnicate")) == 2
+        assert cmd(self._ns(root, "remove", "CVE-2021-44228")) == 0
+        assert squawk.current_watchlist(root) == {}
+        assert cmd(self._ns(root, "remove", "CVE-2021-44228")) == 0       # not on: no line
+        assert len(squawk.load_watch_events(root)) == 2
+
+    def test_cli_list_exits_1_on_a_damaged_watchlist(self, tmp_path):
+        root = str(tmp_path)
+        squawk.record_watch(root, "CVE-2021-44228", by="ana")
+        with open(squawk.watch_path(root), "a", encoding="utf-8") as fh:
+            fh.write("{not json\n")
+        assert squawk.cli.cmd_watch(self._ns(root)) == 1
+
+    def test_cli_refuses_a_bad_id_to_remove_too(self, tmp_path):
+        """Found in review: `remove log4j` answered "not on the watchlist" and
+        exited 0, as if it were a real id. The id is checked first, both ways."""
+        root = str(tmp_path)
+        assert squawk.cli.cmd_watch(self._ns(root, "remove", "log4j")) == 2
+        assert squawk.cli.cmd_watch(self._ns(root, "remove", "CVE-21-1")) == 2
+        assert squawk.cli.cmd_watch(self._ns(root, "list", "extra")) == 2
+        assert not os.path.exists(squawk.watch_path(root))
+
+    def test_reason_on_any_other_command_is_refused_not_dropped(self, tmp_path):
+        assert squawk.cli.main(["verify", "--reason", "why",
+                                "--evidence", str(tmp_path)]) == 2
+
+    def test_cli_add_and_remove_report_a_damaged_list(self, tmp_path, capsys):
+        root = str(tmp_path)
+        squawk.record_watch(root, "CVE-2021-44228", by="ana")
+        with open(squawk.watch_path(root), "a", encoding="utf-8") as fh:
+            fh.write("{not json\n")
+        assert squawk.cli.cmd_watch(self._ns(root)) == 1
+        assert "1 readable change(s)" in capsys.readouterr().out
+        squawk.cli.cmd_watch(self._ns(root, "remove", "CVE-2021-44228"))
+        assert "line 2 does not parse" in capsys.readouterr().err
+
+    def test_the_section_shows_with_no_live_targets(self, tmp_path):
+        """Found in review: the page returned its "no live targets" state before
+        the watchlist was drawn, so a fresh root hid what was being watched."""
+        root = str(tmp_path)
+        squawk.record_watch(root, "CVE-2021-44228", by="ana")
+        html = squawk.view_intel(root)
+        assert "No live targets yet" in html and "On your watchlist" in html
+        assert "0 of 1 watched CVE(s) are present in what you have scanned" in html
+
+    def test_a_filtered_page_says_in_this_scope(self, tmp_path):
+        """A CVE found outside the filter has been scanned, so "not in what you
+        have scanned" would be false there."""
+        root = self._estate(tmp_path)
+        squawk.record_watch(root, "CVE-2099-0001", by="ana")
+        html = squawk.view_intel(root, None, None, str(tmp_path / "app"))
+        block = html.split("On your watchlist")[1]
+        assert "present in this scope" in block and "not in this scope" in block
+
+    def test_the_drawer_reports_a_damaged_list(self, tmp_path):
+        root = self._estate(tmp_path)
+        os.makedirs(os.path.dirname(squawk.watch_path(root)))
+        with open(squawk.watch_path(root), "w", encoding="utf-8") as fh:
+            fh.write("{not json\n")
+        assert "watchlist line 1 does not parse" in squawk.view_intel(root, "CVE-2021-44228")
+
+    def test_a_long_reason_is_cut_with_an_ellipsis_and_kept_whole_in_the_title(self, tmp_path):
+        root = self._estate(tmp_path)
+        squawk.record_watch(root, "CVE-2021-44228", reason="r" * 300, by="ana")
+        block = squawk.view_intel(root).split("On your watchlist")[1]
+        assert "r…</td>" in block and ("r" * 300) in block.split("title='")[1]
+
+    def test_an_id_with_a_trailing_newline_is_not_a_cve(self):
+        assert squawk.is_cve_id("CVE-2021-44228")
+        assert not squawk.is_cve_id("CVE-2021-44228\n")
+        assert squawk.is_cve_id("CVE-2024-1234567"), "the same shape cve_of reads"
+        assert not squawk.decisions._is_watch_line(
+            {"action": "watch", "cve": "CVE-2021-44228\n"})
+
+    def test_watch_is_a_subcommand(self):
+        assert squawk.cli._translate_argv(["watch", "add", "CVE-2021-44228"]) == \
+            ["--watch", "add", "CVE-2021-44228"]
+        args = squawk.cli.build_parser().parse_args(
+            ["--watch", "add", "CVE-2021-44228", "--reason", "why"])
+        assert args.watch == ["add", "CVE-2021-44228"] and args.reason == "why"
+
+
+class TestWeaknesses:
+    """Plan 06: the estate by weakness class. Most scanner findings name a CWE
+    (ZAP's cweid, Bandit's issue_cwe); a CVE finding gets one through its cached
+    NVD record. The CWE catalogue gives each id its name and abstraction level,
+    fetched by `squawk feeds` with provenance like every other source."""
+
+    CSV = ("CWE-ID,Name,Weakness Abstraction,Status,Description\n"
+           '79,"Improper Neutralization of Input During Web Page Generation",Base,Stable,x\n'
+           "693,Protection Mechanism Failure,Pillar,Draft,x\n"
+           "1004,Sensitive Cookie Without 'HttpOnly' Flag,Variant,Incomplete,x\n")
+
+    def _zip(self, text=None):
+        import io as _io
+        import zipfile
+        buf = _io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("1000.csv", text if text is not None else self.CSV)
+        return buf.getvalue()
+
+    def _estate(self, tmp_path, extra=()):
+        root = TestThreatIntel._estate(self, tmp_path)
+        run = os.path.join(root, "20260906T120000Z-dir", "findings.json")
+        with open(run) as fh:
+            finds = json.load(fh)
+        finds = [
+            *finds,
+            {"scanner": "zap", "identity": "10038:/:", "severity": "medium",
+             "title": "CSP not set", "path": "/", "detail": {"cwe": "693"}},
+            {"scanner": "zap", "identity": "10010:/:sid", "severity": "low",
+             "title": "No HttpOnly", "path": "/", "detail": {"cwe": "1004"}},
+            {"scanner": "zap", "identity": "10096:/:", "severity": "info",
+             "title": "Timestamp", "path": "/", "detail": {"cwe": "-1"}},
+            {"scanner": "bandit", "identity": "B602:y.py:2", "severity": "high",
+             "title": "shell", "path": "y.py", "detail": {"cwe": "78"}},
+            *extra,
+        ]
+        with open(run, "w") as fh:
+            json.dump(finds, fh)
+        return root
+
+    def test_the_catalogue_parses_names_and_levels(self):
+        cat = squawk.feeds._parse_cwe_zip(self._zip())
+        assert cat["CWE-79"] == {"name": "Improper Neutralization of Input During "
+                                         "Web Page Generation", "level": "Base"}
+        assert cat["CWE-693"]["level"] == "Pillar" and len(cat) == 3
+
+    @pytest.mark.parametrize("blob", [b"not a zip", b""])
+    def test_a_catalogue_that_is_not_a_zip_parses_to_nothing(self, blob):
+        assert squawk.feeds._parse_cwe_zip(blob) == {}
+
+    def test_update_cwe_records_url_size_and_sha256(self, tmp_path, monkeypatch):
+        blob = self._zip()
+        monkeypatch.setattr(squawk.feeds, "_fetch_feed", lambda url, **k: (blob, ""))
+        ok, lines = squawk.update_cwe(str(tmp_path))
+        assert ok and "3 entries" in lines[0], lines
+        doc = squawk.load_cwe(str(tmp_path))
+        assert doc["url"] == squawk.CWE_URL and doc["bytes"] == len(blob)
+        assert doc["sha256"] == hashlib.sha256(blob).hexdigest()
+        assert doc["weaknesses"]["CWE-1004"]["level"] == "Variant"
+
+    def test_a_failed_or_empty_fetch_writes_nothing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(squawk.feeds, "_fetch_feed", lambda url, **k: (None, "timed out"))
+        ok, lines = squawk.update_cwe(str(tmp_path))
+        assert not ok and "timed out" in lines[0]
+        monkeypatch.setattr(squawk.feeds, "_fetch_feed", lambda url, **k: (b"junk", ""))
+        ok, lines = squawk.update_cwe(str(tmp_path))
+        assert not ok and "0 entries" in lines[0]
+        assert squawk.load_cwe(str(tmp_path)) is None
+
+    def test_cwes_of_reads_the_finding_then_the_cves_nvd_record(self, tmp_path):
+        root = str(tmp_path)
+        assert squawk.cwes_of({"detail": {"cwe": "693"}}, root) == (["CWE-693"], "scanner")
+        assert squawk.cwes_of({"detail": {"cwe": 78}}, root) == (["CWE-78"], "scanner")
+        assert squawk.cwes_of({"detail": {"cwe": "-1"}}, root) == ([], "")
+        assert squawk.cwes_of({"detail": {"cwe": "0"}}, root) == ([], "")
+        assert squawk.cwes_of({"detail": {"cwe": ["CWE-79: Improper Neutralization"]}},
+                              root) == (["CWE-79"], "scanner"), "Semgrep's form"
+        cve_finding = {"identity": "CVE-2021-33503", "detail": {}}
+        assert squawk.cwes_of(cve_finding, root) == ([], ""), "no NVD record cached"
+        # The cached shape `fetch_intel` writes: `_parse_nvd` already kept only
+        # the CWE-n values (NVD-CWE-Other and NVD-CWE-noinfo are dropped there).
+        os.makedirs(squawk.intel_dir(root), exist_ok=True)
+        with open(os.path.join(squawk.intel_dir(root), "CVE-2021-33503.json"), "w") as fh:
+            json.dump({"cwe": ["CWE-400"], "sources": {}}, fh)
+        assert squawk.cwes_of(cve_finding, root) == (["CWE-400"], "nvd")
+
+    def test_the_section_counts_out_of_every_finding(self, tmp_path):
+        root = self._estate(tmp_path)
+        html = squawk.view_intel(root)
+        block = html.split("By weakness")[1].split("</div></div>")[0]
+        # 3 CVE findings (no NVD cached), 1 bandit with no cwe, 4 new: 3 with a CWE
+        assert "3 of 8 findings name a weakness (CWE)" in block, block[:400]
+        assert "CWE-693" in block and "CWE-1004" in block and "CWE-78" in block
+        assert "name not fetched" in block, "names unknown without the catalogue"
+        assert "cwe.mitre.org/data/definitions/693.html" in block
+
+    def test_with_the_catalogue_the_names_and_levels_show(self, tmp_path, monkeypatch):
+        root = self._estate(tmp_path)
+        monkeypatch.setattr(squawk.feeds, "_fetch_feed",
+                            lambda url, **k: (self._zip(), ""))
+        squawk.update_cwe(root)
+        block = squawk.view_intel(root).split("By weakness")[1]
+        assert "Protection Mechanism Failure" in block and "Pillar" in block
+        assert "MITRE CWE" in squawk.view_intel(root), "provenance chip missing"
+
+    def test_an_id_missing_from_a_fetched_catalogue_is_not_called_unfetched(
+            self, tmp_path, monkeypatch):
+        """CWE-16 and CWE-264 are old categories, not weaknesses, so MITRE's
+        weakness list does not carry them. With the catalogue fetched, "name not
+        fetched, run squawk feeds" sent the reader in a circle (seen rendering
+        the live estate)."""
+        root = self._estate(tmp_path, extra=[
+            {"scanner": "zap", "identity": "10020:/:", "severity": "low",
+             "title": "X", "path": "/", "detail": {"cwe": "16"}}])
+        monkeypatch.setattr(squawk.feeds, "_fetch_feed",
+                            lambda url, **k: (self._zip(), ""))
+        squawk.update_cwe(root)
+        row = squawk.view_intel(root).split("CWE-16</a>")[1].split("</tr>")[0]
+        assert "not in MITRE&#39;s weakness list" in row and "name not fetched" not in row
+
+    def test_the_section_shows_without_the_exploitability_feeds(self, tmp_path):
+        html = squawk.view_intel(self._estate(tmp_path))
+        assert "have not been fetched" in html and "By weakness" in html
+
+    def test_the_page_never_opens_a_socket(self, tmp_path, monkeypatch):
+        root = self._estate(tmp_path)
+
+        def boom(*_a, **_k):
+            raise AssertionError("the page reached the network")
+        monkeypatch.setattr(squawk.feeds.urllib.request, "urlopen", boom)
+        assert "By weakness" in squawk.view_intel(root)
+
+    def test_squawk_feeds_fetches_the_catalogue_too(self, tmp_path, monkeypatch):
+        called = []
+        monkeypatch.setattr(squawk.cli, "update_feeds", lambda r: (True, ["  ok   kev"]))
+        monkeypatch.setattr(squawk.cli, "update_cwe",
+                            lambda r: (called.append(r) or True, ["  ok   cwe"]))
+        assert squawk.cli.main(["feeds", "--evidence", str(tmp_path)]) == 0
+        assert called == [str(tmp_path)]
+
+
+class TestDerivedTechniques:
+    """Plan 06: ATT&CK techniques, derived. No scanner on the lab estate
+    publishes an ATT&CK id, so the table is derived through MITRE's own CAPEC
+    catalogue (CWE -> CAPEC -> ATT&CK) and says so. Only Base and Variant CWEs
+    derive a technique: a Pillar such as CWE-693 maps to everything. A technique
+    ATT&CK has revoked or deprecated is named as retired, never counted."""
+
+    CAPEC = ("'ID,Name,Abstraction,Status,Related Weaknesses,Taxonomy Mappings\n"
+             '1,Accessing Functionality,Standard,Draft,::276::,'
+             '"TAXONOMY NAME:ATTACK:ENTRY ID:1574.010:ENTRY NAME:Services File Permissions::"\n'
+             "100,No mapping here,Standard,Draft,::89::,\n"
+             '200,Collect Data,Standard,Draft,::359::,'
+             '"TAXONOMY NAME:ATTACK:ENTRY ID:1005:ENTRY NAME:Data from Local System::"\n'
+             '300,Too Broad,Meta,Draft,::693::,'
+             '"TAXONOMY NAME:ATTACK:ENTRY ID:1611:ENTRY NAME:Escape to Host::"\n'
+             '400,Steal Cookie,Detailed,Draft,::1004::,'
+             '"TAXONOMY NAME:ATTACK:ENTRY ID:1539:ENTRY NAME:Steal Web Session Cookie::"\n'
+             '500,Old Mapping,Standard,Draft,::359::,'
+             '"TAXONOMY NAME:ATTACK:ENTRY ID:1099:ENTRY NAME:Timestomp::"\n')
+    CWE = ("CWE-ID,Name,Weakness Abstraction,Status,Description\n"
+           "359,Exposure of Private Personal Information,Base,Incomplete,x\n"
+           "693,Protection Mechanism Failure,Pillar,Draft,x\n"
+           "1004,Sensitive Cookie Without HttpOnly,Variant,Incomplete,x\n"
+           "89,SQL Injection,Base,Stable,x\n")
+
+    @staticmethod
+    def _bundle():
+        def ap(tid, name, tactics, **extra):
+            return dict({"type": "attack-pattern", "name": name,
+                         "external_references": [{"source_name": "mitre-attack",
+                                                  "external_id": tid}],
+                         "kill_chain_phases": [{"kill_chain_name": "mitre-attack",
+                                                "phase_name": t} for t in tactics]}, **extra)
+        return json.dumps({"type": "bundle", "objects": [
+            {"type": "x-mitre-collection", "name": "Enterprise ATT&CK",
+             "x_mitre_version": "20.1"},
+            ap("T1005", "Data from Local System", ["collection"]),
+            ap("T1539", "Steal Web Session Cookie", ["credential-access"]),
+            ap("T1611", "Escape to Host", ["privilege-escalation"]),
+            ap("T1574.010", "Services File Permissions Weakness", ["persistence"]),
+            ap("T1099", "Timestomp", ["defense-evasion"], revoked=True),
+            {"type": "relationship"}]}).encode()
+
+    def _zip(self, text):
+        import io as _io
+        import zipfile
+        buf = _io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("1000.csv", text)
+        return buf.getvalue()
+
+    def _fetch(self, monkeypatch, fail=""):
+        blobs = {squawk.CAPEC_URL: self._zip(self.CAPEC), squawk.ATTACK_URL: self._bundle(),
+                 squawk.CWE_URL: self._zip(self.CWE)}
+
+        def fake(url, **_k):
+            if url == fail:
+                return None, "timed out"
+            return blobs[url], ""
+        monkeypatch.setattr(squawk.feeds, "_fetch_feed", fake)
+
+    def _estate(self, tmp_path):
+        return TestWeaknesses._estate(self, tmp_path, extra=[
+            {"scanner": "zap", "identity": "10062:/:", "severity": "low",
+             "title": "PII disclosure", "path": "/", "detail": {"cwe": "359"}},
+            {"scanner": "zap", "identity": "40018:/:id", "severity": "high",
+             "title": "SQL Injection", "path": "/", "detail": {"cwe": "89"}}])
+
+    def test_capec_gives_both_link_directions_and_the_attack_ids(self):
+        c2p, p2t = squawk.feeds._parse_capec_zip(self._zip(self.CAPEC))
+        assert c2p["CWE-359"] == ["CAPEC-200", "CAPEC-500"]
+        assert p2t["CAPEC-1"] == ["T1574.010"] and "CAPEC-100" not in p2t
+        assert squawk.feeds._parse_capec_zip(b"junk") == ({}, {})
+
+    def test_the_attack_bundle_gives_names_tactics_status_and_version(self):
+        techs, version = squawk.feeds._parse_attack_bundle(self._bundle())
+        assert version == "20.1"
+        assert techs["T1539"] == {"name": "Steal Web Session Cookie",
+                                  "tactics": ["credential-access"], "status": "current"}
+        assert techs["T1099"]["status"] == "revoked"
+        assert squawk.feeds._parse_attack_bundle(b"{not json") == ({}, "")
+
+    def test_update_attack_records_both_sources(self, tmp_path, monkeypatch):
+        self._fetch(monkeypatch)
+        ok, lines = squawk.update_attack(str(tmp_path))
+        assert ok, lines
+        doc = squawk.load_attack(str(tmp_path))
+        for key, url in (("capec", squawk.CAPEC_URL), ("attack", squawk.ATTACK_URL)):
+            src = doc["sources"][key]
+            assert src["url"] == url and src["bytes"] > 0 and len(src["sha256"]) == 64
+        assert doc["sources"]["attack"]["version"] == "20.1"
+        assert doc["capec_to_tech"]["CAPEC-400"] == ["T1539"]
+
+    @pytest.mark.parametrize("which", ["capec", "attack"])
+    def test_either_fetch_failing_writes_nothing(self, tmp_path, monkeypatch, which):
+        self._fetch(monkeypatch, fail=squawk.CAPEC_URL if which == "capec" else squawk.ATTACK_URL)
+        ok, lines = squawk.update_attack(str(tmp_path))
+        assert not ok and any("timed out" in ln for ln in lines)
+        assert squawk.load_attack(str(tmp_path)) is None
+
+    def test_without_the_feed_the_section_says_so_and_counts_nothing(self, tmp_path):
+        html = squawk.view_intel(self._estate(tmp_path))
+        block = html.split("Techniques (ATT&amp;CK, derived)")[1].split("</div></div>")[0]
+        assert "squawk feeds --attack" in block
+        assert "findings reach" not in block, "a count was shown for a feed never fetched"
+
+    def test_without_the_cwe_catalogue_levels_are_unknown_so_nothing_is_derived(
+            self, tmp_path, monkeypatch):
+        root = self._estate(tmp_path)
+        self._fetch(monkeypatch)
+        squawk.update_attack(root)
+        block = squawk.view_intel(root).split("Techniques (ATT&amp;CK, derived)")[1]
+        block = block.split("</div></div>")[0]
+        assert "needs the CWE catalogue" in block and "findings reach" not in block
+
+    def test_the_table_derives_only_from_specific_cwes_and_says_how(self, tmp_path, monkeypatch):
+        root = self._estate(tmp_path)
+        self._fetch(monkeypatch)
+        squawk.update_cwe(root)
+        squawk.update_attack(root)
+        block = squawk.view_intel(root).split("Techniques (ATT&amp;CK, derived)")[1].split(
+            "</div></div>")[0]
+        # 10 findings: CWE-1004 (Variant) -> T1539; CWE-359 (Base) -> T1005 (+ T1099 revoked).
+        assert "2 of 10 findings reach an ATT&amp;CK technique" in block, block[:500]
+        assert "T1539" in block and "T1005" in block
+        assert "No scanner asserted" in block
+        assert "attack.mitre.org/techniques/T1539/" in block
+        assert "credential-access" in block, "the tactic is shown"
+        assert ">T1611<" not in block, "a Pillar CWE derived a technique"
+        assert "CWE-693" in block and "too broad" in block
+        assert "CWE-89" in block and "no route" in block
+        assert "CWE-78" in block and "the catalogue does not list" in block, \
+            "a CWE the catalogue lacks has an unknown level, not a broad one"
+        assert "T1099" in block and "revoked" in block, "a retired technique must be named"
+        assert ">T1099</a>" not in block, "and never counted as a row"
+
+    def test_a_technique_missing_from_attack_is_not_called_retired(self, tmp_path, monkeypatch):
+        """Found in review: CAPEC can name an id the Enterprise bundle does not
+        carry (a Mobile or ICS technique, or a typo). "Revoked or deprecated"
+        would be a false statement about MITRE's data."""
+        self.CAPEC = self.CAPEC + ('600,Elsewhere,Standard,Draft,::359::,'
+                                   '"TAXONOMY NAME:ATTACK:ENTRY ID:1234:ENTRY NAME:Gone::"\n')
+        root = self._estate(tmp_path)
+        self._fetch(monkeypatch)
+        squawk.update_cwe(root)
+        squawk.update_attack(root)
+        block = squawk.view_intel(root).split("Techniques (ATT&amp;CK, derived)")[1].split(
+            "</div></div>")[0]
+        assert "T1234" in block and "not in Enterprise ATT&amp;CK" in block
+        retired_note = block.split("marks revoked or deprecated")[0].rsplit("<p", 1)[-1]
+        assert "T1234" not in retired_note and "T1099" in retired_note
+
+    def test_each_reason_lists_only_the_cwes_that_fit_it(self, tmp_path, monkeypatch):
+        """Found in review: a finding naming CWE-693 (Pillar) and CWE-89 (Base,
+        no route) put the Pillar under "a specific CWE with no route"."""
+        root = TestWeaknesses._estate(self, tmp_path, extra=[
+            {"scanner": "zap", "identity": "40018:/:q", "severity": "high",
+             "title": "SQLi", "path": "/", "detail": {"cwe": ["693", "89"]}}])
+        self._fetch(monkeypatch)
+        squawk.update_cwe(root)
+        squawk.update_attack(root)
+        block = squawk.view_intel(root).split("Techniques (ATT&amp;CK, derived)")[1]
+        no_route = block.split("no route in MITRE&#39;s data")[1].split(";")[0]
+        assert "CWE-89" in no_route and "CWE-693" not in no_route, no_route
+
+    def test_a_deprecated_capec_pattern_is_not_followed(self):
+        text = self.CAPEC + ('700,Withdrawn,Standard,Deprecated,::1004::,'
+                             '"TAXONOMY NAME:ATTACK:ENTRY ID:1082:ENTRY NAME:Sys Info::"\n')
+        c2p, p2t = squawk.feeds._parse_capec_zip(self._zip(text))
+        assert "CAPEC-700" not in c2p.get("CWE-1004", []) and "CAPEC-700" not in p2t
+
+    def test_a_current_entry_beats_a_revoked_duplicate_in_either_order(self):
+        def bundle(*objs):
+            return json.dumps({"objects": list(objs)}).encode()
+        cur = {"type": "attack-pattern", "name": "Now",
+               "external_references": [{"source_name": "mitre-attack", "external_id": "T1005"}]}
+        old = dict(cur, name="Old", revoked=True)
+        for order in ((cur, old), (old, cur)):
+            techs, _v = squawk.feeds._parse_attack_bundle(bundle(*order))
+            assert techs["T1005"]["status"] == "current", order
+
+    def test_a_failed_write_keeps_the_old_cache_and_reports_a_gap(self, tmp_path, monkeypatch):
+        root = str(tmp_path)
+        self._fetch(monkeypatch)
+        assert squawk.update_attack(root)[0]
+        before = squawk.load_attack(root)
+
+        def full(*_a, **_k):
+            raise OSError(28, "No space left on device")
+        monkeypatch.setattr(squawk.feeds.os, "replace", full)
+        ok, lines = squawk.update_attack(root)
+        assert not ok and "cannot write" in lines[-1] and "No space" in lines[-1]
+        assert squawk.load_attack(root) == before, "a failed write lost the good cache"
+        ok, lines = squawk.update_cwe(root)
+        assert not ok and "cannot write" in lines[-1]
+
+    def test_feed_flags_outside_feeds_are_refused(self, tmp_path):
+        for flag in ("--attack", "--intel", "--refetch"):
+            assert squawk.cli.main(["verify", flag, "--evidence", str(tmp_path)]) == 2, flag
+
+    def test_a_dotted_subtechnique_links_with_a_slash(self):
+        assert squawk.web._attack_url("T1574.010") == \
+            "https://attack.mitre.org/techniques/T1574/010/"
+
+    def test_the_page_never_opens_a_socket(self, tmp_path, monkeypatch):
+        root = self._estate(tmp_path)
+        self._fetch(monkeypatch)
+        squawk.update_cwe(root)
+        squawk.update_attack(root)
+
+        def boom(*_a, **_k):
+            raise AssertionError("the page reached the network")
+        monkeypatch.setattr(squawk.feeds.urllib.request, "urlopen", boom)
+        assert "T1539" in squawk.view_intel(root)
+
+    def test_the_provenance_strip_names_both_sources(self, tmp_path, monkeypatch):
+        root = self._estate(tmp_path)
+        assert "MITRE CAPEC + ATT&amp;CK &middot; not fetched" in squawk.view_intel(root)
+        self._fetch(monkeypatch)
+        squawk.update_attack(root)
+        assert "ATT&amp;CK 20.1" in squawk.view_intel(root)
+
+    def test_feeds_attack_is_opt_in(self, tmp_path, monkeypatch):
+        called = []
+        monkeypatch.setattr(squawk.cli, "update_feeds", lambda r: (True, []))
+        monkeypatch.setattr(squawk.cli, "update_cwe", lambda r: (True, []))
+        monkeypatch.setattr(squawk.cli, "update_attack",
+                            lambda r: (called.append(r) or True, ["  ok   attack"]))
+        assert squawk.cli.main(["feeds", "--evidence", str(tmp_path)]) == 0
+        assert called == [], "the 55 MB fetch ran without --attack"
+        assert squawk.cli.main(["feeds", "--attack", "--evidence", str(tmp_path)]) == 0
+        assert called == [str(tmp_path)]
+
+
+class TestNuclei:
+    """Plan 05, item 6: nuclei as its own url service. Measured against OWASP
+    Juice Shop, a deliberately vulnerable public test app: one template matched
+    its exposed /metrics, and the run's last
+    `-sj` stats line carried templates 4996, requests 12092, errors 48."""
+
+    # The shape nuclei 3.11.1 wrote, with the scanning machine's paths and the
+    # curl command reduced to placeholders.
+    LINE = json.dumps({
+        "template": "http/exposures/configs/prometheus-metrics.yaml",
+        "template-url": "https://cloud.projectdiscovery.io/public/prometheus-metrics",
+        "template-id": "prometheus-metrics",
+        "template-path": "/home/someone/.local/nuclei-templates/http/exposures/x.yaml",
+        "info": {"name": "Prometheus Metrics - Detect", "author": ["x"],
+                 "tags": ["exposure", "prometheus", "config", "vuln"],
+                 "reference": ["https://github.com/prometheus/prometheus"],
+                 "severity": "medium",
+                 "classification": {"cve-id": None, "cwe-id": ["cwe-200"],
+                                    "cvss-score": 5.3}},
+        "type": "http", "host": "10.0.0.5", "port": "3000", "scheme": "http",
+        "url": "http://10.0.0.5:3000", "matched-at": "http://10.0.0.5:3000/metrics",
+        "ip": "10.0.0.5", "timestamp": "2026-11-20T10:50:42-06:00",
+        "curl-command": "curl -X 'GET' ...", "matcher-status": True})
+    STATS = ('{"duration":"0:00:05","errors":"2","matched":"0","requests":"503",'
+             '"templates":"4996","total":"12084"}\n'
+             "[INF] Scan completed in 3m. 1 matches found.\n"
+             '{"duration":"0:03:10","errors":"48","hosts":"1","matched":"1",'
+             '"percent":"100","requests":"12092","rps":"63","templates":"4996",'
+             '"total":"12084"}\n')
+
+    def test_a_match_becomes_a_finding_keyed_by_template_and_path(self):
+        (f,) = squawk.scanners.norm_nuclei(self.LINE, "")
+        assert f.scanner == "nuclei" and f.identity == "prometheus-metrics:/metrics"
+        assert f.severity == "medium" and f.path == "/metrics"
+        assert f.detail["cwe"] == ["CWE-200"] and f.detail["template"] == "prometheus-metrics"
+        detail = json.dumps(f.detail)
+        assert "template-path" not in detail and "/home/" not in detail, \
+            "a path on the scanning machine reached the finding"
+        assert squawk.cwes_of(f._asdict(), "/nonexistent") == (["CWE-200"], "scanner")
+
+    def test_the_host_is_not_the_identity(self):
+        moved = self.LINE.replace("10.0.0.5", "192.168.1.50")
+        assert squawk.scanners.norm_nuclei(moved, "")[0].identity == \
+            squawk.scanners.norm_nuclei(self.LINE, "")[0].identity
+
+    def test_a_cve_template_is_read_as_its_cve(self):
+        line = json.loads(self.LINE)
+        line["template-id"] = "CVE-2021-44228"
+        line["info"]["classification"]["cve-id"] = ["cve-2021-44228"]
+        (f,) = squawk.scanners.norm_nuclei(json.dumps(line), "")
+        assert squawk.cve_of(f._asdict()) == "CVE-2021-44228"
+        assert f.detail["cve"] == ["CVE-2021-44228"]
+
+    def test_junk_and_blank_lines_are_skipped(self):
+        raw = "\n[INF] banner\n{not json\n" + self.LINE + "\n{\"no\": \"template\"}\n"
+        assert len(squawk.scanners.norm_nuclei(raw, "")) == 1
+        assert squawk.scanners.norm_nuclei("", "") == []
+
+    def test_the_last_stats_line_is_the_denominator(self):
+        cov = squawk.scanners._cov_nuclei("", "", self.STATS)
+        assert cov.examined == 4996 and cov.unit == "templates"
+        assert "12092 request(s) of 12084 planned, 48 error(s), 1 match(es)" in cov.note
+
+    def test_no_stats_line_is_unknown_not_zero(self):
+        assert squawk.scanners._cov_nuclei("", "", "[INF] started\n").examined is None
+
+    def test_the_command_runs_only_the_safe_tags_and_never_calls_out(self, tmp_path):
+        ctx = types.SimpleNamespace(target="http://10.0.0.5:3000",
+                                    raw_path=str(tmp_path / "nuclei.jsonl"))
+        cmd, timeout = squawk.stages.stage_nuclei(ctx)
+        def after(flag):
+            return cmd[cmd.index(flag) + 1]
+        assert cmd[0] == "nuclei" and after("-u") == "http://10.0.0.5:3000"
+        assert after("-tags") == "cve,misconfig,exposure"
+        assert after("-etags") == "dos,fuzz,intrusive"
+        assert after("-severity") == "medium,high,critical"
+        for flag in ("-ni", "-duc", "-or", "-stats", "-sj", "-jsonl"):
+            assert flag in cmd, flag
+        for never in ("-code", "-headless", "-dast", "-iserver", "-interactsh-url",
+                      "-cloud-upload", "-dashboard"):
+            assert never not in cmd, never
+        assert after("-o") == ctx.raw_path and timeout > 0
+
+    def test_cloud_upload_variables_are_set_aside(self, monkeypatch):
+        monkeypatch.setenv("PDCP_API_KEY", "x")
+        monkeypatch.setenv("ENABLE_CLOUD_UPLOAD", "true")
+        assert squawk.env_set_aside(["nuclei", "-u", "x"]) == ["ENABLE_CLOUD_UPLOAD",
+                                                               "PDCP_API_KEY"]
+
+    def test_its_own_config_is_named_when_it_narrows_the_run(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+        home = str(tmp_path)
+        assert squawk.nuclei_config_narrowing(home) == []
+        cdir = tmp_path / ".config" / "nuclei"
+        cdir.mkdir(parents=True)
+        (cdir / "config.yaml").write_text("# exclude-templates:\n#  - x\nverbose: true\n")
+        assert squawk.nuclei_config_narrowing(home) == [], "comments and other keys narrow nothing"
+        (cdir / "config.yaml").write_text("exclude-templates:\n  - http/cves/\n")
+        assert squawk.nuclei_config_narrowing(home) == ["config.yaml sets exclude-templates"]
+        (cdir / ".nuclei-ignore").write_text(
+            "tags:\n  - \"dos\"\n  - \"fuzz\"\nfiles:\n  - http/cves/2019/CVE-2019-14696.yaml\n"
+            "  - dns/soa-detect.yaml\n")
+        notes = squawk.nuclei_config_narrowing(home)
+        assert (".nuclei-ignore excludes 2 tag(s) (dos, fuzz) and 2 template file(s), "
+                "1 of them a CVE template") in notes
+
+    def test_the_doctor_reads_a_clean_version(self, monkeypatch):
+        class Done:
+            stdout = ""
+            stderr = "[\x1b[34mINF\x1b[0m] Nuclei Engine Version: v3.11.1\n"
+        monkeypatch.setattr(squawk.core, "tool_path", lambda b: "/usr/bin/" + b)
+        monkeypatch.setattr(squawk.core.subprocess, "run", lambda *a, **k: Done())
+        assert squawk.tool_version(squawk.SCANNERS["nuclei"]) == "Nuclei Engine Version: v3.11.1"
+
+    def test_a_list_of_cwes_reads_as_text_in_the_finding_detail(self):
+        """Seen rendering a Juice Shop run: the chip read "CWE ['CWE-200']", the
+        Python list, because ZAP's cwe is a string and nuclei's is a list."""
+        (f,) = squawk.scanners.norm_nuclei(self.LINE, "")
+        html = squawk.web._detail_block(dict(f.detail, cwe=["CWE-200", "CWE-79"]))
+        assert "CWE CWE-200, CWE-79" in html and "[&#x27;" not in html and "['" not in html
+
+    def _cfg(self, tmp_path, text, ignore=None):
+        cdir = tmp_path / ".config" / "nuclei"
+        cdir.mkdir(parents=True, exist_ok=True)
+        (cdir / "config.yaml").write_text(text)
+        if ignore is not None:
+            (cdir / ".nuclei-ignore").write_text(ignore)
+        return str(tmp_path)
+
+    def test_a_config_that_widens_the_run_is_refused(self, tmp_path, monkeypatch):
+        """Found in review: leaving -code off the command line does not stop a
+        config.yaml that says `code: true`. Squawk refuses rather than guessing
+        which of the two nuclei obeys."""
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+        home = self._cfg(tmp_path, "code: true\ndashboard: true\nverbose: true\n")
+        reason = squawk.nuclei_config_refusal(home)
+        assert "code" in reason and "dashboard" in reason and "verbose" not in reason
+        assert squawk.nuclei_config_refusal(self._cfg(tmp_path, "code: false\n")) == ""
+        assert squawk.TOOL_PREFLIGHT["nuclei"] is squawk.core.nuclei_config_refusal
+
+    def test_the_command_switches_the_widening_options_off_explicitly(self, tmp_path):
+        ctx = types.SimpleNamespace(target="http://t", raw_path=str(tmp_path / "n.jsonl"))
+        cmd, _t = squawk.stages.stage_nuclei(ctx)
+        for flag in ("-code=false", "-esc=false", "-headless=false", "-dast=false",
+                     "-dashboard=false"):
+            assert flag in cmd, flag
+
+    def test_xdg_config_home_moves_where_its_config_is_read(self, tmp_path, monkeypatch):
+        """nuclei 3.11.1 reads $XDG_CONFIG_HOME/nuclei when it is set (measured)."""
+        xdg = tmp_path / "xdg" / "nuclei"
+        xdg.mkdir(parents=True)
+        (xdg / "config.yaml").write_text("exclude-templates:\n  - http/cves/\n")
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+        assert squawk.nuclei_config_narrowing(str(tmp_path / "home")) == [
+            "config.yaml sets exclude-templates"]
+
+    def test_a_repeated_key_is_named_once_and_filter_options_count(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+        home = self._cfg(tmp_path, "tags:\n  - a\ntags:\n  - b\ntemplate-condition:\n  - x\n")
+        assert squawk.nuclei_config_narrowing(home) == [
+            "config.yaml sets tags", "config.yaml sets template-condition"]
+
+    def test_a_single_cwe_given_as_a_string_is_not_split_into_letters(self):
+        line = json.loads(self.LINE)
+        line["info"]["classification"]["cwe-id"] = "cwe-200"
+        line["info"]["classification"]["cve-id"] = "cve-2021-44228"
+        line["info"]["tags"] = ""
+        (f,) = squawk.scanners.norm_nuclei(json.dumps(line), "")
+        assert f.detail["cwe"] == ["CWE-200"] and f.detail["cve"] == ["CVE-2021-44228"]
+        assert f.detail["tags"] == []
+
+    def test_extracted_values_are_kept_out_of_the_finding_and_the_report(self):
+        """An exposure template can extract a secret (an .env value, a key).
+        It must not reach the evidence locker or a page."""
+        line = json.loads(self.LINE)
+        line["extracted-results"] = ["AWS_SECRET_ACCESS_KEY=abc123secretvalue"]
+        (f,) = squawk.scanners.norm_nuclei(json.dumps(line), "")
+        assert "abc123secretvalue" not in json.dumps(f.detail)
+        assert f.detail.get("extracted_count") == 1
+        scrubbed = squawk.scanners.SCRUBBERS["nuclei"](json.dumps(line) + "\nnot json\n")
+        assert "abc123secretvalue" not in scrubbed
+        rows = [json.loads(x) for x in scrubbed.splitlines()]
+        assert rows[0]["extracted-results"] == ["<1 value, withheld by squawk>"]
+        assert rows[1].get("SquawkUnreadableLine") == 2
+
+    def test_its_report_shape_is_checked(self):
+        assert "nuclei" in squawk.scanners.REPORT_SHAPES
+        assert squawk.scanners.report_unreadable("nuclei", "plain text output\n")
+        assert squawk.scanners.report_unreadable("nuclei", self.LINE + "\n") is None
+        assert squawk.scanners.report_unreadable("nuclei", "") is None, "no matches is clean"
+
+    def test_a_note_retest_names_cveprobe(self):
+        hint = squawk.report.retest_for({"scanner": "nuclei", "path": "/metrics",
+                                         "identity": "prometheus-metrics:/metrics",
+                                         "detail": {"rule": "prometheus-metrics"}})
+        assert "squawk run cveprobe --target <url>" in hint and "prometheus-metrics" in hint
+
+    def test_the_finding_says_where_how_serious_and_how_to_reproduce(self):
+        """A reader acting on the finding needs the exact URL (the identity
+        leaves the host out on purpose; the detail must not), the score the
+        template gives, and the request that proved it. nuclei supplies all
+        three; the first version kept none of them."""
+        line = json.loads(self.LINE)
+        line["curl-command"] = "curl -X 'GET' -H 'Accept: */*' 'http://10.0.0.5:3000/metrics'"
+        line["info"]["classification"]["cvss-metrics"] = \
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"
+        (f,) = squawk.scanners.norm_nuclei(json.dumps(line), "")
+        d = f.detail
+        assert d["url"] == "http://10.0.0.5:3000/metrics"
+        assert d["evidence"] == ("template prometheus-metrics matched "
+                                 "http://10.0.0.5:3000/metrics")
+        assert d["cvss"] == "5.3" and d["cvss_vector"].startswith("CVSS:3.1/AV:N")
+        assert d["reproduce"].startswith("curl -X 'GET'") and "other" not in d
+        assert "https://cloud.projectdiscovery.io/public/prometheus-metrics" in d["reference"]
+        html = squawk.web._detail_block(d)
+        assert "http://10.0.0.5:3000/metrics" in html and "CVSS 5.3" in html
+        assert "curl -X" in html
+
+    def test_the_engineer_report_carries_what_an_engineer_needs_to_verify(self):
+        """The report entry had severity, path, evidence and description: no
+        reference, no CWE or score, and no way to reproduce, so an engineer
+        handed the report could not check the finding without Squawk."""
+        line = json.loads(self.LINE)
+        line["curl-command"] = "curl -X 'GET' 'http://10.0.0.5:3000/metrics'"
+        (f,) = squawk.scanners.norm_nuclei(json.dumps(line), "")
+        md = squawk.report._finding_block(f._asdict(), 1)
+        assert "| CWE | CWE-200 |" in md and "| CVSS | 5.3 |" in md
+        assert "**How to reproduce**" in md and "curl -X 'GET'" in md
+        assert "**References**" in md and "github.com/prometheus/prometheus" in md
+        plain = squawk.report._finding_block({"scanner": "bandit", "identity": "B602:x.py:1",
+                                              "severity": "high", "title": "shell",
+                                              "path": "x.py", "detail": {"description": "d"}}, 2)
+        assert "| CWE |" not in plain and "How to reproduce" not in plain \
+            and "References" not in plain, "a finding without them gains no empty rows"
+
+    def test_a_rescan_does_not_count_the_same_finding_twice_in_the_report(self, tmp_path):
+        """Two runs of one target in a session, the same template matching both
+        times: the engineer report said "Findings 2" and "medium 2" and listed
+        it twice. It is one finding, seen twice; the newest copy is listed."""
+        root = str(tmp_path)
+        (old,) = squawk.scanners.norm_nuclei(self.LINE, "")
+        line = json.loads(self.LINE)
+        line["curl-command"] = "curl 'http://10.0.0.5:3000/metrics'"
+        (new,) = squawk.scanners.norm_nuclei(json.dumps(line), "")
+        for rid, f in (("20261120T100000Z-url", old), ("20261120T110000Z-url", new)):
+            d = os.path.join(root, rid)
+            os.makedirs(d)
+            man = {"run_id": rid, "service": "cveprobe", "scope": "url", "session": "s",
+                   "target": "http://10.0.0.5:3000", "service_label": "Known-vulnerability probe",
+                   "not_covered": "", "counts": {"total": 1}, "ledger": []}
+            for name, obj in (("manifest.json", man), ("findings.json", [f._asdict()]),
+                              ("digest.json", {})):
+                with open(os.path.join(d, name), "w") as fh:
+                    json.dump(obj, fh)
+        md, count = squawk.report.report_markdown(root, "s")
+        assert count == 1 and md.count("### ") - md.count("### Targets") == 1, md
+        assert ("| Findings | 1 distinct, seen 2 times across 2 runs, of which "
+                "**0 recorded by hand** |") in md
+        assert "| medium | 1 |" in md
+        assert "How to reproduce" in md, "the newest run's copy is the one listed"
+
+    def test_sarif_gives_a_web_finding_its_url_not_a_file_path(self):
+        """SARIF's artifact location is read as a file by code-scanning tools.
+        `/metrics` there is a file that does not exist in any repository; the
+        full URL is a valid absolute URI and says where the finding is."""
+        man = {"run_id": "r", "service": "cveprobe", "scope": "url",
+               "target": "http://10.0.0.5:3000", "ledger": [
+                   {"tool": "nuclei", "mode": "templates", "status": "ok", "detail": ""}]}
+        f = {"scanner": "nuclei", "identity": "prometheus-metrics:/metrics",
+             "severity": "medium", "title": "x", "path": "/metrics",
+             "detail": {"rule": "prometheus-metrics"}}
+        doc = squawk.sarif.sarif_document(man, [f])
+        loc = doc["runs"][0]["results"][0]["locations"][0]["physicalLocation"]
+        assert loc["artifactLocation"]["uri"] == "http://10.0.0.5:3000/metrics"
+        repo = dict(man, scope="repo", target="/src/app")
+        g = dict(f, scanner="bandit", path="app/x.py", detail={"rule": "B602", "line": 3})
+        repo["ledger"] = [{"tool": "bandit", "mode": "recursive", "status": "ok", "detail": ""}]
+        rloc = squawk.sarif.sarif_document(repo, [g])["runs"][0]["results"][0]["locations"][0]
+        assert rloc["physicalLocation"]["artifactLocation"]["uri"] == "app/x.py"
+
+    def test_it_is_a_url_service_of_its_own_not_part_of_the_passive_probe(self):
+        svc = squawk.SERVICES["cveprobe"]
+        assert svc.scope == "url" and svc.stages == ("nuclei",)
+        assert "nuclei" not in squawk.SERVICES["liveprobe"].stages
+        assert "fuzz" in svc.not_covered and "out-of-band" in svc.not_covered
+
+    def test_the_run_line_names_what_its_own_config_changes(self):
+        """Seen on a Juice Shop run: the note reached the run record and the
+        log, not the line the operator reads."""
+        assert squawk.TOOL_CONFIG_NOTES["nuclei"] is squawk.core.nuclei_config_narrowing
+        ran = {"tool_config": [".nuclei-ignore excludes 5 tag(s)"]}
+        line = squawk.engine._with_tool_config("1 finding(s) across 4996 templates", ran)
+        assert line == ("1 finding(s) across 4996 templates  ·  its own config: "
+                        ".nuclei-ignore excludes 5 tag(s)")
+        assert squawk.engine._with_tool_config("ok", {}) == "ok"
 
 
 class TestRetention:
@@ -8063,15 +8960,10 @@ class TestTheClockWall:
         assert ids[0] == "UTC", "the evidence's own zone leads"
         offsets = [squawk._zone_now(z, time.time()) for z in ids[1:]]
         assert all(o is not None for o in offsets), ids
-        # All four US offsets. Honolulu and Denver were missing, so a wall
-        # meant to answer "what time is it where that ran" skipped two of the
-        # zones a US deployment can run in.
-        assert ids[1:6] == ["Pacific/Honolulu", "America/Los_Angeles",
-                            "America/Denver", "America/Chicago",
-                            "America/New_York"], "the American zones, west to east"
-        assert "Europe/London" in ids and "Europe/Berlin" in ids
-        assert "Asia/Tokyo" in ids and "Asia/Singapore" in ids
-        assert "Asia/Kolkata" in ids, "half-hour offsets exist"
+        # Five: fifteen did not fit one strip and read as noise. The US coasts,
+        # the central zone, and the main European desk.
+        assert ids == ["UTC", "America/Los_Angeles", "America/Chicago",
+                       "America/New_York", "Europe/London"], ids
         assert len(set(ids)) == len(ids), "no zone twice"
 
     def test_the_wall_runs_west_to_east_after_utc(self):
@@ -8156,11 +9048,11 @@ class TestTheClockWall:
         real = squawk.web._zone_now
         monkeypatch.setattr(
             squawk.web, "_zone_now",
-            lambda z, w: None if z in ("Europe/Berlin", "Asia/Dubai") else real(z, w))
+            lambda z, w: None if z in ("America/New_York", "Europe/London") else real(z, w))
         wall = squawk.clock_wall()
         assert "clk miss" in wall and ">2 zone(s) missing" in wall, wall[-400:]
-        assert "Europe/Berlin, Asia/Dubai" in wall, "named, so it can be fixed"
-        assert "data-zone='Europe/Berlin'" not in wall, "and not drawn empty"
+        assert "America/New_York, Europe/London" in wall, "named, so it can be fixed"
+        assert "data-zone='Europe/London'" not in wall, "and not drawn empty"
 
     def test_the_server_clock_is_never_re_read_from_the_browser(self):
         """A browser whose clock is wrong must not make the server's look
@@ -8177,14 +9069,50 @@ class TestTheClockWall:
         assert "disagree by" in html and "comes from the server" in html
         assert ".clocks .who.skew{background:var(--high);color:#fff}" in squawk.PAGE_CSS
 
-    def test_fifteen_clocks_can_never_push_a_page_sideways(self):
-        """Cells sized as a percentage of the strip cannot exceed it, so there
-        is nothing to scroll. `live-check.py` measures the page at four widths;
-        this is the rule that makes that measurement hold."""
+    def test_the_wall_is_one_short_row(self, monkeypatch):
+        """Five clocks, plus the server's zone when it is not one of them: at
+        most six cells, which fit one row on a laptop. Each cell has a width of
+        its own rather than a share of the strip, so a wide screen does not
+        stretch six clocks across 3,000 pixels."""
+        def cells(wall):
+            return re.findall(r"class='clk[^']*' data-zone", wall)
+        assert len(cells(squawk.clock_wall())) <= 6
+        monkeypatch.setattr(squawk.web, "_server_zone", lambda: "Asia/Tokyo")
+        wall = squawk.clock_wall()
+        assert len(cells(wall)) == 6 and "data-zone='Asia/Tokyo'" in wall, \
+            "a server outside the five still gets its clock, badged"
+        rule = squawk.PAGE_CSS.split(".clocks .clk{")[1].split("}")[0]
+        assert "%" not in rule, "a percentage width spreads a short wall across a wide screen"
+
+    def test_the_wall_can_never_push_a_page_sideways(self):
+        """The strip wraps, and each cell can shrink to nothing (`min-width:0`
+        with a shrinkable basis), so no clock is wider than the strip.
+        `live-check.py` measures the page at four widths; this is the rule that
+        makes that measurement hold."""
         rule = squawk.PAGE_CSS.split(".clocks{")[1].split("}")[0]
         assert "flex-wrap:wrap" in rule and "justify-content:center" in rule, rule
         assert "overflow-x" not in rule, \
             "a scrollbar on a wall that cannot overflow only hides clocks"
+        cell = squawk.PAGE_CSS.split(".clocks .clk{")[1].split("}")[0]
+        assert "min-width:0" in cell and "flex:0 1" in cell, cell
+
+    def test_half_hour_offsets_and_bare_abbreviations_still_render(self, monkeypatch):
+        """Kolkata and Dubai left the wall, and with them the only
+        checks of two paths: a half-hour offset, and a zone whose abbreviation
+        is just its offset. A server in either zone still gets its clock."""
+        assert squawk._zone_now("Asia/Kolkata", time.time())[3] == "UTC+5:30"
+        monkeypatch.setattr(squawk.web, "_server_zone", lambda: "Asia/Dubai")
+        wall = squawk.clock_wall()
+        cell = wall.split("data-zone='Asia/Dubai'")[1].split("</div>")[0]
+        assert "UTC+4" in cell and "+04 · UTC+4" not in cell, cell
+
+    def test_the_readers_clock_goes_at_the_end_not_after_utc(self):
+        """It was inserted straight after UTC, so a reader in Tokyo read the
+        wall as UTC, Tokyo, Los Angeles: out of the west-to-east order. It now
+        goes at the end, beside the server's added clock."""
+        js = squawk.web.CLOCK_JS
+        assert "w.firstChild.nextSibling" not in js
+        assert "w.insertBefore(mine,w.querySelector('.miss'))" in js
 
     def test_the_walls_own_classes_are_not_someone_elses(self):
         """The mark rendered as a 15px circle because `.mark` was already the
@@ -19350,6 +20278,61 @@ class TestTheReleaseInstaller:
         assert (dest / "dockle").read_bytes() == inner.read_bytes()
         assert not (dest / "README.md").exists(), "only the binary is installed"
 
+    def test_a_binary_inside_a_checked_zip_is_installed(self, tmp_path):
+        """nuclei ships a zip (nuclei_3.11.1_linux_arm64.zip). The checksum
+        covers the zip; only the named member is taken out, and a member that
+        is not there is refused rather than installing something else."""
+        import hashlib
+        import shutil as _sh
+        import subprocess
+        import zipfile
+        if not (_sh.which("bash") and _sh.which("curl") and _sh.which("unzip")):
+            pytest.skip("bash, curl and unzip are needed to run the installer's functions")
+        rel = tmp_path / "rel"
+        rel.mkdir()
+        payload = b"#!/bin/sh\necho 'Nuclei Engine Version: v9.9.9'\n"
+        archive = rel / "nuclei_9.9.9_linux_arm64.zip"
+        with zipfile.ZipFile(str(archive), "w") as zf:
+            zf.writestr("nuclei", payload)
+            zf.writestr("README.md", "readme")
+        (rel / "sums.txt").write_text("%s  %s\n" % (
+            hashlib.sha256(archive.read_bytes()).hexdigest(), archive.name))
+        path = os.path.join(os.path.dirname(os.path.abspath(squawk.ENTRY_PATH)),
+                            "install-tools.sh")
+        src = open(path, encoding="utf-8").read()
+        funcs = "".join(re.search(r"(?ms)^%s\(\) \{.*?^\}\n" % name, src).group(0)
+                        for name in ("sha256_of", "install_release"))
+
+        def run(member, dest):
+            harness = (
+                "have() { command -v \"$1\" >/dev/null 2>&1; }\n"
+                "ok() { echo \"ok $*\"; }\nadd() { echo \".. $*\"; }\n"
+                "bad() { echo \"!! $*\"; }\nfact() { :; }\nokv() { ok \"$1\"; }\n"
+                "MODE=install; PRIV=none; SUDO=''; REL_OS=linux; REL_ARCH=arm64\n"
+                "REL_DIR=%s\nPATH=/usr/bin:/bin\n%s\n"
+                "install_release nuclei file://%s file://%s %s\n"
+                % (dest, funcs, archive, rel / "sums.txt", member))
+            return subprocess.run(["bash", "-c", harness], capture_output=True, text=True,
+                                  timeout=60)
+        dest = tmp_path / "bin"
+        proc = run("nuclei", dest)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert (dest / "nuclei").read_bytes() == payload
+        assert not (dest / "README.md").exists(), "only the binary is installed"
+        missing = run("not-there", tmp_path / "bin2")
+        assert missing.returncode != 0 and "is not in the archive" in missing.stdout
+        assert not (tmp_path / "bin2" / "nuclei").exists()
+
+    def test_the_installer_fetches_nuclei_and_its_templates(self):
+        src = open(os.path.join(os.path.dirname(os.path.abspath(squawk.ENTRY_PATH)),
+                                "install-tools.sh"), encoding="utf-8").read()
+        assert "latest_tag projectdiscovery/nuclei" in src
+        assert "nuclei_${NUCLEI_V}_checksums.txt" in src, "the zip is not checked"
+        assert "nuclei -update-templates" in src, \
+            "Squawk runs nuclei with -duc, so templates must be fetched here"
+        assert "for logical in hadolint dockle osv-scanner nuclei; do" in src, \
+            "--detect does not list nuclei"
+
     def test_a_checksum_file_without_the_asset_is_refused(self, tmp_path):
         proc, dest, _b = self._run(
             tmp_path, lambda b: "%s *%s-not-it\n" % (self._sum(b), b.name))
@@ -20299,7 +21282,7 @@ class TestRemediationDeadlines:
         assert "Recorded 2 decision(s) for session eng-1" in res.stdout, res.stdout
         [run] = [d for d in root.iterdir() if (d / "dispositions.json").is_file()]
         assert "dispositions.json" in (run / "digest.json").read_text(), "the digest covers it"
-        model = squawk.report.share_model(str(root), "eng-1", today=self._utc_today())
+        model = squawk.report.share_model(str(root), "eng-1", today="2026-10-23")
         [scan] = model["scanner"]
         [rev] = model["reviewer"]
         assert scan["status"] == "risk accepted" and "until %s" % until in scan["decision"]

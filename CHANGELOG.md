@@ -25,6 +25,74 @@ joined across layers.
 
 ## Unreleased
 
+## 0.12.0 — 2026-11-20
+
+The first public release since 0.10.0; it includes everything below.
+
+### nuclei, a known-vulnerability probe
+
+- **`cveprobe` runs ProjectDiscovery's nuclei** against a running web app,
+  behind the same private-target rail as the other DAST services. Only the
+  `cve`, `misconfig` and `exposure` template tags, never `dos`, `fuzz` or
+  `intrusive`; medium severity and up; no code, headless or fuzzing templates
+  (switched off explicitly on the command line), nothing sent to an
+  interaction server, no cloud upload. A nuclei configuration that turns any
+  of those on is refused, with the key named.
+- **The run states what it sent**: templates loaded, requests, errors and
+  matches, from nuclei's own final stats line. What nuclei's own configuration
+  and its `.nuclei-ignore` leave out is printed on the stage line and listed
+  by `doctor`.
+- **A finding says where, how serious and how to reproduce it**: the full URL,
+  the template's CWE and CVSS score, the exact request nuclei sent, and the
+  template's public page. A CVE template's finding is read as its CVE, so KEV,
+  EPSS and the watchlist apply. Anything a template extracted (exposure
+  templates can extract secrets) is withheld from the evidence; only a count
+  is kept.
+- **`install-tools.sh` installs nuclei** from its release zip, checked against
+  the release's checksums, and fetches its templates.
+
+### Reports and exports
+
+- **The engineer report** lists each finding once with how often it was seen,
+  and carries CWE, CVSS, references and a reproduction step for every scanner
+  that supplies them.
+- **SARIF** gives a web finding its full URL rather than a path a
+  code-scanning tool would read as a repository file.
+
+### Threat intel: a watchlist, the estate by weakness, and ATT&CK techniques
+
+- **A CVE watchlist.** `squawk watch add CVE --reason TEXT`, `squawk watch
+  remove CVE` and `squawk watch` keep a list of CVEs to flag whenever they
+  appear. Each change is an append-only, chained line in the evidence root;
+  `verify` checks the chain, and an edited line makes the verdict `failed`. The
+  Intel page shows each watched CVE and the targets it is present in, or "not
+  in what you have scanned" ("in this scope" under a filter). A bad id exits 2
+  and writes nothing; a damaged line is reported wherever the list is read.
+- **The estate by weakness.** The Intel page counts every CWE the live
+  findings name, with MITRE's name and abstraction level for each, out of
+  every finding, so a scanner that names none shows as a gap. A CWE comes from
+  the finding itself (ZAP, Bandit, Semgrep) or, for a CVE, from its cached NVD
+  record. `squawk feeds` now fetches MITRE's CWE catalogue with its URL, size
+  and sha256.
+- **ATT&CK techniques, derived and labelled.** `squawk feeds --attack`
+  (opt-in, about 55 MB) fetches MITRE's CAPEC catalogue and Enterprise ATT&CK.
+  Techniques are derived CWE to CAPEC to ATT&CK from MITRE's own links and the
+  page says so: a row is MITRE's statement that the weakness is used in that
+  technique, not an observed attack. Only Base and Variant CWEs are followed,
+  because a Pillar such as CWE-693 maps to everything. Every finding is
+  accounted for (derived, no CWE, only broad CWEs, no route in MITRE's data,
+  or a CWE the catalogue does not list), and a technique ATT&CK has revoked or
+  deprecated is named, never counted.
+- **The conformance test for chained files** now finds every function that
+  writes one and fails on any that `verify` does not walk.
+
+### The clock wall is five clocks, one row
+
+- **UTC, Los Angeles, Chicago, New York and London**, down from fifteen, plus
+  the server's zone and the reader's when either is not one of them. Each clock
+  has its own width, so a wide screen keeps them together, and the sticky
+  offset below the strip follows its drawn height when it wraps.
+
 ## 0.10.0 — 2026-10-27
 
 ### Engagements, a pre-handover checklist, and reports you can hand over

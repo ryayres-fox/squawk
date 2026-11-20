@@ -168,6 +168,14 @@ def _finding_block(f: dict, n: int) -> str:
            "| Affected | `%s` |" % mask_account(str(f.get("path") or "")),
            "| Identity | `%s` |" % (f.get("identity") or ""),
            ]
+    # The weakness class and the score, where the scanner gave them: what an
+    # engineer looks a finding up by.
+    for label, key in (("CWE", "cwe"), ("CVSS", "cvss")):
+        raw = detail.get(key)
+        val = (", ".join(str(x) for x in raw if x) if isinstance(raw, (list, tuple))
+               else str(raw or "")).strip()
+        if val:
+            out.append("| %s | %s |" % (label, redact_identifiers(val)))
     if manual:
         # Said on its own line, every time. A finding a person typed and a
         # finding a scanner produced are different evidence, and a report that
@@ -182,7 +190,8 @@ def _finding_block(f: dict, n: int) -> str:
                          ("evidence", "Evidence"),
                          ("impact", "Impact"),
                          ("remediation", "Remediation"),
-                         ("description", "Description")):
+                         ("description", "Description"),
+                         ("reproduce", "How to reproduce")):
         val = str(detail.get(key) or "").strip()
         if not val:
             continue
@@ -197,6 +206,12 @@ def _finding_block(f: dict, n: int) -> str:
         heading = str(name)[:1].upper() + str(name)[1:]
         out += ["**%s**" % redact_identifiers(heading), "", "```",
                 redact_identifiers(val), "```", ""]
+
+    refs = str(detail.get("reference") or "").strip()
+    if refs and not manual:
+        out += ["**References**", ""]
+        out += ["- %s" % redact_identifiers(r.strip()) for r in refs.splitlines() if r.strip()]
+        out.append("")
 
     att = detail.get("attachments") or []
     if att:
@@ -224,19 +239,32 @@ def report_markdown(root: str, session: str,
         ]
         return "\n".join(lines), 0
 
-    findings: List[dict] = []
+    # One entry per finding, not per sighting. A rescan that still finds the
+    # same thing on the same target used to add it again: "Findings 2",
+    # "medium 2", the same entry twice, for one problem. Runs are oldest first,
+    # so the newest run's copy (with whatever the scanner now says) wins.
+    latest: Dict[Tuple[str, str, str], dict] = {}
+    sightings = 0
     for man in runs:
-        findings.extend(load_findings(str(man.get("_dir") or "")))
+        for f in load_findings(str(man.get("_dir") or "")):
+            sightings += 1
+            key = (str(man.get("target") or ""), str(f.get("scanner") or ""),
+                   str(f.get("identity") or ""))
+            latest.pop(key, None)
+            latest[key] = f
+    findings: List[dict] = list(latest.values())
 
     targets = sorted({str(m.get("target") or "") for m in runs})
     manual = sum(1 for f in findings if (f.get("scanner") or "") == MANUAL_SCANNER)
+    seen = ("" if sightings == len(findings) else
+            " distinct, seen %d times across %d runs" % (sightings, len(runs)))
 
     lines += [
         "## Summary", "",
         "| | |", "|---|---|",
         "| Runs | %d |" % len(runs),
         "| Targets | %d |" % len(targets),
-        "| Findings | %d, of which **%d recorded by hand** |" % (len(findings), manual),
+        "| Findings | %d%s, of which **%d recorded by hand** |" % (len(findings), seen, manual),
         "| First run | `%s` |" % runs[0].get("run_id"),
         "| Last run | `%s` |" % runs[-1].get("run_id"),
         "",
@@ -385,6 +413,9 @@ def retest_for(f: dict) -> str:
         return ("squawk run authdast --target <url>: %s no longer reported" % rule)
     if scanner == "schemathesis":
         return ("squawk run apiprobe --target <url>: %s no longer reported" % rule)
+    if scanner == "nuclei":
+        return "squawk run cveprobe --target <url>: template %s no longer matches%s" % (
+            rule, (" %s" % path) if path else "")
     if scanner == "zap":
         return "squawk run liveprobe --target <url>: alert %s not raised%s" % (
             rule, (" for %s" % path) if path else "")

@@ -11,7 +11,7 @@ import sys
 import tempfile
 import time
 from http.server import BaseHTTPRequestHandler
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 from squawk.analysis import (
@@ -98,7 +98,7 @@ from squawk.core import (
     show_setting,
     tool_path,
 )
-from squawk.decisions import current_decisions, record_decision, summarize
+from squawk.decisions import current_decisions, current_watchlist, record_decision, summarize
 from squawk.engagements import (
     engagement_for,
     engagement_names,
@@ -129,6 +129,8 @@ from squawk.feeds import (
     PRIORITY_TIERS,
     cve_of,
     cvss_words,
+    cwes_of,
+    derive_techniques,
     epss_top,
     estate_cves,
     feed_ages,
@@ -136,6 +138,8 @@ from squawk.feeds import (
     kev_by_vendor,
     kev_ransomware,
     kev_recent,
+    load_attack,
+    load_cwe,
     load_feeds,
     load_intel,
     rank_run,
@@ -210,11 +214,10 @@ PAGE_CSS = """
     the literal `73px` in one place and nowhere else — so the clock strip,
     added later, scrolled away under the topbar and the sticky column
     underneath it cleared only one of the two. */
- /* The clock strip wraps, so its height is not one number. Two rows is the
-    common case on an ordinary window; a sticky element below it clears that
-    rather than the one-row height, because too much gap is a smaller fault
-    than a column sitting under the clocks. */
- --topbar-h:73px;--clocks-h:88px;
+ /* One row of clocks is 64px (measured in Chromium). The clock script resets
+    this to the strip's real height when it wraps; 64px is the value without
+    the script. */
+ --topbar-h:73px;--clocks-h:64px;
  --bg:#f3f6f6;--panel:#ffffff;--panel-2:#f8fbfb;--inset:#edf3f3;
  --line:#e0e9e9;--line-2:#eef4f4;
  --ink:#15242b;--soft:#556772;--faint:#667278;
@@ -321,43 +324,14 @@ a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,
    is what the evidence is stamped in, then the desks west to east. Two of them
    are also facts about this run — one is the machine that scanned, one is the
    browser reading — and where either is already on the wall it is badged
-   rather than drawn twice. Its own row, and it scrolls inside itself, so ten
-   clocks can never push a page sideways. */
-/* A GRID, not a wrapping flex row. Fifteen cells never fit one row on a
-   laptop, and wrapped flex cells size themselves independently: eight on the
-   first row and seven on the second, none of them lining up, every cell a
-   different width. On a small laptop screen that reads as noise rather than as a wall
-   of clocks.
-   `auto-fit` puts as many columns as fit and shares the rest, so the rows are
-   columns and the cell count follows the window without a breakpoint. */
-/* A FIXED number per row, chosen at breakpoints, with the remainder centred.
-   Neither of the first two attempts balanced. A wrapping flex row sized every
-   cell to its own content, so the rows did not line up. `auto-fit` lined them
-   up and then picked the column count from the window width alone — which is
-   the real fault, because with fifteen clocks the count decides everything:
-
-       8 columns -> 8 + 7        7 columns -> 7 + 7 + 1
-       5 columns -> 5 + 5 + 5    4 columns -> 4 + 4 + 4 + 3
-
-   A window a little narrower than the operator's lands on seven and puts one
-   clock alone on a row. So the count is chosen here, from the values that
-   divide well, and never by the width on its own.
-
-   8, 6 and 4 are the three that strand nobody at FIFTEEN or at SIXTEEN — the
-   script adds a sixteenth clock when the reader's own zone is not already on
-   the wall, so both counts have to work:
-
-       8 -> 8+7  or 8+8        6 -> 6+6+3    or 6+6+4
-       4 -> 4+4+4+3 or 4+4+4+4
-
-   2, 3, 5 and 7 are all excluded, each of them leaving one clock alone on a
-   row at one count or the other. 4 is the floor for that reason and not
-   because of the width.
-
-   Fifteen is odd, so no two-row split is even and no amount of arithmetic
-   makes one. `justify-content:center` is the answer to that: the short row
-   sits centred under the full one, which reads as deliberate rather than as a
-   hole at the end. */
+   rather than drawn twice. Its own row; it wraps rather than scrolling, and a
+   cell can shrink to nothing (`min-width:0`), so it never pushes a page
+   sideways. */
+/* Five clocks, plus the server's zone and the reader's when either is not one
+   of them: up to seven, one centred row on a laptop for the five. Each cell has
+   a width of its own, not a share of the strip, so a wide screen does not spread
+   them edge to edge; a narrow one wraps them, and the script sets the sticky
+   offset (`--clocks-h`) from the height actually drawn. */
 .clocks{display:flex;flex-wrap:wrap;justify-content:center;
  gap:.5rem .25rem;align-items:stretch;
  padding:.5rem 1.75rem;border-bottom:1px solid var(--line);
@@ -366,13 +340,9 @@ a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,
     written; this was not, so the wall a reader is meant to check a timestamp
     against left the screen the moment they scrolled to the timestamp. */
  position:sticky;top:var(--topbar-h);z-index:4}
-/* A percentage basis forces the count: eight per row whatever the width, so
-   the rows cannot line up differently from one another. `0 0` because a cell
-   that grows would fill the short row and undo the centring. */
 .clocks .clk{display:flex;flex-direction:column;gap:.02rem;
- padding:.1rem .5rem;min-width:0;flex:0 0 calc(12.5% - .25rem)}
-@media(max-width:1180px){.clocks .clk{flex-basis:calc(16.666% - .25rem)}}
-@media(max-width:820px){.clocks .clk{flex-basis:calc(25% - .25rem)}}
+ padding:.1rem .75rem;min-width:0;flex:0 1 10.5rem}
+@media(max-width:820px){.clocks .clk{flex-basis:7.6rem;padding:.1rem .4rem}}
 
 .clocks .zone{text-transform:uppercase;letter-spacing:.07em;font-size:.6rem;
  color:var(--faint);line-height:1.25}
@@ -767,25 +737,13 @@ def page(title: str, body: str, active: str = "",
 # one that was never offered.
 WORLD_ZONES = (
     ("UTC", "UTC"),
-    # The four US offsets, not two. Honolulu and Denver were missing, so a
-    # wall meant to answer "what time is it where that ran" skipped two of
-    # the zones a US estate actually runs in.
-    ("Pacific/Honolulu", "Honolulu"),
+    # Five: fifteen did not fit one strip and read as noise. The US coasts, the
+    # central zone and the main European desk. The server's zone is added when
+    # it is not one of these, so the machine that scanned is always on the wall.
     ("America/Los_Angeles", "Los Angeles"),
-    ("America/Denver", "Denver"),
     ("America/Chicago", "Chicago"),
     ("America/New_York", "New York"),
-    ("America/Sao_Paulo", "Sao Paulo"),
     ("Europe/London", "London"),
-    ("Europe/Berlin", "Berlin"),
-    ("Asia/Dubai", "Dubai"),
-    # Half-hour offsets exist and a wall that only shows whole hours quietly
-    # teaches that they do not.
-    ("Asia/Kolkata", "Mumbai"),
-    ("Asia/Singapore", "Singapore"),
-    ("Asia/Tokyo", "Tokyo"),
-    ("Australia/Sydney", "Sydney"),
-    ("Pacific/Auckland", "Auckland"),
 )
 
 
@@ -827,9 +785,8 @@ def _zone_now(zone: str, when: float) -> Optional[Tuple[str, str, str, str]]:
 
 
 def clock_wall() -> str:
-    """The wall, the way an operations room hangs it: not two clocks on the
-    same zone, but the three main American zones plus UTC, the major European
-    and Asian ones, and any other standard zone, each once.
+    """The wall, the way an operations room hangs it: UTC, the US coasts, the
+    central zone and London, each once.
 
     Two of the clocks are also facts about this run: one is badged **server**,
     the machine the scans run on, and one **you**, the browser reading. In
@@ -936,7 +893,7 @@ CLOCK_JS = (
     # fills the whole line, abbreviation included.
     "\"<span class='day'></span>\";"
     "mine.querySelector('.zone').textContent=you.split('/').pop()"
-    ".replace(/_/g,' ');w.insertBefore(mine,w.firstChild.nextSibling);"
+    ".replace(/_/g,' ');w.insertBefore(mine,w.querySelector('.miss'));"
     "cells.push(mine)}"
     # One mark, not two chips: where the server is also the machine reading —
     # the common case on a laptop — the wall says "server · you" once.
@@ -962,7 +919,14 @@ CLOCK_JS = (
     "yc.title=skew>120000?('your browser and the server disagree by '"
     "+Math.round(skew/60000)+' min — every timestamp in the evidence comes from "
     "the server'):'in step with the server'}"
-    "}tick();setInterval(tick,1000);})();</script>")
+    "}tick();setInterval(tick,1000);"
+    # The strip is one row for the five, but the server's zone and the
+    # reader's can add two more, and a narrow window wraps it. A sticky element
+    # below clears `--clocks-h`, so set it from the height actually drawn, now
+    # and whenever the window changes, rather than trusting one number.
+    "function fit(){document.documentElement.style.setProperty("
+    "'--clocks-h',w.offsetHeight+'px')}fit();window.addEventListener('resize',fit);"
+    "})();</script>")
 
 
 def _fmt_run_time(run_id_str: str) -> str:
@@ -2038,6 +2002,7 @@ def _detail_block(det: dict) -> str:
     for label, keys in (("What it is", ("description", "what")),
                         ("Remediation", ("remediation",)),
                         ("Evidence", ("evidence", "attack", "other")),
+                        ("How to reproduce", ("reproduce",)),
                         ("Reference", ("reference",))):
         vals = [str(det.get(k, "")).strip() for k in keys]
         if label == "Evidence":
@@ -2053,11 +2018,14 @@ def _detail_block(det: dict) -> str:
                     "<div class='%s' style='font-size:.85rem;max-width:96ch'>%s"
                     "</div></div>" % (label, cls, body))
     chips = []
-    for label, k in (("CWE", "cwe"), ("WASC", "wasc"),
+    for label, k in (("CWE", "cwe"), ("CVSS", "cvss"), ("WASC", "wasc"),
                      ("confidence", "confidence"), ("risk", "risk"),
                      ("fixed in", "fixed_in"), ("package", "package"),
                      ("installed", "installed"), ("rule", "rule")):
-        v = str(det.get(k, "")).strip()
+        raw = det.get(k, "")
+        # A list (nuclei's CWE ids) reads as text, not as Python's repr of it.
+        v = (", ".join(str(x) for x in raw if x) if isinstance(raw, (list, tuple))
+             else str(raw)).strip()
         if v:
             chips.append("<span class='dchip'>%s %s</span>" % (E(label), E(v)))
     if chips:
@@ -2936,7 +2904,7 @@ def _intel_chip(row: dict) -> str:
     if row.get("entries"):
         bits.append("%d entries" % row["entries"])
     days = row.get("age_days")
-    stale = days is not None and days >= FEED_STALE_DAYS
+    stale = days is not None and days >= row.get("stale_days", FEED_STALE_DAYS)
     if days is not None:
         bits.append("%d day(s) old" % days)
     if row.get("sha256"):
@@ -3014,9 +2982,11 @@ def view_intel(root: str, cve: Optional[str] = None,
     # can always say.
     if cve:
         return _intel_detail(root, cve.upper(), cves, feeds, strip)
+    scoped_view = bool(engagement or target)
     if not live:
         return ("<h1>Threat intel</h1><p class='sub'>What is being exploited, "
                 "out of what you actually run.</p>" + strip
+                + _watch_section(root, {}, scoped_view)
                 + empty_state("priority", "No live targets yet",
                               "Scan something and its CVEs are cross-referenced "
                               "here against CISA KEV and FIRST EPSS. "
@@ -3035,6 +3005,12 @@ def view_intel(root: str, cve: Optional[str] = None,
                "; %d vanished target(s) are not counted" % len(vanished)
                if vanished else "", len(cves), cached, strip))
     head += intel_bar
+    head += _watch_section(root, cves, scoped_view)
+    # Read every live finding once, with its CWEs, for both sections below.
+    scanned = [(man, f, cwes_of(f, root)) for man in live.values()
+               for f in load_findings(man["_dir"])]
+    head += _weakness_section(root, scanned)
+    head += _technique_section(root, scanned)
 
     if not feeds.get("present"):
         return head + empty_state(
@@ -3076,6 +3052,224 @@ def view_intel(root: str, cve: Optional[str] = None,
         "is a reading, and it can change with the next feed fetch. "
         "Reachability is not assessed anywhere on this page.</p></div>" % rest)
     return "".join(body)
+
+
+def _weakness_section(root: str, scanned: List[Tuple[dict, dict, Tuple[List[str], str]]],
+                      top: int = 25) -> str:
+    """The estate by weakness class: every CWE the live findings name, how many
+    findings and targets carry it, and what MITRE calls it.
+
+    The denominator is every finding, not only those with a CWE, so a scanner
+    that names none (Checkov, Grype) shows up as the gap it is. A CWE comes from
+    the finding itself or, for a CVE, from its cached NVD record; the count of
+    each is stated. Names and levels come from the cached catalogue and read
+    "name not fetched" without it."""
+    total = len(scanned)
+    by: Dict[str, Dict[str, Any]] = {}
+    origin = {"scanner": 0, "nvd": 0}
+    for man, _f, (ids, src) in scanned:
+        if not ids:
+            continue
+        origin[src] += 1
+        for cid in ids:
+            row = by.setdefault(cid, {"findings": 0, "targets": set()})
+            row["findings"] += 1
+            row["targets"].add(str(man.get("target", "")))
+    named = origin["scanner"] + origin["nvd"]
+    cat = (load_cwe(root) or {}).get("weaknesses") or {}
+    rows = []
+    for cid, row in sorted(by.items(), key=lambda kv: (-kv[1]["findings"], kv[0]))[:top]:
+        info = cat.get(cid) or {}
+        num = cid.split("-", 1)[1]
+        rows.append(
+            "<tr><td class='mono' style='white-space:nowrap'>"
+            "<a href='https://cwe.mitre.org/data/definitions/%s.html' target='_blank' "
+            "rel='noopener noreferrer'>%s</a></td><td style='font-size:.82rem'>%s</td>"
+            "<td class='muted' style='font-size:.78rem'>%s</td>"
+            "<td style='text-align:right'>%d</td><td style='text-align:right'>%d</td></tr>"
+            % (E(num), E(cid),
+               E(info["name"]) if info.get("name")
+               else ("<span class='muted'>not in MITRE&#39;s weakness list (a category "
+                     "or a retired id)</span>" if cat
+                     else "<span class='muted'>name not fetched &mdash; squawk feeds</span>"),
+               E(info.get("level", "")) or "&mdash;",
+               row["findings"], len(row["targets"])))
+    more = len(by) - len(rows)
+    table = ("<div style='overflow-x:auto'><table><thead><tr><th>CWE</th><th>Weakness</th>"
+             "<th>Level</th><th style='text-align:right'>Findings</th>"
+             "<th style='text-align:right'>Targets</th></tr></thead><tbody>%s</tbody>"
+             "</table></div>%s" % ("".join(rows), "<p class='muted' style='font-size:.8rem'>"
+                                   "and %d more CWE(s)</p>" % more if more > 0 else "")
+             ) if rows else ("<p class='muted' style='font-size:.85rem'>No finding names "
+                             "a CWE.</p>")
+    return _cmp_section(
+        "By weakness",
+        "%d of %d findings name a weakness (CWE): %d by the scanner itself, %d through "
+        "the CVE&#39;s NVD record. The rest name none, which is a gap in the scanner&#39;s "
+        "output, not a clean result." % (named, total, origin["scanner"], origin["nvd"]),
+        table)
+
+
+def _attack_url(tid: str) -> str:
+    """ATT&CK's page for a technique: T1574.010 lives at /techniques/T1574/010/."""
+    return "https://attack.mitre.org/techniques/%s/" % tid.replace(".", "/")
+
+
+def _counted(counter: Dict[str, int], limit: int = 6) -> str:
+    """'CWE-693 x25, CWE-345 x5' for the largest entries, and how many more."""
+    items = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+    text = ", ".join("%s &times;%d" % (E(k), n) for k, n in items[:limit])
+    return text + (" and %d more" % (len(items) - limit) if len(items) > limit else "")
+
+
+def _technique_section(root: str, scanned: List[Tuple[dict, dict, Tuple[List[str], str]]],
+                       top: int = 25) -> str:
+    """ATT&CK techniques, derived CWE -> CAPEC -> ATT&CK from MITRE's own data.
+
+    No scanner here publishes an ATT&CK id, so every row is derived and says so:
+    MITRE's statement that the weakness is used in that technique, never an
+    observed attack. Only Base and Variant CWEs derive (a Pillar maps to
+    everything); the rest of the estate is accounted for by why it did not
+    derive; a technique ATT&CK has retired is named and not counted."""
+    title = "Techniques (ATT&amp;CK, derived)"
+    attack = load_attack(root)
+    if attack is None:
+        return _cmp_section(title, "Not fetched. Run <span class='mono'>squawk feeds "
+                            "--attack</span> (MITRE&#39;s CAPEC catalogue and Enterprise "
+                            "ATT&amp;CK, about 55 MB). Until then nothing is derived, so no "
+                            "count is shown.", "")
+    levels = (load_cwe(root) or {}).get("weaknesses") or {}
+    if not levels:
+        return _cmp_section(title, "This table needs the CWE catalogue to tell a specific "
+                            "weakness from a broad one. Run <span class='mono'>squawk "
+                            "feeds</span>.", "")
+    version = ((attack.get("sources") or {}).get("attack") or {}).get("version") or "?"
+    techs = attack.get("techniques") or {}
+    rows: Dict[str, Dict[str, Any]] = {}
+    outcome = {"derived": 0, "no-cwe": 0, "too-broad": 0, "unlisted": 0, "no-route": 0}
+    broad: Dict[str, int] = {}
+    unrouted: Dict[str, int] = {}
+    unlisted: Dict[str, int] = {}
+    retired: Dict[str, int] = {}
+    missing: Dict[str, int] = {}
+    tactic: Dict[str, int] = {}
+    total = len(scanned)
+    for man, _f, (cwes, _src) in scanned:
+        result, found, gone, absent, why = derive_techniques(cwes, levels, attack)
+        outcome[result] += 1
+        bucket = {"too-broad": broad, "no-route": unrouted, "unlisted": unlisted}.get(result)
+        if bucket is not None:
+            for c in why:
+                bucket[c] = bucket.get(c, 0) + 1
+        for tid in gone:
+            retired[tid] = retired.get(tid, 0) + 1
+        for tid in absent:
+            missing[tid] = missing.get(tid, 0) + 1
+        for tac in sorted({tc for tid in found for tc in techs[tid].get("tactics") or []}):
+            tactic[tac] = tactic.get(tac, 0) + 1
+        for tid, via in found.items():
+            row = rows.setdefault(tid, {"findings": 0, "targets": set(), "via": set()})
+            row["findings"] += 1
+            row["targets"].add(str(man.get("target", "")))
+            row["via"].update(via)
+    body = []
+    for tid, row in sorted(rows.items(), key=lambda kv: (-kv[1]["findings"], kv[0]))[:top]:
+        info = techs.get(tid) or {}
+        body.append(
+            "<tr><td class='mono' style='white-space:nowrap'><a href='%s' target='_blank' "
+            "rel='noopener noreferrer'>%s</a></td><td style='font-size:.82rem'>%s</td>"
+            "<td class='muted' style='font-size:.78rem'>%s</td>"
+            "<td style='text-align:right'>%d</td><td style='text-align:right'>%d</td>"
+            "<td class='mono muted' style='font-size:.75rem'>%s</td></tr>"
+            % (E(_attack_url(tid)), E(tid), E(info.get("name", "")),
+               E(", ".join(info.get("tactics") or [])) or "&mdash;", row["findings"],
+               len(row["targets"]), E(", ".join(sorted(row["via"])))))
+    more = len(rows) - len(body)
+    table = ("<div style='overflow-x:auto'><table><thead><tr><th>Technique</th><th>Name</th>"
+             "<th>Tactics</th><th style='text-align:right'>Findings</th>"
+             "<th style='text-align:right'>Targets</th><th>Through</th></tr></thead>"
+             "<tbody>%s</tbody></table></div>%s"
+             % ("".join(body), "<p class='muted' style='font-size:.8rem'>and %d more "
+                               "technique(s)</p>" % more if more > 0 else "")) if body else ""
+    notes = []
+    if tactic:
+        notes.append("By tactic (findings): %s." % _counted(tactic, 12))
+    notes.append("Of the other %d finding(s): %d name no CWE; %d name only CWEs too broad to "
+                 "derive from (Pillar or Class)%s; %d name a specific CWE with no route in "
+                 "MITRE&#39;s data%s; %d name a CWE the catalogue does not list%s."
+                 % (total - outcome["derived"], outcome["no-cwe"], outcome["too-broad"],
+                    ": " + _counted(broad) if broad else "", outcome["no-route"],
+                    ": " + _counted(unrouted) if unrouted else "", outcome["unlisted"],
+                    ": " + _counted(unlisted) if unlisted else ""))
+    if retired:
+        notes.append("CAPEC also points at %s, which ATT&amp;CK %s marks revoked or "
+                     "deprecated; not counted." % (", ".join(E(t) for t in sorted(retired)),
+                                                   E(version)))
+    if missing:
+        notes.append("CAPEC also points at %s, which is not in Enterprise ATT&amp;CK %s "
+                     "(another ATT&amp;CK domain, or an id MITRE never published there); "
+                     "not counted." % (", ".join(E(t) for t in sorted(missing)), E(version)))
+    return _cmp_section(
+        title,
+        "%d of %d findings reach an ATT&amp;CK technique, derived CWE &rarr; CAPEC &rarr; "
+        "ATT&amp;CK from MITRE&#39;s CAPEC catalogue (ATT&amp;CK %s). No scanner asserted "
+        "these: each row is MITRE&#39;s statement that the weakness is used in that "
+        "technique, not an observed attack. Only Base and Variant CWEs are followed."
+        % (outcome["derived"], total, E(version)),
+        table + "".join("<p class='muted' style='font-size:.8rem'>%s</p>" % n for n in notes))
+
+
+def _clip(text: str, cap: int) -> str:
+    """`text` cut to `cap` characters, with an ellipsis when anything was cut."""
+    return text if len(text) <= cap else text[:cap - 1].rstrip() + "…"
+
+
+def _watched_since(ev: dict) -> str:
+    """'since <when> by <who> · <reason>' for one watchlist line."""
+    reason = " · %s" % ev["reason"] if ev.get("reason") else ""
+    return "since %s by %s%s" % (ev.get("at", ""), ev.get("who", ""), reason)
+
+
+def _watch_section(root: str, cves: Dict[str, List[dict]], scoped: bool = False) -> str:
+    """The CVEs the operator asked to have flagged, and where each one is now.
+
+    Present means a finding in the newest run of a live target in this scope
+    names the CVE; absent is "not in what you have scanned", never "not
+    affected". With an engagement or target filter on, it says "in this scope"
+    instead: a CVE found outside the filter has been scanned. Empty when nothing
+    is watched, so a page without a watchlist is unchanged. A damaged watchlist
+    line is named, because a lost line can quietly take a CVE off the list."""
+    where_word = "in this scope" if scoped else "in what you have scanned"
+    problems: List[str] = []
+    watched = current_watchlist(root, problems)
+    if not watched and not problems:
+        return ""
+    present = [c for c in watched if c in cves]
+    rows = []
+    for cve in sorted(watched, key=lambda c: (c not in cves, c)):
+        ev = watched[cve]
+        if cve in cves:
+            targets = sorted({str(f.get("_target", "")) for f in cves[cve]})
+            where = ("<b>present</b> in %d target%s: %s" % (
+                len(targets), "" if len(targets) == 1 else "s",
+                ", ".join(E(_short_target(x)) for x in targets)))
+        else:
+            where = "<span class='muted'>not %s</span>" % where_word
+        rows.append("<tr><td class='mono' style='white-space:nowrap'>"
+                    "<a href='/intel?cve=%s'>%s</a></td><td style='font-size:.82rem'>%s</td>"
+                    "<td class='muted' style='font-size:.78rem' title='%s'>%s</td></tr>"
+                    % (E(cve), E(cve), where, E(_watched_since(ev)),
+                       E(_clip(_watched_since(ev), 160))))
+    warn = "".join("<p class='silent' style='font-size:.82rem'>%s</p>" % E(p) for p in problems)
+    table = ("<div style='overflow-x:auto'><table><thead><tr><th>CVE</th><th>In the estate?"
+             "</th><th>Watched</th></tr></thead><tbody>%s</tbody></table></div>"
+             % "".join(rows)) if rows else ""
+    return _cmp_section(
+        "On your watchlist",
+        "%d of %d watched CVE(s) are present %s. Change the list "
+        "with <span class='mono'>squawk watch add|remove CVE</span>."
+        % (len(present), len(watched), where_word),
+        warn + table)
 
 
 def _mine(cve: str, cves: Dict[str, List[dict]]) -> str:
@@ -3269,6 +3463,16 @@ def _intel_detail(root: str, cve: str, cves: Dict[str, List[dict]],
     finds = cves.get(cve) or []
     detail = load_intel(root, cve)
     cards = [_cve_source_links(cve)]
+    damaged: List[str] = []
+    watch = current_watchlist(root, damaged).get(cve)
+    for msg in damaged:
+        cards.insert(0, "<div class='card tight'><p class='silent' style='margin:0;"
+                        "font-size:.82rem'>%s</p></div>" % E(msg))
+    if watch:
+        cards.insert(0, "<div class='card tight'><p style='margin:0;font-size:.85rem'>"
+                        "<b>On your watchlist</b> since %s by %s%s.</p></div>"
+                     % (E(str(watch.get("at", ""))), E(str(watch.get("who", ""))),
+                        " &middot; " + E(str(watch["reason"])) if watch.get("reason") else ""))
 
     kev = feeds.get("kev", {}).get(cve) or {}
     ep = feeds.get("epss", {}).get(cve)
@@ -6194,14 +6398,17 @@ __all__ = [
     '_SKIP_DIRS',
     '_STATUS_DOT',
     'E',
+    '_attack_url',
     '_budget_bar',
     '_chip',
     '_chip_link',
+    '_clip',
     '_cloud_doubt',
     '_cloud_found',
     '_cloud_reading',
     '_cmp_section',
     '_count_cell',
+    '_counted',
     '_cve_rows',
     '_cve_source_links',
     '_cve_vendor',
@@ -6240,10 +6447,14 @@ __all__ = [
     '_state_pill',
     '_target_options',
     '_target_select',
+    '_technique_section',
     '_unavailable',
     '_unavailable_banner',
     '_under_roots',
     '_unreadable_note',
+    '_watch_section',
+    '_watched_since',
+    '_weakness_section',
     '_why',
     '_zone_now',
     'canonical_zone',
