@@ -25,6 +25,8 @@ from squawk.core import (
     SCANNERS,
     SEVERITY_ORDER,
     STOP_REQUESTED,
+    TOOL_CONFIG_NOTES,
+    TOOL_PREFLIGHT,
     Coverage,
     Finding,
     Profile,
@@ -455,6 +457,13 @@ def _run_one_stage(spec: StageSpec, ctx: RunContext, raw_file: str,
         progress({"phase": "budget", "tool": spec.tool, "mode": spec.mode,
                   "timeout": timeout, "timeout_from": timeout_from})
 
+    preflight = TOOL_PREFLIGHT.get(spec.tool)
+    refused = preflight() if preflight else ""
+    if refused:
+        LOG.warning("%s %s", spec.tool, refused)
+        ran["refusal"] = refused
+        return StageResult(spec.tool, spec.mode, "error", refused, None, [], 0, None, ran)
+
     if spec.config:
         conf = config_path(raw_file, spec.config_suffix)
         try:
@@ -495,6 +504,12 @@ def _run_one_stage(spec: StageSpec, ctx: RunContext, raw_file: str,
     # elapsed on one clock against a budget on
     # another is a claim about a control that was never measured.
     started = time.monotonic()
+    narrowing = TOOL_CONFIG_NOTES.get(spec.tool)
+    narrows = narrowing() if narrowing else []
+    if narrows:
+        ran["tool_config"] = narrows
+        LOG.warning("%s reads its own configuration, which changes what it runs: %s",
+                    spec.tool, "; ".join(narrows))
     aside = env_set_aside(cmd)
     if aside:
         ran["env_set_aside"] = aside
@@ -544,6 +559,16 @@ def _run_one_stage(spec: StageSpec, ctx: RunContext, raw_file: str,
                 out = fh.read()
         except OSError:
             out = ""
+        # A report the scanner wrote itself is scrubbed the same way, and the
+        # file rewritten before anything is sealed: nuclei's exposure templates
+        # extract what they find, and what they find can be a secret.
+        if scrub is not None and out:
+            out = scrub(out)
+            try:
+                with open(raw_file, "w", encoding="utf-8") as fh:
+                    fh.write(out)
+            except OSError:
+                pass
     else:
         with open(raw_file, "w", encoding="utf-8") as fh:
             fh.write(out)
@@ -644,10 +669,19 @@ def _run_one_stage(spec: StageSpec, ctx: RunContext, raw_file: str,
         if heap:
             detail = ("%s  ·  ZAP ran with %s, from zap_memory_mb"
                       % (detail, heap))
+    detail = _with_tool_config(detail, ran)
     if status == "gap":
         LOG.warning("GAP %s %s", spec.tool, detail)
     return StageResult(spec.tool, spec.mode, status, detail, rel_raw, kept,
                        excluded, cov, ran)
+
+
+def _with_tool_config(detail: str, ran: dict) -> str:
+    """The stage line, with what the scanner's own configuration changed. A
+    count of templates is only half a denominator when nuclei's ignore file
+    left some out; the line the operator reads says so, not only the record."""
+    notes = ran.get("tool_config") or []
+    return "%s  ·  its own config: %s" % (detail, "; ".join(notes)) if notes else detail
 
 
 def execute_service(service: Service, target: str, evidence_root: str,
@@ -1053,6 +1087,7 @@ __all__ = [
     '_refusal',
     '_run_one_stage',
     '_upstream_coverage',
+    '_with_tool_config',
     '_write_evidence',
     'claim_run_dir',
     'execute_service',

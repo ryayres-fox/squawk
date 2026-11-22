@@ -34,7 +34,7 @@ from squawk.core import (
     vuln_db_ages,
     walk_chain,
 )
-from squawk.decisions import current_decisions, summarize, verify_ledger
+from squawk.decisions import current_decisions, summarize, verify_ledger, verify_watchlist
 from squawk.evidence import (
     history_entries,
     list_runs,
@@ -4709,6 +4709,7 @@ def verify_root(root: str, progress: Optional[Callable[[dict], None]] = None) ->
     runs = verify_runs(root, previous=last, progress=progress)
     ledger = verify_ledger(root, str((last.get("ledger") or {}).get("head", "")))
     checklist = verify_checklist(root, str((last.get("checklist") or {}).get("head", "")))
+    watchlist = verify_watchlist(root, str((last.get("watchlist") or {}).get("head", "")))
     report = {"root": root,
               "at": time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
               "previous_at": last.get("at", ""),
@@ -4716,7 +4717,8 @@ def verify_root(root: str, progress: Optional[Callable[[dict], None]] = None) ->
               "total": runs["total"], "dropped": runs["dropped"],
               "pruned_runs": runs["pruned_runs"], "digests": runs["digests"],
               "failed": runs["failed"], "unverifiable": runs["unverifiable"],
-              "ledger": ledger, "checklist": checklist, "retention": retention}
+              "ledger": ledger, "checklist": checklist, "watchlist": watchlist,
+              "retention": retention}
     report["status"], report["exit"], report["summary"] = _verify_verdict(report)
     return report
 
@@ -4728,6 +4730,7 @@ def _verify_verdict(report: dict) -> Tuple[str, int, str]:
     ledger = report.get("ledger", {})
     retention = report.get("retention", {})
     checklist = report.get("checklist", {})
+    watchlist = report.get("watchlist", {})
     pruned = report.get("pruned_runs") or []
     drops = [r for r in pruned if r.get("kind") == "drop"]
     trims = [r for r in pruned if r.get("kind") == "trim"]
@@ -4737,7 +4740,8 @@ def _verify_verdict(report: dict) -> Tuple[str, int, str]:
                  " — a record, not a proof." % (len(drops), len(trims))
     if report["failed"] or ledger.get("state") == "broken" \
             or retention.get("state") == "broken" \
-            or checklist.get("state") == "broken":
+            or checklist.get("state") == "broken" \
+            or watchlist.get("state") == "broken":
         parts = []
         for state in ("altered", "missing", "extra", "chain broken"):
             n = report["counts"].get(state, 0)
@@ -4752,11 +4756,15 @@ def _verify_verdict(report: dict) -> Tuple[str, int, str]:
         if checklist.get("state") == "broken":
             parts.append("the checklist ledger broken (%s)"
                          % checklist.get("detail", "no detail"))
+        if watchlist.get("state") == "broken":
+            parts.append("the watchlist broken (%s)"
+                         % watchlist.get("detail", "no detail"))
         return ("failed", VERIFY_EXIT_FAILED,
                 "%d run(s) checked; %s.%s" % (report["total"], ", ".join(parts), relied))
     if report["unverifiable"] or ledger.get("state") == "unverifiable" \
             or retention.get("state") == "unverifiable" \
-            or checklist.get("state") == "unverifiable":
+            or checklist.get("state") == "unverifiable" \
+            or watchlist.get("state") == "unverifiable":
         bits = []
         rows = report.get("runs") or []
         legacy = sum(1 for r in rows if r["state"] == "unverifiable"
@@ -4779,6 +4787,9 @@ def _verify_verdict(report: dict) -> Tuple[str, int, str]:
         if checklist.get("state") == "unverifiable":
             bits.append("the checklist ledger: %s"
                         % checklist.get("detail", "could not be checked"))
+        if watchlist.get("state") == "unverifiable":
+            bits.append("the watchlist: %s"
+                        % watchlist.get("detail", "could not be checked"))
         return ("unverifiable", VERIFY_EXIT_UNVERIFIABLE,
                 "%d of %d run(s) verified; %s.%s"
                 % (report["counts"].get("ok", 0), report["total"], "; ".join(bits),

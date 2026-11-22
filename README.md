@@ -20,7 +20,7 @@ python3 squawk.py --install               # provision the scanner toolbench (Uni
 python3 squawk.py --update                 # OS, scanners, vuln DBs, ZAP image, and record what moved
 python3 squawk.py --doctor                 # what's installed, what's missing, and the instrument check
 python3 squawk.py --run selfaudit          # audit this machine, not a target
-python3 squawk.py --list-services          # the seventeen services
+python3 squawk.py --list-services          # the eighteen services
 python3 squawk.py --run compliance --repo /path/to/checkout
 python3 squawk.py sarif > squawk.sarif        # the last run, as SARIF 2.1.0
 
@@ -161,9 +161,9 @@ scanner that reported last time and not this time raises 7600 rather than
 letting the smaller number read as progress.
 
 The rest of the vocabulary is the same airport. **Scan** is where a run starts,
-and the seventeen services are **pre-flight check**, **customs manifest**,
+and the eighteen services are **pre-flight check**, **customs manifest**,
 **baggage check**, **contraband sweep**, **cargo scan**, **recon**, **live
-probe**, **active probe**, **authenticated app probe**, **API probe**, **object
+probe**, **active probe**, **known-vulnerability probe**, **authenticated app probe**, **API probe**, **object
 authorization probe**, **compliance**, **cloud (AWS)**, **self-audit**, **skill
 audit** and **AI probe**. Every one of them declares what it does *not* cover before you
 read its result. (The Scan page was called the Kiosk until each service tile
@@ -216,8 +216,9 @@ Rebuilt in iterations from a private handoff document, each verified before the 
   row per `(scanner, rule)` across every live target, filtered, searched and
   paged, with every count stating what it is out of), **Priority** (ranked by
   exploitability, not severity), **Intel** (CISA KEV and EPSS with provenance,
-  per-CVE detail from OSV and NVD, and general intel that does not depend on
-  having scanned anything), **Triage**, **History**, **Cloud** (AWS Security Hub
+  per-CVE detail from OSV and NVD, general intel that does not depend on
+  having scanned anything, and a CVE watchlist kept with `squawk watch`),
+  **Triage**, **History**, **Cloud** (AWS Security Hub
   ingest, read-only), **Baselines**. Underneath: a real lifecycle (`status`,
   `stop`, `restart`, `--daemon`, `/healthz`, a generated systemd unit, aborted
   runs recorded), evidence retention with a dry run and a record of what went,
