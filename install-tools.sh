@@ -193,7 +193,11 @@ fact() {
 # than discarded: "ok syft" does not tell you which syft.
 ver() {
   have "$1" || { printf -- '-'; return; }
-  { "$1" "${2:---version}" 2>&1 || true; } | head -1 | tr -d '\r'
+  # nuclei prints its version as a coloured log line ("[INF] Nuclei Engine
+  # Version: v3.11.1"): the colour codes and the level tag are not the version.
+  # tr and a plain sed pattern, so this reads the same on BSD sed.
+  { "$1" "${2:---version}" 2>&1 || true; } | head -1 | tr -d '\r\033' \
+    | sed -e 's/\[[0-9;]*m//g' -e 's/^\[INF\] //'
 }
 
 # Report a tool with its version, so the terminal shows what actually landed.
@@ -245,7 +249,7 @@ if [ "$MODE" = detect ]; then
   else
     printf '  %-9s install   vendor installer over https (needs curl)\n' trufflehog
   fi
-  for logical in hadolint dockle osv-scanner; do
+  for logical in hadolint dockle osv-scanner nuclei; do
     if have "$logical"; then
       printf '  %-9s present   %s\n' "$logical" "$(ver "$logical")"
     else
@@ -526,10 +530,24 @@ install_release() { # name  binary-or-archive-url  checksums-url  [member-in-tar
   if [ -n "${4:-}" ]; then
     # The checksum covers the archive; the binary is taken out of it after.
     xdir="$(mktemp -d)" || { bad "$1 — could not create a temp directory"; rm -f "$tmp" "$sums"; return 1; }
-    if ! tar -xzf "$tmp" -C "$xdir" "$4"; then
-      bad "$1 — $4 is not in the archive"
-      rm -rf "$tmp" "$sums" "$xdir"; return 1
-    fi
+    # Only the named member is taken out, from a tar.gz or a zip (nuclei
+    # ships zips); a member that is not there installs nothing.
+    case "$asset" in
+      *.zip)
+        if ! have unzip; then
+          bad "$1 — unzip is needed to unpack $asset; install unzip and re-run"
+          rm -rf "$tmp" "$sums" "$xdir"; return 1
+        fi
+        if ! unzip -q -o "$tmp" "$4" -d "$xdir" >/dev/null 2>&1 || [ ! -f "$xdir/$4" ]; then
+          bad "$1 — $4 is not in the archive"
+          rm -rf "$tmp" "$sums" "$xdir"; return 1
+        fi ;;
+      *)
+        if ! tar -xzf "$tmp" -C "$xdir" "$4"; then
+          bad "$1 — $4 is not in the archive"
+          rm -rf "$tmp" "$sums" "$xdir"; return 1
+        fi ;;
+    esac
     src="$xdir/$4"
   fi
   if [ "$PRIV" = none ]; then mkdir -p "$REL_DIR"; fi
@@ -580,6 +598,38 @@ else
     install_release dockle \
       "${DOCKLE_PLAT:+$DOCKLE_REL/dockle_${DOCKLE_V}_$DOCKLE_PLAT.tar.gz}" \
       "$DOCKLE_REL/dockle_${DOCKLE_V}_checksums.txt" dockle
+  fi
+fi
+
+# nuclei: versioned zip assets and a checksums file, like dockle's tar.gz.
+# Squawk's cveprobe runs it with -duc (no update check mid-run), so the
+# templates are fetched here, on install and on every update.
+if { [ "$MODE" = install ] && have nuclei; } || { [ "$MODE" = update ] && ! have nuclei; }; then
+  install_release nuclei "" ""     # present, or not installed on update: no fetch
+else
+  NUCLEI_PLAT=""
+  case "$REL_OS-$REL_ARCH" in
+    linux-x86_64) NUCLEI_PLAT=linux_amd64 ;;  linux-arm64) NUCLEI_PLAT=linux_arm64 ;;
+    macos-x86_64) NUCLEI_PLAT=macOS_amd64 ;;  macos-arm64) NUCLEI_PLAT=macOS_arm64 ;;
+  esac
+  NUCLEI_TAG="$(latest_tag projectdiscovery/nuclei)"
+  if [ -z "$NUCLEI_TAG" ]; then
+    bad "nuclei — could not read the latest release tag from github.com"
+  else
+    NUCLEI_REL="https://github.com/projectdiscovery/nuclei/releases/download/$NUCLEI_TAG"
+    NUCLEI_V="${NUCLEI_TAG#v}"
+    install_release nuclei \
+      "${NUCLEI_PLAT:+$NUCLEI_REL/nuclei_${NUCLEI_V}_$NUCLEI_PLAT.zip}" \
+      "$NUCLEI_REL/nuclei_${NUCLEI_V}_checksums.txt" nuclei
+  fi
+fi
+if have nuclei; then
+  add "nuclei: fetching its templates"
+  if nuclei -update-templates -silent >/dev/null 2>&1; then
+    ok "nuclei templates"; fact '{"kind":"templates","tool":"nuclei","ok":true}'
+  else
+    bad "nuclei templates not fetched (network or rate limit) — cveprobe finds nothing without them"
+    fact '{"kind":"templates","tool":"nuclei","ok":false}'
   fi
 fi
 
